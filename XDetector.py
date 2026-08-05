@@ -110,6 +110,16 @@ def _x_contrast_score(gray, cx, cy):
             best_score = bright_score
             best_polarity = "bright-on-dark"
 
+        # Some ad networks draw a white X directly on a bright yellow/green
+        # panel.  The absolute background is bright, but the four white arms
+        # still have clear local contrast.  Shape validation below keeps text
+        # and provider logos from being accepted.
+        if center_bright >= 235 and bright_value >= 225 and axis_value <= 235 and bright_score >= 22:
+            color_background_score = 120.0 + (bright_score * 4.0)
+            if color_background_score > best_score:
+                best_score = color_background_score
+                best_polarity = "bright-on-dark"
+
         dark_score = axis_value - dark_value
         if center_dark <= 90 and dark_value <= 105 and axis_value >= 155 and dark_score >= 55 and dark_score > best_score:
             best_score = dark_score
@@ -217,6 +227,87 @@ def _response_centers(gray):
     return centers
 
 
+def _looks_like_double_chevron(gray, cx, cy, polarity):
+    """Recognize a bright >> control so it is not treated as a close X."""
+    if polarity != "bright-on-dark":
+        return False
+
+    height, width = gray.shape
+    x0, x1 = max(0, int(cx) - 32), min(width, int(cx) + 33)
+    y0, y1 = max(0, int(cy) - 20), min(height, int(cy) + 21)
+    patch = gray[y0:y1, x0:x1]
+    if patch.size == 0:
+        return False
+
+    _, binary = cv2.threshold(patch, 200, 255, cv2.THRESH_BINARY)
+    component_count, _, stats, centers = cv2.connectedComponentsWithStats(binary)
+    chevrons = []
+    for index in range(1, component_count):
+        component_width = int(stats[index, cv2.CC_STAT_WIDTH])
+        component_height = int(stats[index, cv2.CC_STAT_HEIGHT])
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        if (
+            4 <= component_width <= 14
+            and 9 <= component_height <= 25
+            and 20 <= area <= 150
+            and component_width <= component_height
+        ):
+            chevrons.append((float(centers[index][0]), float(centers[index][1])))
+
+    for first_index, first in enumerate(chevrons):
+        for second in chevrons[first_index + 1:]:
+            horizontal_gap = abs(first[0] - second[0])
+            vertical_gap = abs(first[1] - second[1])
+            if 5 <= horizontal_gap <= 18 and vertical_gap <= 5:
+                return True
+    return False
+
+
+def _matches_tiny_x_component(gray, cx, cy):
+    """Validate a 4-10 px X without weakening the normal close detector."""
+    height, width = gray.shape
+    radius = 8
+    x0, x1 = max(0, int(round(cx)) - radius), min(width, int(round(cx)) + radius + 1)
+    y0, y1 = max(0, int(round(cy)) - radius), min(height, int(round(cy)) + radius + 1)
+    patch = gray[y0:y1, x0:x1]
+    if patch.size == 0:
+        return False
+
+    threshold = max(90.0, float(np.median(patch)) + 55.0)
+    binary = np.where(patch >= threshold, 255, 0).astype(np.uint8)
+    component_count, labels, stats, centers = cv2.connectedComponentsWithStats(binary)
+
+    for index in range(1, component_count):
+        component_width = int(stats[index, cv2.CC_STAT_WIDTH])
+        component_height = int(stats[index, cv2.CC_STAT_HEIGHT])
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        aspect = component_width / float(max(1, component_height))
+        component_x = x0 + float(centers[index][0])
+        component_y = y0 + float(centers[index][1])
+        if not (
+            4 <= component_width <= 10
+            and 4 <= component_height <= 10
+            and 10 <= area <= 45
+            and 0.65 <= aspect <= 1.50
+            and math.hypot(component_x - cx, component_y - cy) <= 3.0
+        ):
+            continue
+
+        points_y, points_x = np.where(labels == index)
+        relative_x = (points_x + x0) - cx
+        relative_y = (points_y + y0) - cy
+        quadrants = (
+            np.any((relative_x <= -1) & (relative_y <= -1)),
+            np.any((relative_x >= 1) & (relative_y <= -1)),
+            np.any((relative_x <= -1) & (relative_y >= 1)),
+            np.any((relative_x >= 1) & (relative_y >= 1)),
+        )
+        if all(quadrants):
+            return True
+
+    return False
+
+
 def _detect_right_corner_x(bgr, live=False):
     height, width = bgr.shape[:2]
     if width < 200 or height < 120:
@@ -240,6 +331,7 @@ def _detect_right_corner_x(bgr, live=False):
         return None
 
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    raw_gray = gray.copy()
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
     edges = cv2.Canny(gray, 45, 135)
     lines = cv2.HoughLinesP(edges, 1, np.pi / 180.0, threshold=8,
@@ -331,6 +423,38 @@ def _detect_right_corner_x(bgr, live=False):
         shape_quality = _x_shape_quality(gray, cx, cy, polarity)
         candidates.append((score, cx + left, cy + top, polarity, "response", shape_quality))
 
+    # Some portrait-ad overlays use a 6x6 px white X inside a roughly 20 px
+    # dark circle. Blurring removes its one-pixel arms, so validate this very
+    # specific top-right control on the raw grayscale image instead.
+    if height > width * 1.25:
+        game_right = max(1, width - 42)
+        tiny_responses = sorted(
+            _response_centers(raw_gray), key=lambda candidate: candidate[2], reverse=True
+        )
+        for cx, cy, response_strength in tiny_responses:
+            screen_x = cx + left
+            screen_y = cy + top
+            if response_strength < 45:
+                continue
+            if not (game_right - 60 <= screen_x <= game_right - 6):
+                continue
+            if not (44 <= screen_y <= 86):
+                continue
+            contrast, polarity = _x_contrast_score(raw_gray, cx, cy)
+            if polarity != "bright-on-dark" or contrast < 300:
+                continue
+            if not _matches_tiny_x_component(raw_gray, cx, cy):
+                continue
+            candidates.append((
+                contrast + response_strength,
+                screen_x,
+                screen_y,
+                polarity,
+                "tiny-overlay",
+                100.0,
+            ))
+            break
+
     if not candidates:
         return None
 
@@ -344,6 +468,7 @@ def _detect_right_corner_x(bgr, live=False):
     score, cx, cy, polarity, method, shape_quality = max(candidates, key=lambda item: item[0])
     if score < 210:
         return None
+    kind = "skip" if _looks_like_double_chevron(gray, cx - left, cy - top, polarity) else "close"
     return {
         "found": True,
         "x": float(cx / width),
@@ -352,6 +477,7 @@ def _detect_right_corner_x(bgr, live=False):
         "polarity": polarity,
         "method": method,
         "shape": round(float(shape_quality), 2),
+        "kind": kind,
     }
 
 
@@ -373,6 +499,251 @@ def detect_x(bgr, live=False):
     if not candidates:
         return None
     return max(candidates, key=lambda result: float(result.get("score", 0.0)))
+
+
+def detect_top_resource_cards(bgr):
+    """Detect Top Eleven's green, blue and red resource cards from pixels."""
+    height, width = bgr.shape[:2]
+    if width < 400 or height < 140:
+        return {"found": False, "green": 0, "blue": 0, "red": 0}
+
+    # Exclude the fixed BlueStacks toolbar on the right. The resource cards
+    # occupy the upper-right part of the first ~50 px of the game viewport.
+    game_width = max(1, width - 42)
+    left = int(game_width * 0.42)
+    right = min(width, int(game_width * 0.99))
+    best = {"found": False, "green": 0, "blue": 0, "red": 0}
+
+    # Small vertical search tolerates window borders and DPI/titlebar offsets.
+    for top in range(38, 55, 4):
+        bottom = min(height, top + 50)
+        bar = bgr[top:bottom, left:right]
+        if bar.size == 0:
+            continue
+        blue_channel, green_channel, red_channel = cv2.split(bar)
+        green_count = int(np.count_nonzero(
+            (green_channel > 125)
+            & (green_channel > red_channel.astype(np.float32) * 1.18)
+            & (green_channel > blue_channel.astype(np.float32) * 1.08)
+        ))
+        blue_count = int(np.count_nonzero(
+            (blue_channel > 145)
+            & (blue_channel > red_channel.astype(np.float32) * 1.20)
+            & (blue_channel > green_channel.astype(np.float32) * 1.03)
+        ))
+        red_count = int(np.count_nonzero(
+            (red_channel > 165)
+            & (red_channel > green_channel.astype(np.float32) * 1.25)
+            & (red_channel > blue_channel.astype(np.float32) * 1.18)
+        ))
+        candidate = {
+            "found": green_count >= 100 and blue_count >= 70 and red_count >= 70,
+            "green": green_count,
+            "blue": blue_count,
+            "red": red_count,
+        }
+        if min(green_count / 100.0, blue_count / 70.0, red_count / 70.0) > min(
+            best["green"] / 100.0, best["blue"] / 70.0, best["red"] / 70.0
+        ):
+            best = candidate
+
+    return best
+
+
+def detect_yellow_ad_control(bgr):
+    """Detect the wide yellow Google Play pill or the yellow circular close X."""
+    height, width = bgr.shape[:2]
+    if width < 300 or height < 140:
+        return {"found": False}
+
+    game_right = max(1, width - 42)
+    left = int(game_right * 0.72)
+    top = 38
+    bottom = min(height, max(145, int(height * 0.22)))
+    roi = bgr[top:bottom, left:game_right]
+    if roi.size == 0:
+        return {"found": False}
+    roi_height, roi_width = roi.shape[:2]
+
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    # Keep the orange-yellow control separate from lime/green gameplay
+    # backgrounds. Lower saturation includes the pale button fill; the narrow
+    # hue band prevents it from merging with the whole ad scene.
+    yellow = cv2.inRange(hsv, np.array([14, 35, 170]), np.array([32, 255, 255]))
+    yellow = cv2.morphologyEx(yellow, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    contours, _ = cv2.findContours(yellow, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    candidates = []
+
+    for contour in contours:
+        x, y, control_width, control_height = cv2.boundingRect(contour)
+        area = float(cv2.contourArea(contour))
+        if control_width < 18 or control_height < 16 or area < 220:
+            continue
+        cx = float(left + x + control_width / 2.0)
+        cy = float(top + y + control_height / 2.0)
+        aspect = control_width / float(max(1, control_height))
+
+        # A full yellow ad background used to look like one very wide Play
+        # pill. A real badge is a bounded component with margins, white text or
+        # chevrons, and occupies only a small part of this corner ROI.
+        box_area = float(control_width * control_height)
+        roi_fraction = box_area / float(max(1, roi_width * roi_height))
+        touches_edge = (
+            x <= 2
+            or y <= 2
+            or x + control_width >= roi_width - 2
+            or y + control_height >= roi_height - 2
+        )
+        control_hsv = hsv[y:y + control_height, x:x + control_width]
+        white_ratio = 0.0
+        if control_hsv.size:
+            white_pixels = np.count_nonzero(
+                (control_hsv[:, :, 1] < 75) & (control_hsv[:, :, 2] > 205)
+            )
+            white_ratio = white_pixels / box_area
+
+        if (
+            2.4 <= aspect <= 8.0
+            and 85 <= control_width <= 240
+            and 20 <= control_height <= 65
+            and roi_fraction <= 0.25
+            and not touches_edge
+            and area >= box_area * 0.45
+            and white_ratio >= 0.025
+            and 0.80 <= cx / float(width) <= 0.97
+            and 0.05 <= cy / float(height) <= 0.18
+        ):
+            candidates.append((area, "google_play", cx, cy, control_width, control_height))
+            continue
+
+        if 0.72 <= aspect <= 1.38 and 20 <= control_width <= 70 and 20 <= control_height <= 70:
+            refined = None
+            for offset_y in range(-3, 4):
+                for offset_x in range(-3, 4):
+                    test_x, test_y = cx + offset_x, cy + offset_y
+                    contrast, polarity = _x_contrast_score(gray, test_x, test_y)
+                    if polarity is None:
+                        continue
+                    shape = _x_shape_quality(gray, test_x, test_y, polarity)
+                    quality = shape + min(contrast, 300.0) * 0.05
+                    if refined is None or quality > refined[0]:
+                        refined = (quality, contrast, shape, test_x, test_y)
+            if refined is not None:
+                _, contrast, shape, refined_x, refined_y = refined
+                if contrast >= 150 and shape >= 78:
+                    candidates.append((area + contrast, "close", refined_x, refined_y, control_width, control_height))
+
+    if not candidates:
+        return {"found": False}
+
+    # Closing the ad always has priority if a Play pill and an X coexist.
+    close_controls = [candidate for candidate in candidates if candidate[1] == "close"]
+    google_play = [candidate for candidate in candidates if candidate[1] == "google_play"]
+    selected = max(close_controls or google_play or candidates, key=lambda item: item[0])
+    _, kind, cx, cy, control_width, control_height = selected
+    return {
+        "found": True,
+        "kind": kind,
+        "x": float(cx / width),
+        "y": float(cy / height),
+        "width": int(control_width),
+        "height": int(control_height),
+    }
+
+
+def detect_play_destination(bgr):
+    """Detect a blank play.google.com Chrome Custom Tab and its close X."""
+    height, width = bgr.shape[:2]
+    if width < 400 or height < 300:
+        return {"found": False}
+
+    game_right = max(1, width - 42)
+    header_top = 40
+    header_bottom = min(height, max(145, int(height * 0.20)))
+    body_top = header_bottom
+    header = bgr[header_top:header_bottom, 0:game_right]
+    body = bgr[body_top:max(body_top + 1, height - 8), 8:max(9, game_right - 8)]
+    if header.size == 0 or body.size == 0:
+        return {"found": False}
+
+    header_white_ratio = float(np.mean(np.all(header >= 235, axis=2)))
+    body_white_ratio = float(np.mean(np.all(body >= 235, axis=2)))
+    if header_white_ratio < 0.90 or body_white_ratio < 0.985:
+        return {
+            "found": False,
+            "header_white": round(header_white_ratio, 4),
+            "body_white": round(body_white_ratio, 4),
+        }
+
+    full_gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+
+    def dark_ratio(x0, y0, x1, y1):
+        zone = full_gray[
+            max(0, int(height * y0)):min(height, int(height * y1)),
+            max(0, int(game_right * x0)):min(game_right, int(game_right * x1)),
+        ]
+        if zone.size == 0:
+            return 0.0
+        return float(np.mean(zone < 80))
+
+    chevron_dark = dark_ratio(0.045, 0.115, 0.085, 0.170)
+    address_dark = dark_ratio(0.095, 0.115, 0.250, 0.170)
+    right_controls_dark = dark_ratio(0.885, 0.110, 0.975, 0.175)
+    if chevron_dark < 0.008 or address_dark < 0.012 or right_controls_dark < 0.008:
+        return {
+            "found": False,
+            "header_white": round(header_white_ratio, 4),
+            "body_white": round(body_white_ratio, 4),
+            "chevron_dark": round(chevron_dark, 4),
+            "address_dark": round(address_dark, 4),
+            "right_dark": round(right_controls_dark, 4),
+        }
+
+    # Chrome Custom Tabs put a dark X around (29, 104) at this DPI. Require
+    # the full X shape as well as the white header/body so white ads cannot
+    # trigger this fallback.
+    close_left, close_right = 5, min(game_right, 78)
+    close_top, close_bottom = 78, min(height, 132)
+    close_roi = bgr[close_top:close_bottom, close_left:close_right]
+    if close_roi.size == 0:
+        return {"found": False}
+    close_gray = cv2.cvtColor(close_roi, cv2.COLOR_BGR2GRAY)
+    close_gray = cv2.GaussianBlur(close_gray, (3, 3), 0)
+    response_candidates = sorted(
+        _response_centers(close_gray), key=lambda candidate: candidate[2], reverse=True
+    )
+    for cx, cy, response_strength in response_candidates:
+        screen_x = cx + close_left
+        screen_y = cy + close_top
+        if response_strength < 50:
+            continue
+        if not (15 <= screen_x <= 50 and 90 <= screen_y <= 120):
+            continue
+        contrast, polarity = _x_contrast_score(close_gray, cx, cy)
+        if polarity is None or contrast < 200:
+            continue
+        shape = _x_shape_quality(close_gray, cx, cy, polarity)
+        if shape < 80:
+            continue
+        return {
+            "found": True,
+            "x": float(screen_x / width),
+            "y": float(screen_y / height),
+            "score": round(float(contrast + response_strength), 2),
+            "shape": round(float(shape), 2),
+            "header_white": round(header_white_ratio, 4),
+            "body_white": round(body_white_ratio, 4),
+            "chevron_dark": round(chevron_dark, 4),
+            "address_dark": round(address_dark, 4),
+            "right_dark": round(right_controls_dark, 4),
+        }
+
+    return {
+        "found": False,
+        "header_white": round(header_white_ratio, 4),
+        "body_white": round(body_white_ratio, 4),
+    }
 
 
 def load_image(path):
@@ -399,7 +770,14 @@ def server_loop():
                 image = capture_rect(request["rect"])
             else:
                 image = load_image(request["image"])
-            result = detect_x(image, live=("rect" in request)) or {"found": False}
+            if request.get("mode") == "top_resource_cards":
+                result = detect_top_resource_cards(image)
+            elif request.get("mode") == "yellow_ad_control":
+                result = detect_yellow_ad_control(image)
+            elif request.get("mode") == "play_destination":
+                result = detect_play_destination(image)
+            else:
+                result = detect_x(image, live=("rect" in request)) or {"found": False}
             print(json.dumps(result), flush=True)
         except Exception as exc:
             print(json.dumps({"found": False, "error": str(exc)}), flush=True)

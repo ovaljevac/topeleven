@@ -69,7 +69,7 @@ public static class Win32Agent {
 $script:BlueStacksExe = 'C:\Program Files\BlueStacks_nxt\HD-Player.exe'
 $script:BlueStacksInstance = 'Pie64'
 $script:WindowTitle = 'BlueStacks App Player'
-$script:TopElevenShortcut = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Top Eleven - BlueStacks App Player 1.lnk'
+$script:TopElevenShortcut = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Top Eleven.lnk'
 $script:PythonExe = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'
 $script:XDetectorScript = Join-Path $PSScriptRoot 'XDetector.py'
 $script:BlueStacksPlayerLog = 'C:\ProgramData\BlueStacks_nxt\Logs\Player.log'
@@ -77,9 +77,16 @@ $script:ForegroundStateCache = $null
 $script:ForegroundStateCheckedAt = $null
 $script:LastHandledGooglePlayEvent = $null
 $script:LastGooglePlayBackAt = $null
+$script:PlayDestinationCheckedAt = $null
+$script:PlayDestinationCache = $false
+$script:DetectedPlayDestinationCloseX = $null
+$script:DetectedPlayDestinationCloseY = $null
 $script:Mode = $Mode
 $script:Cancelled = $false
 $script:Running = $false
+$script:ShortTransitionBufferMs = 500
+$script:TransitionBufferMs = 1800
+$script:LongTransitionBufferMs = 3000
 
 function Add-Log {
     param([string]$Text)
@@ -159,6 +166,29 @@ function Click-Relative {
     Add-Log "Klik: $Name ($screenX, $screenY)"
 }
 
+function Click-GameRelative {
+    param(
+        [IntPtr]$Handle,
+        [double]$X,
+        [double]$Y,
+        [string]$Name
+    )
+    $rect = Get-WindowRectangle $Handle
+    # Top Eleven viewport ne ukljucuje BlueStacks naslovnu traku ni desni toolbar.
+    $gameLeft = $rect.Left
+    $gameTop = $rect.Top + 40
+    $gameRight = $rect.Right - 42
+    $gameBottom = $rect.Bottom
+    $screenX = [int]($gameLeft + (($gameRight - $gameLeft) * $X))
+    $screenY = [int]($gameTop + (($gameBottom - $gameTop) * $Y))
+    [Win32Agent]::SetForegroundWindow($Handle) | Out-Null
+    Wait-Agent 30
+    [Win32Agent]::SetCursorPos($screenX, $screenY) | Out-Null
+    [Win32Agent]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
+    [Win32Agent]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+    Add-Log "Klik u igri: $Name ($screenX, $screenY)"
+}
+
 function Send-Escape {
     param([IntPtr]$Handle)
     [Win32Agent]::SetForegroundWindow($Handle) | Out-Null
@@ -166,6 +196,16 @@ function Send-Escape {
     [Win32Agent]::keybd_event(0x1B, 0, 0, [UIntPtr]::Zero)
     [Win32Agent]::keybd_event(0x1B, 0, 0x0002, [UIntPtr]::Zero)
     Add-Log 'Pokušaj zatvaranja popupa: Back / Escape'
+}
+
+function Send-BlueStacksBack {
+    param([IntPtr]$Handle)
+    [Win32Agent]::SetForegroundWindow($Handle) | Out-Null
+    Wait-Agent 50
+    # Escape je Android Back u BlueStacksu, pa nema zavisnosti od koordinata.
+    [Win32Agent]::keybd_event(0x1B, 0, 0, [UIntPtr]::Zero)
+    [Win32Agent]::keybd_event(0x1B, 0, 0x0002, [UIntPtr]::Zero)
+    Add-Log 'BlueStacks Back poslan preko Escape tipke.'
 }
 
 function Get-BlueStacksForegroundState {
@@ -208,6 +248,38 @@ function Get-BlueStacksForegroundState {
     return $state
 }
 
+function Get-RecentGooglePlayLinkEvent {
+    param([datetime]$AdStartedAt)
+
+    try {
+        if (-not (Test-Path -LiteralPath $script:BlueStacksPlayerLog)) { return $null }
+        $lines = @(Get-Content -LiteralPath $script:BlueStacksPlayerLog -Tail 500 -ErrorAction Stop)
+        for ($index = $lines.Count - 1; $index -ge 0; $index--) {
+            $line = [string]$lines[$index]
+            if ($line -notmatch 'hcallOnActivityDisplayedClbk\s*:\s*package\s*=\s*(?<Package>com\.android\.(?:vending|chrome))') {
+                continue
+            }
+            $eventTime = $null
+            if ($line.Length -ge 28) {
+                $parsedTime = [DateTimeOffset]::MinValue
+                if ([DateTimeOffset]::TryParse($line.Substring(0, 28), [ref]$parsedTime)) {
+                    $eventTime = $parsedTime.LocalDateTime
+                }
+            }
+            if ($null -ne $eventTime -and $eventTime -lt $AdStartedAt.AddSeconds(-2)) {
+                return $null
+            }
+            return [PSCustomObject]@{
+                Package = [string]$Matches.Package
+                Signature = $line
+                EventTime = $eventTime
+            }
+        }
+    }
+    catch { }
+    return $null
+}
+
 function Restore-AdFromGooglePlay {
     param(
         [IntPtr]$Handle,
@@ -215,29 +287,100 @@ function Restore-AdFromGooglePlay {
     )
 
     $state = Get-BlueStacksForegroundState
-    if ($null -eq $state -or $state.Package -ne 'com.android.vending') {
+    $externalState = if ($null -ne $state -and
+        ($state.Package -eq 'com.android.vending' -or $state.Package -eq 'com.android.chrome')) {
+        $state
+    }
+    else {
+        Get-RecentGooglePlayLinkEvent $AdStartedAt
+    }
+
+    # Screen fallback catches a blank Chrome Custom Tab even if Player.log was
+    # read during the short transition between Top Eleven and Chrome.
+    $playDestinationVisible = $false
+    if (((Get-Date) - $AdStartedAt).TotalSeconds -ge 45) {
+        $playDestinationVisible = Test-PlayDestinationScreen $Handle
+    }
+    if ($null -eq $externalState -and $playDestinationVisible) {
+        $externalState = [PSCustomObject]@{
+            Package = 'com.android.chrome'
+            Signature = "play-destination-screen-$($AdStartedAt.Ticks)"
+            EventTime = Get-Date
+        }
+    }
+    if ($null -eq $externalState) {
         return $false
     }
-    if ($null -ne $state.EventTime -and $state.EventTime -lt $AdStartedAt.AddSeconds(-2)) {
+    if (-not $playDestinationVisible -and $null -ne $externalState.EventTime -and
+        $externalState.EventTime -lt $AdStartedAt.AddSeconds(-2)) {
         return $false
     }
 
-    # Jedan Back po konkretnom Play Store dogadjaju. Dok se zapisnik ne
-    # osvjezi, ne smijemo poslati drugi Back.
-    if ($script:LastHandledGooglePlayEvent -ne $state.Signature) {
-        $script:LastHandledGooglePlayEvent = $state.Signature
-        $script:LastGooglePlayBackAt = Get-Date
-        Set-Status 'Otvoren je Google Play Store - vracam se jednim Back klikom...' ([System.Drawing.Color]::FromArgb(255, 210, 100))
-        Click-Relative $Handle 0.132 0.018 'BlueStacks Back - povratak iz Google Play Storea'
-        Wait-Agent 900
+    # A Chrome event can appear just after the cached Top Eleven state was
+    # read. Refresh once and compare timestamps instead of relying only on an
+    # exact log-line signature.
+    if ($null -eq $state -or $state.Signature -ne $externalState.Signature) {
         $script:ForegroundStateCheckedAt = $null
+        $refreshedState = Get-BlueStacksForegroundState
+        if ($null -ne $refreshedState) { $state = $refreshedState }
+    }
+
+    $externalStillVisible = $playDestinationVisible
+    if ($null -ne $state -and
+        ($state.Package -eq 'com.android.vending' -or $state.Package -eq 'com.android.chrome')) {
+        $externalStillVisible = $true
+    }
+    elseif ($null -ne $state -and $null -ne $state.EventTime -and
+        $null -ne $externalState.EventTime -and $externalState.EventTime -gt $state.EventTime) {
+        $externalStillVisible = $true
+    }
+
+    $sameEventHandled = $script:LastHandledGooglePlayEvent -eq $externalState.Signature
+    $retryDue = $externalStillVisible -and
+        ($null -eq $script:LastGooglePlayBackAt -or
+         ((Get-Date) - $script:LastGooglePlayBackAt).TotalSeconds -ge 2)
+    if (-not $sameEventHandled -or $retryDue) {
+        $script:LastHandledGooglePlayEvent = $externalState.Signature
+        $script:LastGooglePlayBackAt = Get-Date
+        if ($externalStillVisible) {
+            $destination = if ($externalState.Package -eq 'com.android.chrome') { 'play.google link' } else { 'Google Play Store' }
+            Set-Status "Otvoren je $destination - vracam se jednim Back klikom..." ([System.Drawing.Color]::FromArgb(255, 210, 100))
+            Send-BlueStacksBack $Handle
+            Wait-Agent 900
+
+            # Escape ponekad ne zatvori Chrome Custom Tab. If the same visual
+            # page remains, click its own X and then return to the ad.
+            $script:PlayDestinationCheckedAt = $null
+            if ($externalState.Package -eq 'com.android.chrome' -and
+                (Test-PlayDestinationScreen $Handle)) {
+                Set-Status 'Back nije zatvorio play.google stranicu - kliknem X preglednika...' ([System.Drawing.Color]::FromArgb(255, 210, 100))
+                Click-Relative $Handle $script:DetectedPlayDestinationCloseX $script:DetectedPlayDestinationCloseY 'Chrome X - povratak u reklamu'
+                Wait-Agent 1200
+            }
+            else {
+                Wait-Agent 300
+            }
+        }
+        else {
+            Set-Status 'play.google link se vec automatski vratio u reklamu; cekam zuti X...' ([System.Drawing.Color]::FromArgb(255, 210, 100))
+            Wait-Agent 800
+        }
+
+        $script:ForegroundStateCheckedAt = $null
+        $script:PlayDestinationCheckedAt = $null
         $script:XDetectorStableCount = 0
         $script:XDetectorStableSince = $null
         $script:XDetectorLastX = $null
         $script:XDetectorLastY = $null
-        Add-Log 'Back je pritisnut jednom; nastavljam cekati pravi X reklame.'
+        if ($externalStillVisible) {
+            Add-Log 'Back tok je izvrsen; nastavljam cekati pravi X reklame.'
+        }
+        else {
+            Add-Log 'Kratki play.google Chrome dogadjaj je prepoznat nakon automatskog povratka.'
+        }
         return $true
     }
+    if ($externalStillVisible) { return $true }
     if ($null -ne $script:LastGooglePlayBackAt -and
         ((Get-Date) - $script:LastGooglePlayBackAt).TotalSeconds -lt 2) {
         return $true
@@ -261,6 +404,13 @@ function Wait-ForAdXAfterGooglePlayReturn {
             continue
         }
         if (Test-AdCloseReady $Handle) {
+            if ($script:DetectedAdCloseKind -eq 'skip') {
+                Click-Relative $Handle $script:DetectedAdCloseX $script:DetectedAdCloseY '>> - nastavi reklamu'
+                Wait-Agent $script:TransitionBufferMs
+                $script:XDetectorStableCount = 0
+                $script:XDetectorStableSince = $null
+                continue
+            }
             return $true
         }
         Start-Sleep -Milliseconds 50
@@ -376,6 +526,70 @@ function Test-StoreLoaded {
         ([Math]::Abs($r - $g) -lt 35) -and ([Math]::Abs($g - $b) -lt 35)
     }
     return $whiteCount -ge 80
+}
+
+function Test-TopElevenReturnedAfterAd {
+    param([IntPtr]$Handle)
+
+    Start-XDetector
+    $rect = Get-WindowRectangle $Handle
+    $request = @{
+        rect = @($rect.Left, $rect.Top, $rect.Right, $rect.Bottom)
+        mode = 'top_resource_cards'
+    } | ConvertTo-Json -Compress
+    $script:XDetectorProcess.StandardInput.WriteLine($request)
+    $script:XDetectorProcess.StandardInput.Flush()
+    $result = $script:XDetectorProcess.StandardOutput.ReadLine() | ConvertFrom-Json
+    return [bool]$result.found
+}
+
+function Test-YellowAdControlReady {
+    param([IntPtr]$Handle)
+
+    Start-XDetector
+    $rect = Get-WindowRectangle $Handle
+    $request = @{
+        rect = @($rect.Left, $rect.Top, $rect.Right, $rect.Bottom)
+        mode = 'yellow_ad_control'
+    } | ConvertTo-Json -Compress
+    $script:XDetectorProcess.StandardInput.WriteLine($request)
+    $script:XDetectorProcess.StandardInput.Flush()
+    $result = $script:XDetectorProcess.StandardOutput.ReadLine() | ConvertFrom-Json
+    if (-not $result.found) { return $false }
+
+    $script:DetectedYellowControlKind = [string]$result.kind
+    $script:DetectedYellowControlX = [double]$result.x
+    $script:DetectedYellowControlY = [double]$result.y
+    Add-Log ("Zuta kontrola: vrsta={0}, centar={1:N3},{2:N3}" -f $script:DetectedYellowControlKind, $script:DetectedYellowControlX, $script:DetectedYellowControlY)
+    return $true
+}
+
+function Test-PlayDestinationScreen {
+    param([IntPtr]$Handle)
+
+    $now = Get-Date
+    if ($null -ne $script:PlayDestinationCheckedAt -and
+        ($now - $script:PlayDestinationCheckedAt).TotalMilliseconds -lt 250) {
+        return [bool]$script:PlayDestinationCache
+    }
+
+    Start-XDetector
+    $rect = Get-WindowRectangle $Handle
+    $request = @{
+        rect = @($rect.Left, $rect.Top, $rect.Right, $rect.Bottom)
+        mode = 'play_destination'
+    } | ConvertTo-Json -Compress
+    $script:XDetectorProcess.StandardInput.WriteLine($request)
+    $script:XDetectorProcess.StandardInput.Flush()
+    $result = $script:XDetectorProcess.StandardOutput.ReadLine() | ConvertFrom-Json
+    $found = [bool]$result.found
+    $script:PlayDestinationCheckedAt = $now
+    $script:PlayDestinationCache = $found
+    if ($found) {
+        $script:DetectedPlayDestinationCloseX = [double]$result.x
+        $script:DetectedPlayDestinationCloseY = [double]$result.y
+    }
+    return $found
 }
 
 function Test-AdCloseReadyLegacy {
@@ -526,6 +740,7 @@ function Start-XDetector {
     $script:XDetectorLastY = $null
     $script:XDetectorLastPolarity = $null
     $script:XDetectorLastSide = $null
+    $script:XDetectorLastKind = $null
     Add-Log 'OpenCV X detektor je pokrenut.'
 }
 
@@ -578,6 +793,7 @@ function Test-AdCloseReady {
         $script:XDetectorLastY = $null
         $script:XDetectorLastPolarity = $null
         $script:XDetectorLastSide = $null
+        $script:XDetectorLastKind = $null
         return $false
     }
 
@@ -585,11 +801,13 @@ function Test-AdCloseReady {
     $y = [double]$result.y
     $polarity = [string]$result.polarity
     $side = if ($null -ne $result.side) { [string]$result.side } else { 'right' }
+    $kind = if ($null -ne $result.kind) { [string]$result.kind } else { 'close' }
     $sameTarget = $null -ne $script:XDetectorLastX -and
         [Math]::Abs($x - $script:XDetectorLastX) -le 0.006 -and
         [Math]::Abs($y - $script:XDetectorLastY) -le 0.006 -and
         $polarity -eq $script:XDetectorLastPolarity -and
-        $side -eq $script:XDetectorLastSide
+        $side -eq $script:XDetectorLastSide -and
+        $kind -eq $script:XDetectorLastKind
 
     if ($sameTarget) {
         $script:XDetectorStableCount++
@@ -602,6 +820,7 @@ function Test-AdCloseReady {
     $script:XDetectorLastY = $y
     $script:XDetectorLastPolarity = $polarity
     $script:XDetectorLastSide = $side
+    $script:XDetectorLastKind = $kind
 
     $stableMilliseconds = if ($null -ne $script:XDetectorStableSince) {
         ((Get-Date) - $script:XDetectorStableSince).TotalMilliseconds
@@ -616,15 +835,49 @@ function Test-AdCloseReady {
 
     $script:DetectedAdCloseX = $x
     $script:DetectedAdCloseY = $y
-    Add-Log ("OpenCV X: confidence={0}, oblik={1}, tip={2}, centar={3:N3},{4:N3}" -f $result.score, $result.shape, $polarity, $x, $y)
+    $script:DetectedAdCloseKind = $kind
+    Add-Log ("OpenCV kontrola: vrsta={0}, confidence={1}, oblik={2}, tip={3}, centar={4:N3},{5:N3}" -f $kind, $result.score, $result.shape, $polarity, $x, $y)
     return $true
+}
+
+function Wait-ForAdExitOrControl {
+    param(
+        [IntPtr]$Handle,
+        [int]$TimeoutSeconds = 10
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $returnedStableCount = 0
+    while ((Get-Date) -lt $deadline) {
+        Test-Cancelled
+        if (Test-TopElevenReturnedAfterAd $Handle) {
+            $returnedStableCount++
+            if ($returnedStableCount -eq 1) {
+                Add-Log 'Kartice resursa su pronadjene; potvrdjujem Top Eleven ekran...'
+            }
+            if ($returnedStableCount -ge 3) {
+                Add-Log 'Povratak u Top Eleven potvrdjen preko kartica resursa.'
+                return 'exited'
+            }
+            # Ne pokreci spori OpenCV X pregled dok su kartice vec vidljive.
+            Start-Sleep -Milliseconds 150
+            continue
+        }
+        else {
+            $returnedStableCount = 0
+        }
+
+        if (Test-AdCloseReady $Handle) { return 'control' }
+        Start-Sleep -Milliseconds 120
+    }
+    return 'unknown'
 }
 
 function Dismiss-GamePopups {
     param([IntPtr]$Handle)
 
     Set-Status 'Provjeravam i zatvaram popupove…'
-    Wait-Agent 100
+    Wait-Agent $script:ShortTransitionBufferMs
 
     $clearChecks = 0
     for ($attempt = 1; $attempt -le 4; $attempt++) {
@@ -645,7 +898,7 @@ function Dismiss-GamePopups {
             3 { Click-Relative $Handle 0.500 0.840 'moguće dugme ZATVORI' }
             0 { Click-Relative $Handle 0.900 0.145 'alternativni X na popupu' }
         }
-        Wait-Agent 150
+        Wait-Agent $script:ShortTransitionBufferMs
     }
 
     Add-Log 'Nije potvrdjen cist ekran; pokusat cu otvoriti prodavnicu i provjeriti rezultat.'
@@ -658,7 +911,7 @@ function Open-Store {
         Set-Status "Otvaram prodavnicu preko zelenog + dugmeta (pokušaj $attempt/3)…"
         Click-Relative $Handle 0.651 0.071 'zeleni + za odmore'
 
-        $deadline = (Get-Date).AddMilliseconds(1500)
+        $deadline = (Get-Date).AddMilliseconds($script:LongTransitionBufferMs)
         while ((Get-Date) -lt $deadline) {
             Test-Cancelled
             if (Test-StoreLoaded $Handle) {
@@ -675,7 +928,7 @@ function Open-Store {
             3 { Click-Relative $Handle 0.500 0.840 'moguće dugme ZATVORI' }
             4 { Send-Escape $Handle }
         }
-        Wait-Agent 150
+        Wait-Agent $script:ShortTransitionBufferMs
     }
 
     throw 'Nije uspjelo otvoriti prodavnicu nakon zatvaranja popupova.'
@@ -687,16 +940,16 @@ function Open-TeamRest {
     Set-Status 'Otvaram bocni meni...'
     $form.TopMost = $false
     [Win32Agent]::SetForegroundWindow($Handle) | Out-Null
-    Wait-Agent 100
+    Wait-Agent $script:ShortTransitionBufferMs
 
-    Click-Relative $Handle 0.012 0.092 'bocni meni'
-    Wait-Agent 1200
-    Click-Relative $Handle 0.120 0.206 'Trening'
-    Wait-Agent 2200
-    Click-Relative $Handle 0.110 0.907 'Fizio centar'
-    Wait-Agent 1200
-    Click-Relative $Handle 0.958 0.269 'GK plus'
-    Wait-Agent 1200
+    Click-GameRelative $Handle 0.014 0.068 'bocni meni'
+    Wait-Agent $script:TransitionBufferMs
+    Click-GameRelative $Handle 0.087 0.189 'Trening'
+    Wait-Agent $script:LongTransitionBufferMs
+    Click-GameRelative $Handle 0.124 0.914 'Fizio centar'
+    Wait-Agent $script:TransitionBufferMs
+    Click-GameRelative $Handle 0.976 0.256 'GK plus'
+    Wait-Agent $script:TransitionBufferMs
 
     $form.TopMost = $true
     Add-Log 'Otvoren je Fizio centar za GK.'
@@ -743,15 +996,16 @@ function Wait-ManualTeamRestAd {
 
     [Win32Agent]::SetForegroundWindow($Handle) | Out-Null
     Set-Status "BESPLATNO je spremno za $PlayerLabel - kliknem automatski." ([System.Drawing.Color]::FromArgb(120, 240, 150))
-    Click-Relative $Handle 0.755 0.872 "BESPLATNO - $PlayerLabel"
+    Click-GameRelative $Handle 0.778 0.880 "BESPLATNO - $PlayerLabel"
     $adStartedAt = Get-Date
 
-    Set-Status "Reklama za $PlayerLabel je pokrenuta. Cekam 40 sekundi prije detekcije X-a..."
+    Set-Status "Reklama za $PlayerLabel je pokrenuta. Cekam 60 sekundi prije detekcije X-a..."
     $adCloseDeadline = (Get-Date).AddMinutes(5)
-    $xDetectionStartsAt = (Get-Date).AddSeconds(40)
+    $xDetectionStartsAt = (Get-Date).AddSeconds(60)
     $googlePlayBadgeClicked = $false
-    $googlePlayProbeCount = 0
-    $firstGooglePlayProbeAt = $adStartedAt.AddSeconds(1)
+    $yellowGooglePlayAttempted = $false
+    $portraitGooglePlayNextAttemptAt = $adStartedAt.AddSeconds(60)
+    $portraitGooglePlayAttemptCount = 0
     $googlePlayReminderAt = (Get-Date).AddSeconds(75)
     $googlePlayReminderShown = $false
     $xDetectionStarted = $false
@@ -764,30 +1018,76 @@ function Wait-ManualTeamRestAd {
             Start-Sleep -Milliseconds 50
             continue
         }
-        if (-not $googlePlayBadgeClicked -and (Test-AdGooglePlayBadge $Handle)) {
-            $googlePlayBadgeClicked = $true
-            Set-Status "Kratki Google Play badge za $PlayerLabel je prepoznat - kliknem ga odmah..." ([System.Drawing.Color]::FromArgb(255, 210, 100))
-            Click-Relative $Handle 0.085 0.058 'Google Play badge u reklami'
-            Wait-Agent 500
-            continue
+        if ((Get-Date) -ge $xDetectionStartsAt -and (Test-YellowAdControlReady $Handle)) {
+            if ($script:DetectedYellowControlKind -eq 'google_play') {
+                # A real close X always wins over a yellow Play candidate.
+                if (Test-AdCloseReady $Handle) {
+                    if ($script:DetectedAdCloseKind -eq 'skip') {
+                        Click-Relative $Handle $script:DetectedAdCloseX $script:DetectedAdCloseY ">> - nastavi reklamu za $PlayerLabel"
+                        Wait-Agent $script:TransitionBufferMs
+                        $script:XDetectorStableCount = 0
+                        $script:XDetectorStableSince = $null
+                        continue
+                    }
+                    $adCloseReady = $true
+                    break
+                }
+                if (-not $googlePlayBadgeClicked -and -not $yellowGooglePlayAttempted) {
+                    $yellowGooglePlayAttempted = $true
+                    Set-Status "Zuto Google Play dugme za $PlayerLabel je pronadjeno - otvaram Store..." ([System.Drawing.Color]::FromArgb(255, 210, 100))
+                    Click-Relative $Handle $script:DetectedYellowControlX $script:DetectedYellowControlY 'zuto Google Play dugme'
+                    Wait-Agent 2000
+                    if (Restore-AdFromGooglePlay $Handle $adStartedAt) {
+                        $googlePlayBadgeClicked = $true
+                    }
+                    continue
+                }
+            }
+            else {
+                $script:DetectedAdCloseX = $script:DetectedYellowControlX
+                $script:DetectedAdCloseY = $script:DetectedYellowControlY
+                $script:DetectedAdCloseKind = 'close'
+                $adCloseReady = $true
+                Set-Status "Zuti X za $PlayerLabel je pronadjen." ([System.Drawing.Color]::FromArgb(120, 240, 150))
+                break
+            }
         }
-        $runGooglePlayProbe = -not $googlePlayBadgeClicked -and
+        if (-not $googlePlayBadgeClicked -and
+            -not $yellowGooglePlayAttempted -and
+            $portraitGooglePlayAttemptCount -lt 3 -and
             (Test-PortraitAdWindow $Handle) -and
-            (($googlePlayProbeCount -eq 0 -and (Get-Date) -ge $firstGooglePlayProbeAt) -or
-             ($googlePlayProbeCount -eq 1 -and (Get-Date) -ge $xDetectionStartsAt))
-        if ($runGooglePlayProbe) {
-            $googlePlayProbeCount++
-            Set-Status "Sigurnosni pokusaj Google Play badgea za $PlayerLabel ($googlePlayProbeCount/2)..." ([System.Drawing.Color]::FromArgb(255, 210, 100))
-            Click-Relative $Handle 0.085 0.058 'Google Play badge - portretni sigurnosni pokusaj'
-            Wait-Agent 350
+            (Get-Date) -ge $portraitGooglePlayNextAttemptAt) {
+            $portraitGooglePlayAttemptCount++
+            Set-Status "Aktiviram Google Play tok za $PlayerLabel (pokusaj $portraitGooglePlayAttemptCount/3)..." ([System.Drawing.Color]::FromArgb(255, 210, 100))
+            Click-GameRelative $Handle 0.104 0.023 'Google Play zona - aktivacija loga'
+            Wait-Agent 2000
+            if (Restore-AdFromGooglePlay $Handle $adStartedAt) {
+                $googlePlayBadgeClicked = $true
+                continue
+            }
+            Click-GameRelative $Handle 0.104 0.023 'Google Play logo - otvori Store'
+            Wait-Agent 2000
+            if (Restore-AdFromGooglePlay $Handle $adStartedAt) {
+                $googlePlayBadgeClicked = $true
+                continue
+            }
+            $portraitGooglePlayNextAttemptAt = (Get-Date).AddSeconds(8)
             continue
         }
         if ((Get-Date) -ge $xDetectionStartsAt) {
             if (-not $xDetectionStarted) {
                 $xDetectionStarted = $true
-                Set-Status "Proslo je 40 sekundi. Pokrecem detekciju X-a za $PlayerLabel..."
+                Set-Status "Proslo je 60 sekundi. Pokrecem detekciju X-a za $PlayerLabel..."
             }
             if (Test-AdCloseReady $Handle) {
+                if ($script:DetectedAdCloseKind -eq 'skip') {
+                    Set-Status "Dugme >> za $PlayerLabel je spremno - nastavljam reklamu..." ([System.Drawing.Color]::FromArgb(255, 210, 100))
+                    Click-Relative $Handle $script:DetectedAdCloseX $script:DetectedAdCloseY ">> - nastavi reklamu za $PlayerLabel"
+                    Wait-Agent $script:TransitionBufferMs
+                    $script:XDetectorStableCount = 0
+                    $script:XDetectorStableSince = $null
+                    continue
+                }
                 $adCloseReady = $true
                 break
             }
@@ -813,25 +1113,31 @@ function Wait-ManualTeamRestAd {
         $closeX = if ($null -ne $script:DetectedAdCloseX) { $script:DetectedAdCloseX } else { 0.9525 }
         $closeY = if ($null -ne $script:DetectedAdCloseY) { $script:DetectedAdCloseY } else { 0.077 }
         Click-Relative $Handle $closeX $closeY "X - zatvori reklamu za $PlayerLabel"
-        Wait-Agent 800
+        Wait-Agent $script:TransitionBufferMs
         if (Restore-AdFromGooglePlay $Handle $adStartedAt) {
             if (-not (Wait-ForAdXAfterGooglePlayReturn $Handle $adCloseDeadline $adStartedAt $PlayerLabel)) {
                 throw "Nakon povratka iz Google Play Storea X za $PlayerLabel nije pronadjen."
             }
             continue
         }
-        if (-not (Test-AdCloseReady $Handle)) {
+        $exitState = Wait-ForAdExitOrControl $Handle 10
+        if ($exitState -eq 'exited') {
             $adClosed = $true
+            Add-Log "Top Eleven ekran je vizuelno potvrdjen nakon reklame za $PlayerLabel."
             break
         }
-        Add-Log "X klik nije zatvorio reklamu za $PlayerLabel; pokusavam ponovo."
+        if ($exitState -eq 'control') {
+            Add-Log "Reklama za $PlayerLabel je jos otvorena; pronadjena je nova aktivna kontrola."
+            continue
+        }
+        throw "Nakon klika nije potvrdjen Top Eleven ekran niti je pronadjen novi X za $PlayerLabel."
     }
 
     if (-not $adClosed) {
         throw "X je kliknut, ali reklama za $PlayerLabel nije zatvorena."
     }
 
-    Wait-Agent 1200
+    Wait-Agent $script:TransitionBufferMs
     Add-Log "Zavrsen automatski odmor: $PlayerLabel"
 }
 
@@ -842,44 +1148,44 @@ function Run-TeamRestManualQueue {
     Wait-ManualTeamRestAd $Handle 'GK'
 
     $topRows = @(
-        @{ Label = 'DL'; Y = 0.345 },
-        @{ Label = 'DC 1'; Y = 0.421 },
-        @{ Label = 'DC 2'; Y = 0.498 },
-        @{ Label = 'DR'; Y = 0.574 },
-        @{ Label = 'DMC'; Y = 0.651 },
-        @{ Label = 'MC 1'; Y = 0.728 }
+        @{ Label = 'DL'; Y = 0.336 },
+        @{ Label = 'DC 1'; Y = 0.417 },
+        @{ Label = 'DC 2'; Y = 0.497 },
+        @{ Label = 'DR'; Y = 0.576 },
+        @{ Label = 'DMC'; Y = 0.656 },
+        @{ Label = 'MC 1'; Y = 0.736 }
     )
     foreach ($player in $topRows) {
-        Click-Relative $Handle 0.958 $player.Y ("plus za {0}" -f $player.Label)
+        Click-GameRelative $Handle 0.976 $player.Y ("plus za {0}" -f $player.Label)
         Wait-Agent 1200
         Wait-ManualTeamRestAd $Handle $player.Label
     }
 
     Scroll-PlayerList $Handle 'Down'
     $bottomRows = @(
-        @{ Label = 'MC 2'; Y = 0.275 },
-        @{ Label = 'AML'; Y = 0.352 },
-        @{ Label = 'AMR'; Y = 0.430 },
-        @{ Label = 'ST'; Y = 0.507 }
+        @{ Label = 'MC 2'; Y = 0.256 },
+        @{ Label = 'AML'; Y = 0.336 },
+        @{ Label = 'AMR'; Y = 0.417 },
+        @{ Label = 'ST'; Y = 0.497 }
     )
     foreach ($player in $bottomRows) {
-        Click-Relative $Handle 0.958 $player.Y ("plus za {0}" -f $player.Label)
+        Click-GameRelative $Handle 0.976 $player.Y ("plus za {0}" -f $player.Label)
         Wait-Agent 1200
         Wait-ManualTeamRestAd $Handle $player.Label
     }
 
     Scroll-PlayerList $Handle 'Up'
-    Click-Relative $Handle 0.958 0.345 'plus za DL - ponovo'
+    Click-GameRelative $Handle 0.976 0.336 'plus za DL - ponovo'
     Wait-Agent 1200
     Wait-ManualTeamRestAd $Handle 'DL - ponovo'
 
     Scroll-PlayerList $Handle 'Down'
     foreach ($player in @(
-        @{ Label = 'ST - ponovo'; Y = 0.507 },
-        @{ Label = 'AMR - ponovo'; Y = 0.430 },
-        @{ Label = 'AML - ponovo'; Y = 0.352 }
+        @{ Label = 'ST - ponovo'; Y = 0.497 },
+        @{ Label = 'AMR - ponovo'; Y = 0.417 },
+        @{ Label = 'AML - ponovo'; Y = 0.336 }
     )) {
-        Click-Relative $Handle 0.958 $player.Y ("plus za {0}" -f $player.Label)
+        Click-GameRelative $Handle 0.976 $player.Y ("plus za {0}" -f $player.Label)
         Wait-Agent 1200
         Wait-ManualTeamRestAd $Handle $player.Label
     }
@@ -904,29 +1210,14 @@ function Start-Automation {
     $stopButton.Enabled = $true
 
     try {
-        Set-Status 'Pokrećem Top Eleven preko desktop prečice…'
-        if (-not (Test-Path -LiteralPath $script:TopElevenShortcut)) {
-            throw "Top Eleven desktop prečica nije pronađena: $script:TopElevenShortcut"
+        Set-Status 'Koristim vec otvoreni Top Eleven i odmah pokrecem glavni dio...'
+        $handle = Get-BlueStacksWindow
+        if ($handle -eq [IntPtr]::Zero) {
+            throw 'Otvoreni BlueStacks prozor nije pronadjen.'
         }
-
-        Start-Process -FilePath $script:TopElevenShortcut
-        Wait-ForCondition 'pokretanje Top Elevena i BlueStacksa' 120 {
-            $script:currentHandle = Get-BlueStacksWindow
-            $script:currentHandle -ne [IntPtr]::Zero
-        } | Out-Null
-        $handle = $script:currentHandle
-
-        [Win32Agent]::ShowWindow($handle, 3) | Out-Null
         [Win32Agent]::SetForegroundWindow($handle) | Out-Null
-        Wait-Agent 100
+        Wait-Agent $script:ShortTransitionBufferMs
 
-        Set-Status 'Čekam da se Top Eleven učita (do 3 minute)…'
-        Wait-ForCondition 'učitavanje početnog ekrana igre' 180 {
-            Test-GameHomeLoaded $handle
-        } | Out-Null
-        Wait-Agent 50
-
-        Dismiss-GamePopups $handle
         if ($script:Mode -eq 'OdmoriEkipu') {
             Open-TeamRest $handle
             Run-TeamRestManualQueue $handle
@@ -950,19 +1241,20 @@ function Start-Automation {
             Set-Status ("BESPLATNO je spremno - kliknem automatski. (reklama #{0})" -f ($totalAdsWatched + 1)) ([System.Drawing.Color]::FromArgb(120, 240, 150))
 
             if ($script:Mode -eq 'OdmoriEkipu') {
-                Click-Relative $handle 0.755 0.872 'BESPLATNO - odmor GK'
+                Click-GameRelative $handle 0.778 0.880 'BESPLATNO - odmor GK'
             }
             else {
                 Click-Relative $handle 0.890 0.245 'BESPLATNO'
             }
             $adStartedAt = Get-Date
 
-            Set-Status 'Reklama je pokrenuta. Cekam 40 sekundi prije detekcije X-a...'
+            Set-Status 'Reklama je pokrenuta. Cekam 60 sekundi prije detekcije X-a...'
             $adCloseDeadline = (Get-Date).AddMinutes(5)
-            $xDetectionStartsAt = (Get-Date).AddSeconds(40)
+            $xDetectionStartsAt = (Get-Date).AddSeconds(60)
             $googlePlayBadgeClicked = $false
-            $googlePlayProbeCount = 0
-            $firstGooglePlayProbeAt = $adStartedAt.AddSeconds(1)
+            $yellowGooglePlayAttempted = $false
+            $portraitGooglePlayNextAttemptAt = $adStartedAt.AddSeconds(60)
+            $portraitGooglePlayAttemptCount = 0
             $googlePlayReminderAt = (Get-Date).AddSeconds(75)
             $googlePlayReminderShown = $false
             $xDetectionStarted = $false
@@ -975,30 +1267,76 @@ function Start-Automation {
                     Start-Sleep -Milliseconds 50
                     continue
                 }
-                if (-not $googlePlayBadgeClicked -and (Test-AdGooglePlayBadge $handle)) {
-                    $googlePlayBadgeClicked = $true
-                    Set-Status 'Kratki Google Play badge je prepoznat - kliknem ga odmah...' ([System.Drawing.Color]::FromArgb(255, 210, 100))
-                    Click-Relative $handle 0.085 0.058 'Google Play badge u reklami'
-                    Wait-Agent 500
-                    continue
+                if ((Get-Date) -ge $xDetectionStartsAt -and (Test-YellowAdControlReady $handle)) {
+                    if ($script:DetectedYellowControlKind -eq 'google_play') {
+                        # A real close X always wins over a yellow Play candidate.
+                        if (Test-AdCloseReady $handle) {
+                            if ($script:DetectedAdCloseKind -eq 'skip') {
+                                Click-Relative $handle $script:DetectedAdCloseX $script:DetectedAdCloseY '>> - nastavi reklamu'
+                                Wait-Agent $script:TransitionBufferMs
+                                $script:XDetectorStableCount = 0
+                                $script:XDetectorStableSince = $null
+                                continue
+                            }
+                            $adCloseReady = $true
+                            break
+                        }
+                        if (-not $googlePlayBadgeClicked -and -not $yellowGooglePlayAttempted) {
+                            $yellowGooglePlayAttempted = $true
+                            Set-Status 'Zuto Google Play dugme je pronadjeno - otvaram Store...' ([System.Drawing.Color]::FromArgb(255, 210, 100))
+                            Click-Relative $handle $script:DetectedYellowControlX $script:DetectedYellowControlY 'zuto Google Play dugme'
+                            Wait-Agent 2000
+                            if (Restore-AdFromGooglePlay $handle $adStartedAt) {
+                                $googlePlayBadgeClicked = $true
+                            }
+                            continue
+                        }
+                    }
+                    else {
+                        $script:DetectedAdCloseX = $script:DetectedYellowControlX
+                        $script:DetectedAdCloseY = $script:DetectedYellowControlY
+                        $script:DetectedAdCloseKind = 'close'
+                        $adCloseReady = $true
+                        Set-Status 'Zuti X je pronadjen.' ([System.Drawing.Color]::FromArgb(120, 240, 150))
+                        break
+                    }
                 }
-                $runGooglePlayProbe = -not $googlePlayBadgeClicked -and
+                if (-not $googlePlayBadgeClicked -and
+                    -not $yellowGooglePlayAttempted -and
+                    $portraitGooglePlayAttemptCount -lt 3 -and
                     (Test-PortraitAdWindow $handle) -and
-                    (($googlePlayProbeCount -eq 0 -and (Get-Date) -ge $firstGooglePlayProbeAt) -or
-                     ($googlePlayProbeCount -eq 1 -and (Get-Date) -ge $xDetectionStartsAt))
-                if ($runGooglePlayProbe) {
-                    $googlePlayProbeCount++
-                    Set-Status "Sigurnosni pokusaj Google Play badgea ($googlePlayProbeCount/2)..." ([System.Drawing.Color]::FromArgb(255, 210, 100))
-                    Click-Relative $handle 0.085 0.058 'Google Play badge - portretni sigurnosni pokusaj'
-                    Wait-Agent 350
+                    (Get-Date) -ge $portraitGooglePlayNextAttemptAt) {
+                    $portraitGooglePlayAttemptCount++
+                    Set-Status "Aktiviram Google Play tok (pokusaj $portraitGooglePlayAttemptCount/3)..." ([System.Drawing.Color]::FromArgb(255, 210, 100))
+                    Click-GameRelative $handle 0.104 0.023 'Google Play zona - aktivacija loga'
+                    Wait-Agent 2000
+                    if (Restore-AdFromGooglePlay $handle $adStartedAt) {
+                        $googlePlayBadgeClicked = $true
+                        continue
+                    }
+                    Click-GameRelative $handle 0.104 0.023 'Google Play logo - otvori Store'
+                    Wait-Agent 2000
+                    if (Restore-AdFromGooglePlay $handle $adStartedAt) {
+                        $googlePlayBadgeClicked = $true
+                        continue
+                    }
+                    $portraitGooglePlayNextAttemptAt = (Get-Date).AddSeconds(8)
                     continue
                 }
                 if ((Get-Date) -ge $xDetectionStartsAt) {
                     if (-not $xDetectionStarted) {
                         $xDetectionStarted = $true
-                        Set-Status 'Proslo je 40 sekundi. Pokrecem detekciju X-a...'
+                        Set-Status 'Proslo je 60 sekundi. Pokrecem detekciju X-a...'
                     }
                     if (Test-AdCloseReady $handle) {
+                        if ($script:DetectedAdCloseKind -eq 'skip') {
+                            Set-Status 'Dugme >> je spremno - nastavljam reklamu...' ([System.Drawing.Color]::FromArgb(255, 210, 100))
+                            Click-Relative $handle $script:DetectedAdCloseX $script:DetectedAdCloseY '>> - nastavi reklamu'
+                            Wait-Agent $script:TransitionBufferMs
+                            $script:XDetectorStableCount = 0
+                            $script:XDetectorStableSince = $null
+                            continue
+                        }
                         $adCloseReady = $true
                         break
                     }
@@ -1024,32 +1362,41 @@ function Start-Automation {
                 $closeX = if ($null -ne $script:DetectedAdCloseX) { $script:DetectedAdCloseX } else { 0.9525 }
                 $closeY = if ($null -ne $script:DetectedAdCloseY) { $script:DetectedAdCloseY } else { 0.077 }
                 Click-Relative $handle $closeX $closeY 'X (zatvori reklamu)'
-                Wait-Agent 800
+                Wait-Agent $script:TransitionBufferMs
                 if (Restore-AdFromGooglePlay $handle $adStartedAt) {
                     if (-not (Wait-ForAdXAfterGooglePlayReturn $handle $adCloseDeadline $adStartedAt 'reklamu')) {
                         throw 'Nakon povratka iz Google Play Storea X nije pronadjen.'
                     }
                     continue
                 }
-                if (-not (Test-AdCloseReady $handle)) { $adClosed = $true; break }
-                Add-Log 'X klik nije zatvorio reklamu; pokušavam ponovo.'
+                $exitState = Wait-ForAdExitOrControl $handle 10
+                if ($exitState -eq 'exited') {
+                    $adClosed = $true
+                    Add-Log 'Top Eleven ekran je vizuelno potvrdjen nakon reklame.'
+                    break
+                }
+                if ($exitState -eq 'control') {
+                    Add-Log 'Reklama je jos otvorena; pronadjena je nova aktivna kontrola.'
+                    continue
+                }
+                throw 'Nakon klika nije potvrdjen Top Eleven ekran niti je pronadjen novi X.'
             }
 
             if ($adClosed) {
                 $totalAdsWatched++
                 Add-Log "Reklama #$totalAdsWatched uspješno zatvorena."
-                Wait-Agent 500
+                Wait-Agent $script:ShortTransitionBufferMs
 
                 # Provjeri je li dugme BESPLATNO postalo sivo (nedostupno)
                 # Nakon zatvaranja reklame, vrati se na ekran prodavnice
                 Set-Status 'Provjeravam je li dugme BESPLATNO još uvijek dostupno...'
                 
                 # Ponekad treba malo vremena da se prodavnica osvježi
-                Wait-Agent 200
+                Wait-Agent $script:ShortTransitionBufferMs
                 
                 if ($script:Mode -eq 'OdmoriEkipu') {
-                    Click-Relative $handle 0.958 0.269 'GK plus - sljedeci odmor'
-                    Wait-Agent 500
+                    Click-GameRelative $handle 0.976 0.256 'GK plus - sljedeci odmor'
+                    Wait-Agent $script:TransitionBufferMs
                 }
                 else {
                     # Ako prodavnica nije vidljiva, pokušaj je ponovo otvoriti
@@ -1076,7 +1423,7 @@ function Start-Automation {
                 }
                 else {
                     Set-Status "Reklama #$totalAdsWatched zatvorena. Čekam sljedeću..." ([System.Drawing.Color]::FromArgb(220, 235, 255))
-                    Wait-Agent 500
+                    Wait-Agent $script:TransitionBufferMs
                     # Nastavi petlju za sljedeću reklamu
                 }
             }
