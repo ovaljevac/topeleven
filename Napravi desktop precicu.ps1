@@ -1,14 +1,15 @@
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 $projectDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
-$launcher = Join-Path $projectDirectory 'Pokreni Top Eleven Agent.cmd'
+$activeDirectory = Join-Path $projectDirectory 'AI-Agent'
+$launcher = Join-Path $activeDirectory 'Pokreni AI Agent.cmd'
 $desktop = [Environment]::GetFolderPath('Desktop')
 $shortcutPath = Join-Path $desktop 'Top Eleven Agent.lnk'
 
 $shell = New-Object -ComObject WScript.Shell
 $shortcut = $shell.CreateShortcut($shortcutPath)
 $shortcut.TargetPath = $launcher
-$shortcut.WorkingDirectory = $projectDirectory
+$shortcut.WorkingDirectory = $activeDirectory
 $shortcut.Description = 'Pokreni Top Eleven Agent'
 $shortcut.Save()
 

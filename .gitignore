@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+AI-Agent/debug/
+AI-Agent/pydeps/
+AI-Agent/.env
+AI-Agent/logs/

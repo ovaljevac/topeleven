@@ -1,0 +1,125 @@
+{
+  "zip": "../../ss.zip",
+  "cases": [
+    {
+      "name": "portrait ad still running",
+      "image": "Screenshot 2026-08-04 082859.png",
+      "crop": [594, 0, 1188, 1017],
+      "mode": "x",
+      "expectedFound": false
+    },
+    {
+      "name": "portrait video skip top right",
+      "image": "Screenshot 2026-08-04 083044.png",
+      "crop": [0, 0, 1781, 986],
+      "mode": "x",
+      "expectedFound": true,
+      "expectedKind": "skip"
+    },
+    {
+      "name": "large yellow background is not Google Play",
+      "image": "Screenshot 2026-08-04 085349.png",
+      "crop": [0, 0, 1778, 1015],
+      "mode": "yellow_ad_control",
+      "expectedFound": false
+    },
+    {
+      "name": "Top Eleven home resource cards",
+      "image": "Screenshot 2026-08-04 165039.png",
+      "crop": [0, 0, 1323, 758],
+      "mode": "top_resource_cards",
+      "expectedFound": true
+    },
+    {
+      "name": "Top Eleven store resource cards",
+      "image": "Screenshot 2026-08-05 094040.png",
+      "crop": [546, 34, 1876, 804],
+      "mode": "top_resource_cards",
+      "expectedFound": true
+    },
+    {
+      "name": "portrait ad without close control",
+      "image": "Screenshot 2026-08-05 105021.png",
+      "crop": [986, 35, 1436, 803],
+      "mode": "x",
+      "expectedFound": false
+    },
+    {
+      "name": "yellow Google Play pill",
+      "image": "Screenshot 2026-08-05 110749.png",
+      "crop": [546, 35, 1877, 803],
+      "mode": "yellow_ad_control",
+      "expectedFound": true,
+      "expectedKind": "google_play"
+    },
+    {
+      "name": "yellow Google Play pill is not a skip control",
+      "image": "Screenshot 2026-08-05 110749.png",
+      "crop": [546, 35, 1877, 803],
+      "mode": "x",
+      "expectedFound": false
+    },
+    {
+      "name": "yellow circular close X",
+      "image": "Screenshot 2026-08-05 110817.png",
+      "crop": [546, 35, 1877, 803],
+      "mode": "yellow_ad_control",
+      "expectedFound": true,
+      "expectedKind": "close"
+    },
+    {
+      "name": "landscape game skip top right",
+      "image": "Screenshot 2026-08-05 113246.png",
+      "crop": [546, 35, 1877, 803],
+      "mode": "x",
+      "expectedFound": true,
+      "expectedKind": "skip"
+    },
+    {
+      "name": "second yellow Google Play pill",
+      "image": "Screenshot 2026-08-05 113807.png",
+      "crop": [531, 30, 1862, 797],
+      "mode": "yellow_ad_control",
+      "expectedFound": true,
+      "expectedKind": "google_play"
+    },
+    {
+      "name": "Chrome play.google 404 destination",
+      "image": "Screenshot 2026-08-05 114154.png",
+      "crop": [545, 35, 1875, 803],
+      "mode": "play_destination",
+      "expectedFound": true
+    },
+    {
+      "name": "GET overlay close control",
+      "image": "Screenshot 2026-08-05 114417.png",
+      "crop": [971, 27, 1421, 796],
+      "mode": "x",
+      "expectedFound": true,
+      "expectedKind": "close"
+    },
+    {
+      "name": "gray ad close top left",
+      "image": "Screenshot 2026-08-05 122611.png",
+      "crop": [546, 35, 1876, 803],
+      "mode": "x",
+      "expectedFound": true,
+      "expectedKind": "close"
+    },
+    {
+      "name": "blank Chrome play.google destination",
+      "image": "Screenshot 2026-08-05 130127.png",
+      "crop": [528, 34, 1859, 802],
+      "mode": "play_destination",
+      "expectedFound": true
+    },
+    {
+      "name": "third yellow Google Play pill",
+      "image": "Screenshot 2026-08-05 130323.png",
+      "crop": [546, 27, 1877, 796],
+      "mode": "yellow_ad_control",
+      "expectedFound": true,
+      "expectedKind": "google_play"
+    }
+  ]
+}

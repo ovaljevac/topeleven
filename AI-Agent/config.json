@@ -1,0 +1,33 @@
+{
+  "windowTitle": "BlueStacks App Player",
+  "referenceWindowsDpi": 96,
+  "titleBarPx": 40,
+  "rightToolbarPx": 42,
+  "adWaitSeconds": 60,
+  "xDetectionDelaySeconds": 5,
+  "scrollSteps": 6,
+  "tvClickBufferMs": 1500,
+  "tvNavigationBufferMs": 2000,
+  "tvWatchButtonWaitSeconds": 30,
+  "campusHundredButtonWaitSeconds": 180,
+  "campusOpenBufferMs": 3000,
+  "campusBuildingClickAttempts": 3,
+  "campusDetailOpenWaitSeconds": 8,
+  "putSavezaAdButtonWaitSeconds": 30,
+  "putSavezaMenuScrollAttempts": 10,
+  "putSavezaMenuScrollSteps": 2,
+  "stageRetryAttempts": 3,
+  "stageRecoveryLaunchTimeoutSeconds": 90,
+  "trainingPlayerClickBufferMs": 1800,
+  "trainingPlayerCloseBufferMs": 1500,
+  "connectionRecoveryWaitMs": 12000,
+  "adWakeTapAfterSeconds": 75,
+  "adWakeTapIntervalSeconds": 12,
+  "adWakeBurstSeconds": 6,
+  "adWakeTapMaximum": 20,
+  "transitionMs": {
+    "short": 500,
+    "normal": 1800,
+    "long": 3000
+  }
+}
