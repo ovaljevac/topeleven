@@ -3,4 +3,5 @@ __pycache__/
 AI-Agent/debug/
 AI-Agent/pydeps/
 AI-Agent/.env
+AI-Agent/discord_config.json
 AI-Agent/logs/
