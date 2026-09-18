@@ -1,20 +1,20 @@
-# Završetak i restart: zeleni i trening igrača
+# Completion and Restart: Greens and Player Training
 
-Od 2026-09-02 ova dva toka razlikuju tekst i boju ciljane ponude:
+Since 2026-09-02, these two workflows distinguish the target offer by both text and color:
 
-| Stanje | Postupak |
-|---|---|
-| Plavo BESPLATNO | Lokalna provjera dugmeta i klik. |
-| Sivo/tamno BESPLATNO | Dvije svježe AI potvrde, pauza 10 s, postojeći restart tačne BlueStacks instance, ponovno otvaranje odgovarajućeg toka. |
-| OGRAN. DOSTIGNUTO | Dvije svježe AI potvrde; normalan završetak faze. |
-| Nepoznato, skriveno dugme ili tačkice učitavanja | Čekanje; nikad dokaz ograničenja niti razlog za restart. Nakon roka prijavljuje grešku, ne uspjeh. |
+| State | Action |
+| --- | --- |
+| Blue `BESPLATNO` | Validate the button locally and click it. |
+| Gray or dark `BESPLATNO` | Require two fresh AI confirmations, pause for 10 seconds, restart the exact BlueStacks instance using the existing process, and reopen the appropriate workflow. |
+| `OGRAN. DOSTIGNUTO` | Require two fresh AI confirmations and finish the stage normally. |
+| Unknown state, hidden button, or loading dots | Wait. This is never proof of a limit and never a reason to restart. Report an error rather than success after the deadline. |
 
-AI čita samo ponudu zelenih odmora u prodavnici ili besplatnog oporavka KONDICIJE u profilu. Plavi MORAL, plaćeni Unajmi i navigacijski BESPLATNI nisu ciljevi. Posebni AI odgovori ne smiju sadržavati akciju klika. Potvrđene klasifikacije zahtijevaju confidence najmanje 0,90.
+AI reads only the green-rest offer in the store or the free CONDITION recovery offer in the player profile. Blue MORALE, paid Hire, and navigational FREE controls are not targets. The dedicated AI responses must not contain a click action. Confirmed classifications require confidence of at least 0.90.
 
-Provjere se ponavljaju najranije nakon 12 s i prolaze postojeći zajednički Gemini limiter od najviše 15 zahtjeva u kliznih 60 s. Ove provjere su dodatne u odnosu na prepoznavanje reklamnog X-a; pravilo jedne AI potvrde X-a nije promijenjeno.
+Checks are repeated no sooner than every 12 seconds and pass through the existing shared Gemini limiter of at most 15 requests in a rolling 60-second window. These checks are additional to ad-X recognition; the rule requiring one AI confirmation for X is unchanged.
 
-Ako je nakon uspješnog restarta ponovo potvrđeno sivo BESPLATNO, ponavlja restart bez starog ograničenja na jedan restart. STOP ostaje dostupan. Greška samog restarta ili neprepoznat ekran i dalje prekidaju rad s greškom.
+If gray `BESPLATNO` is confirmed again after a successful restart, the restart is repeated without the former one-restart limit. STOP remains available. A restart failure or unrecognized screen still terminates the workflow with an error.
 
-Zeleni nakon restarta ponovo otvaraju prodavnicu. Trening ponovo otvara IZVJEŠTAJI → PONOVI, svježe čita FIT i pronalazi igrača ispod 30%; ne čuva staru koordinatu igrača preko restarta. Ako je potvrđeno ograničenje, ne pokreće naredni trening.
+After a restart, the Greens workflow reopens the store. Training reopens `IZVJESTAJI` -> `PONOVI`, reads FIT again, and finds a player below 30%; it does not retain the old player coordinate across a restart. If the limit is confirmed, it does not start the next training session.
 
-Sigurnosni limiti trening ciklusa i drugi rokovi ostaju greške, a ne normalan završetak zbog potrošenih reklama. Vizuelna AI klasifikacija nije garancija savršenog prepoznavanja. Automatski testovi pokrivaju validaciju odgovora i simulirane tokove; stvarni API/igra nisu dio tih testova.
+Training-cycle safety limits and other deadlines remain errors rather than normal completion caused by exhausted ads. Visual AI classification is not a guarantee of perfect recognition. Automated tests cover response validation and simulated workflows; the real API and game are not part of those tests.

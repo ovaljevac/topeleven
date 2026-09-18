@@ -1,17 +1,17 @@
-# Top Eleven kompletni AI agent
+# Complete Top Eleven AI Agent
 
-Pokreni `Pokreni AI Agent.cmd`, izaberi `Pokreni sve`, odaberi pocetnu fazu i pritisni `POKRENI AGENTA`. Stari direktni launcher `Pokreni sve redom.cmd` i dalje pokrece puni redoslijed od Mourinho faze.
+Run `Pokreni AI Agent.cmd`, select `Pokreni sve`, choose the starting stage, and click `POKRENI AGENTA`. The legacy direct launcher `Pokreni sve redom.cmd` still starts the full sequence from the Mourinho stage.
 
-Redoslijed je:
+The sequence is:
 
-1. Mourinho reklama.
-2. Top Eleven TV reklame.
-3. Put saveza dnevna reklama.
-4. Kampus objekti ispod 100%.
-5. Uzmi 25 zelenih (`Zeleni` tok).
+1. Mourinho ad.
+2. Top Eleven TV ads.
+3. Daily Alliance Road ad.
+4. Campus buildings below 100%.
+5. Collect 25 greens (the `Zeleni` workflow).
 
-Kod obicne AI ili vizuelne neizvjesnosti agent ne gasi igru nego ponavlja sigurnu provjeru na istom koraku. Tvrdi restart tacne BlueStacks instance koristi se samo kada je reklama potvrdeno zaglavljena ili kada je prije nastavka potreban provjeren pocetni ekran. Neuspjela faza se zapisuje u log, nakon sigurnog preflighta prelazi se na sljedecu fazu, a Manager zavrsetak prikazuje kao upozorenje `Zavrseno uz greske`. Dugme `ZAUSTAVI` prekida cijeli zajednicki tok.
+When ordinary AI or visual uncertainty occurs, the agent does not close the game. It repeats a safe check at the same step. A hard restart of the exact BlueStacks instance is used only when an ad is confirmed to be stuck or a verified home screen is required before continuing. A failed stage is recorded in the log; after a safe preflight check, the agent proceeds to the next stage, and the Manager reports the result as `Zavrseno uz greske` (Completed with errors). The `ZAUSTAVI` button stops the entire combined workflow.
 
-Ako reklama otvori Google Play Store ili Chrome, agent preko trenutnog BlueStacks ADB activity stanja salje Android Back, vraca se u reklamu i zavrsava njen X. Sljedeca faza ne dobija pravo na klik dok `MainPlayerNativeActivity` i Top Eleven zaglavlje nisu stabilno potvrdeni.
+If an ad opens the Google Play Store or Chrome, the agent sends Android Back through the current BlueStacks ADB connection, returns to the ad, and closes it with its X control. The next stage cannot click anything until `MainPlayerNativeActivity` and the Top Eleven header have been confirmed as stable.
 
-Postojeci pojedinacni launcheri i dalje rade nepromijenjeno.
+All existing individual launchers continue to work unchanged.

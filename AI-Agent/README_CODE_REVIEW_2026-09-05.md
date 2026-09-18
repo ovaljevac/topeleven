@@ -1,51 +1,24 @@
-# Pregled koda — 5. septembar 2026.
+# Code Review — September 5, 2026
 
-Pregled je obuhvatio reklamne petlje, pocetnu provjeru ekrana, trening,
-prekid rada, AI validaciju, Discord pokretanje i pracenje, cuvanje napretka,
-izvjestaje gresaka i Manager. Ovo je pregled konkretnih putanja i regresija,
-a ne garancija da su svi moguci kvarovi uklonjeni.
+The review covered ad loops, initial screen validation, Training, cancellation, AI validation, Discord startup and monitoring, progress persistence, error reports, and the Manager. This was a review of specific paths and regressions, not a guarantee that every possible failure has been eliminated.
 
-## Ispravke ovog pregleda
+## Fixes from this review
 
-- Odmor ekipe i zajednicki reklamni tok sada koriste rezultat wake provjere
-  u istoj iteraciji. Ne salju novu AI analizu koja bi odbacila upravo
-  potvrdjen povratak ili reklamnu kontrolu. Zeleni takodjer cuvaju wake
-  rezultate za skip i Google Play.
-- Trening prvo lokalno ceka ekran, a nakon pet sekundi provjerava popup
-  prekinute veze. Naredni pokusaji imaju razmak; normalni kratki prelazi
-  ne trosе dodatni AI zahtjev.
-- Nakon restarta zbog sivog BESPLATNO trening nastavlja oporavak kondicije
-  preko IZVJESTAJI/PONOVI. Ne pokusava ponovo zapoceti trening prije
-  nastavka tog oporavka. Procitano ogranicenje zavrsava fazu.
-- Korisnicki prekid tokom AI zahtjeva propagira se kao prekid, umjesto
-  da bude predstavljen kao kvar AI providera.
-- Obje osnovne funkcije klika odbijaju NaN, beskonacne i koordinate van
-  raspona 0–1 prije sporednih efekata.
-- AI odgovor s pogresnim tipom akcije, ekrana ili kontrole vraca greske
-  validacije umjesto izuzetka. Tekstualni `topElevenReturned` nije boolean
-  potvrda povratka.
-- Discord serijalizuje istovremene zahtjeve za pokretanje, zapocinje
-  nadzor prije slanja potvrde i odgadja odgovor dok pokrece proces.
-- Privremena greska slanja Discord loga ne uklanja aktivni proces iz
-  pracenja. Neposlani redovi ostaju za naredni pokusaj. Pri djelimicno
-  uspjesnom slanju vise blokova moguce je ponavljanje vec poslanog bloka.
-- Nestanak metadata fajla tokom citanja izvjestaja ne prekida citac.
-- Pocetna AI provjera zadrzava identitet provjere kroz ponavljanja,
-  omogucavajuci vise uzastopnih potvrda ako konfiguracija to zahtijeva.
+- Team Rest and the shared ad workflow now use the wake-check result in the same iteration. They do not send a new AI analysis that would discard the return or ad control that was just confirmed. Greens also retains wake results for skip and Google Play.
+- Training first waits locally for the screen and checks for the disconnected-session popup after five seconds. Subsequent attempts are spaced out, so normal short transitions do not consume an extra AI request.
+- After a restart caused by a gray `BESPLATNO`, Training continues condition recovery through `IZVJESTAJI` and `PONOVI`. It does not attempt to start training again before resuming that recovery. A recognized limit finishes the stage.
+- User cancellation during an AI request is propagated as cancellation instead of being reported as an AI provider failure.
+- Both base click functions reject NaN, infinite values, and coordinates outside the 0–1 range before any side effects.
+- An AI response with an incorrect action, screen, or control type returns validation errors instead of throwing an exception. A textual `topElevenReturned` value is not accepted as a Boolean return confirmation.
+- Discord serializes simultaneous start requests, begins monitoring before sending confirmation, and defers the interaction response while starting the process.
+- A temporary Discord log-send failure does not remove the active process from monitoring. Unsent lines remain available for the next attempt. If a multi-block send partly succeeds, a previously sent block may be repeated.
+- A metadata file disappearing while reports are being read does not terminate the reader.
+- Initial AI validation preserves the check identity across retries, enabling multiple consecutive confirmations when the configuration requires them.
 
-## Provjere i granice
+## Validation and limitations
 
-Pokrenut je kompletan unittest skup, ukljucujuci testove na referentnim
-slikama i simulacije PowerShell tokova. Dodatne simulacije pokrivaju
-neispravan AI JSON, prekid zahtjeva, popup treninga, wake povratak,
-neispravne koordinate, Discord prekid mreze i konkurentno pokretanje.
-Azuriran je zastarjeli test nastavka treninga da simulira stvarni dijalog
-UMORNI IGRACI i zabrani novi pocetak treninga nakon restarta prije oporavka.
+The complete unittest suite was run, including tests using reference images and simulated PowerShell workflows. Additional simulations cover invalid AI JSON, request cancellation, the Training popup, wake return, invalid coordinates, Discord network interruption, and concurrent startup. An outdated Training resume test was updated to simulate the real `UMORNI IGRACI` dialog and to prohibit a new training start after restart until recovery is complete.
 
-PowerShell fajlovi prolaze parser. Agent i Manager prolaze SelfTest, ali
-Agent SelfTest trenutno ne nalazi vidljivi prozor konfigurisanog BlueStacksa
-niti ADB serial. Zato klikovi, Gemini zahtjevi i Discord slanje nisu
-provjereni uzivo. Opcionalni `ss.zip` arhiv nije dostupan; testovi lokalnih
-referentnih slika jesu ukljuceni.
+The PowerShell files pass parsing. The Agent and Manager pass SelfTest, but Agent SelfTest currently does not find a visible window for the configured BlueStacks instance or an ADB serial. Therefore, clicks, Gemini requests, and Discord delivery were not validated live. The optional `ss.zip` archive is unavailable; local reference-image tests are included.
 
-Za ucitavanje izmjena potrebno je ponovo pokrenuti agent i Discord bot.
+Restart the agent and Discord bot to load the changes.

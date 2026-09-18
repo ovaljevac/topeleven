@@ -1,14 +1,14 @@
-# Put saveza AI agent
+# Alliance Road AI Agent
 
-Pokreni `Pokreni Put saveza Agent.cmd`, pa pritisni `POKRENI`.
+Run `Pokreni Put saveza Agent.cmd`, then click `POKRENI`.
 
-Tok automatski:
+The workflow automatically:
 
-1. vrati igru na Pocetni ekran;
-2. otvori bocni meni i skroluje dok vizuelno ne pronadje `Savezi`;
-3. otvori `PUT SAVEZA`;
-4. ceka tacno plavo video dugme `IDI` (zelena `IDI` dugmad ignorise);
-5. koristi zajednicki AI-only tok za reklamu;
-6. nakon povratka pronalazi i pritisce modalni `X`.
+1. returns the game to the Home screen;
+2. opens the side menu and scrolls until it visually finds `Savezi`;
+3. opens `PUT SAVEZA`;
+4. waits for the correct blue video `IDI` button and ignores green `IDI` buttons;
+5. uses the shared AI-only ad workflow;
+6. finds and clicks the modal X after returning.
 
-Ako je dnevna Video Master reklama vec zavrsena, agent ne klikce druga `IDI` dugmad nego samo zatvara Put saveza.
+If the daily Video Master ad has already been completed, the agent does not click any other `IDI` buttons and only closes Alliance Road.

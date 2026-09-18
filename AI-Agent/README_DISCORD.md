@@ -1,51 +1,51 @@
-# Discord kontrola Top Eleven agenta
+# Discord Control for the Top Eleven Agent
 
-Bot moze pokrenuti samo unaprijed dozvoljene Top Eleven tokove. Ne prihvata proizvoljne terminalske komande.
+The bot can start only pre-approved Top Eleven workflows. It does not accept arbitrary terminal commands.
 
-## 1. Napravi Discord aplikaciju
+## 1. Create a Discord application
 
-1. Otvori Discord Developer Portal i napravi **New Application**.
-2. U odjeljku **Bot** napravi bot i kopiraj njegov token. Token nikome ne salji i ne stavljaj ga u Git.
-3. U **OAuth2 > URL Generator** oznaci `bot` i `applications.commands`.
-4. Bot permissions: `View Channels`, `Send Messages` i `Use Slash Commands`.
-5. Otvori generisani URL i dodaj bota na svoj server.
+1. Open the Discord Developer Portal and create a **New Application**.
+2. In the **Bot** section, create a bot and copy its token. Never share the token or commit it to Git.
+3. Under **OAuth2 > URL Generator**, select `bot` and `applications.commands`.
+4. Grant these bot permissions: `View Channels`, `Send Messages`, and `Use Slash Commands`.
+5. Open the generated URL and add the bot to your server.
 
-Message Content Intent nije potreban jer bot koristi slash komande.
+Message Content Intent is not required because the bot uses slash commands.
 
-## 2. Konfigurisi pristup
+## 2. Configure access
 
-Najlakse je dvokliknuti `Postavi Discord Bot.cmd`. Otvorit ce tri prozora za token, Server ID i User ID te sam napraviti konfiguraciju.
+The easiest option is to double-click `Postavi Discord Bot.cmd`. It opens three dialogs for the token, Server ID, and User ID, then creates the configuration automatically.
 
-Kopiraj `discord_config.example.json` u `discord_config.json`, pa unesi:
+Alternatively, copy `discord_config.example.json` to `discord_config.json` and enter:
 
-- `token`: bot token iz Developer Portala
-- `guild_id`: ID Discord servera (komande se tako pojave odmah)
-- `allowed_user_ids`: tvoj Discord User ID; mozes dodati jos ID brojeva
-- `live_log`: `true` ako zelis automatske poruke iz loga
+- `token`: the bot token from the Developer Portal
+- `guild_id`: the Discord server ID, which makes commands appear immediately
+- `allowed_user_ids`: your Discord User ID; additional user IDs may be added
+- `live_log`: set to `true` to receive automatic log messages
 
-Za kopiranje ID-a ukljuci **Discord Settings > Advanced > Developer Mode**, zatim desni klik na server/korisnika i **Copy ID**.
+To copy an ID, enable **Discord Settings > Advanced > Developer Mode**, then right-click the server or user and select **Copy ID**.
 
-## 3. Instaliraj i pokreni
+## 3. Install and run
 
-Ako `python --version` ne radi, prvo instaliraj aktuelni Python 3 sa python.org i tokom instalacije oznaci **Add Python to PATH**.
+If `python --version` does not work, install a current Python 3 release from python.org and enable **Add Python to PATH** during installation.
 
-U PowerShellu, iz `AI-Agent` foldera:
+From the `AI-Agent` directory in PowerShell:
 
 ```powershell
 python -m pip install -r requirements.txt
 ```
 
-Zatim dvoklikni `Pokreni Discord Bot.cmd`. Taj prozor mora ostati otvoren dok koristis bota.
+Then double-click `Pokreni Discord Bot.cmd`. Its window must remain open while the bot is in use.
 
-## Komande
+## Commands
 
-- `/skripte` — prikazuje dozvoljene tokove
-- `/pokreni` — bira i pokrece tok
-- `/sve`, `/zeleni`, `/odmor`, `/tv`, `/mourinho`, `/kampus`, `/savez`, `/trening` — odmah pokrecu trazeni tok bez dodatnog izbora i klika
-- `/restart` — potpuno gasi konfiguriranu BlueStacks instancu, ponovo pokrece Top Eleven i ceka potvrdu pocetnog ekrana
-- `/start` — pokrece Top Eleven ako je zatvoren; ako vec radi, samo ga prebacuje u prvi plan
-- `/status` — prikazuje aktivni tok i trajanje
-- `/log` — zadnjih 20 redova loga
-- `/stop` ili `/zaustavi` — salje postojeci sigurni stop signal agentu
+- `/skripte` — lists the allowed workflows
+- `/pokreni` — selects and starts a workflow
+- `/sve`, `/zeleni`, `/odmor`, `/tv`, `/mourinho`, `/kampus`, `/savez`, `/trening` — immediately start the requested workflow without an additional selection or click
+- `/restart` — fully stops the configured BlueStacks instance, starts Top Eleven again, and waits for home-screen confirmation
+- `/start` — starts Top Eleven if it is closed; if it is already running, brings it to the foreground
+- `/status` — shows the active workflow and elapsed time
+- `/log` — shows the last 20 log lines
+- `/stop` or `/zaustavi` — sends the agent's existing safe-stop signal
 
-Bot namjerno dozvoljava samo jednu aktivnu skriptu jer svi tokovi kontrolisu istu BlueStacks instancu.
+The bot intentionally permits only one active script because every workflow controls the same BlueStacks instance.

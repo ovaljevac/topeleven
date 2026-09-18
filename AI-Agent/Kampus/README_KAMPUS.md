@@ -1,16 +1,16 @@
-# Top Eleven Kampus AI Agent
+# Top Eleven Campus AI Agent
 
-Pokreni `Pokreni Kampus Agent.cmd` dok je Top Eleven otvoren, zatim pritisni `POKRENI`.
+Run `Pokreni Kampus Agent.cmd` while Top Eleven is open, then click `POKRENI`.
 
-Tok:
+Workflow:
 
-1. Otvori bocni meni, ceka 2 sekunde, klikne `Kampus`, zatim ceka sigurnosne 3 sekunde da se ekran ucita.
-2. Potvrdi Kampus i klikne vizuelno pronadjenu lijevu ikonu alata.
-3. Gemini pregleda procente i bira naziv objekta ispod 100%. Odluka da vise nema takvih objekata i dalje mora biti potvrdena kroz dva svjeza skeniranja.
-4. Kampus kamera se stalno pomjera, zato se stara AI koordinata ne klika. Nakon Gemini odgovora agent odmah uzima svjezu sliku, projektivno poravna mapu i klikne unaprijed sigurnu unutrasnju tacku izabranog objekta. Ako poravnanje, najmanje tri zelene procentne oznake ili svjezi maintenance ekran nisu potvrdeni, nema klika. Poslije klika provjerava da li se detalj stvarno otvorio i po potrebi radi novi siguran pokusaj, najvise tri puta.
-5. U detalju objekta ceka do 180 sekundi da plava tipka stvarno sadrzi bijeli tekst `100%`; sama plava pozadina nije dovoljna.
-6. Pokrene reklamu istim AI-only/Google Play tokom. Gemini redovno provjerava reklamne kontrole svakih 20.5 sekundi, dok wake mehanizam po potrebi moze odmah zatraziti dodatnu provjeru.
-7. Nakon potvrdenog povratka u Top Eleven klikne sigurnu zonu ispod bustera da zatvori detalj.
-8. Ponavlja dok dvije svjeze Gemini provjere ne potvrde da su svi vidljivi objekti na 100%.
+1. Opens the side menu, waits two seconds, clicks `Kampus`, and then waits a three-second safety interval for the screen to load.
+2. Confirms Campus and clicks the visually detected left tool icon.
+3. Gemini inspects the percentages and selects the name of a building below 100%. A decision that no such buildings remain must still be confirmed by two fresh scans.
+4. The Campus camera moves continuously, so an old AI coordinate is never clicked. After the Gemini response, the agent immediately captures a fresh image, projectively aligns the map, and clicks a prevalidated interior point of the selected building. No click occurs unless the alignment, at least three green percentage labels, and a fresh maintenance screen are confirmed. After clicking, the agent verifies that the details panel actually opened and makes another safe attempt when needed, up to three attempts.
+5. In the building details, waits up to 180 seconds for the blue button to genuinely contain the white `100%` text. A blue background alone is insufficient.
+6. Starts the ad with the same AI-only and Google Play flow. Gemini regularly checks ad controls every 20.5 seconds, while the wake mechanism may request an immediate additional check when necessary.
+7. After a confirmed return to Top Eleven, clicks the safe area below the booster to close the details panel.
+8. Repeats until two fresh Gemini checks confirm that every visible building is at 100%.
 
-Tokom AI snimanja i klika prozor agenta se privremeno postavlja iza BlueStacksa, tako da ne moze prekriti objekat. Sigurnosni limit je 12 objekata po pokretanju. Vrijeme otvaranja Kampusa podesava se kroz `campusOpenBufferMs`, cekanje detalja kroz `campusDetailOpenWaitSeconds`, broj pokusaja kroz `campusBuildingClickAttempts`, a cekanje `100%` kroz `campusHundredButtonWaitSeconds` u roditeljskom `config.json`. Campus poravnanje radi samo nad mapom, bez fiksnog univerzalnog pomaka koordinata, i fail-closed je: ako kvalitet transformacije nije dovoljan, agent ne klikce.
+During AI capture and clicking, the agent window is temporarily placed behind BlueStacks so it cannot cover a building. The safety limit is 12 buildings per run. Campus opening time is configured with `campusOpenBufferMs`, details waiting with `campusDetailOpenWaitSeconds`, retry count with `campusBuildingClickAttempts`, and the `100%` wait with `campusHundredButtonWaitSeconds` in the parent `config.json`. Campus alignment operates only on the map, without a fixed universal coordinate offset, and fails closed: if transformation quality is insufficient, the agent does not click.

@@ -1,14 +1,14 @@
-# Mourinho AI agent
+# Mourinho AI Agent
 
-Pokreni `Pokreni Mourinho Agent.cmd` dok je Top Eleven otvoren na glavnom ekranu.
+Run `Pokreni Mourinho Agent.cmd` while Top Eleven is open on the main screen.
 
-Tok automatizacije:
+Automation flow:
 
-1. Potvrdi glavni ekran prema `1.png`.
-2. Posalje Gemini AI-u trenutni BlueStacks screenshot i trazi centar male kvadratne tipke desno od `Nivo spremnosti` progress bara i lijevo od `PREGLED UTAKMICE`. AI lokacija se koristi bez OpenCV odluke o tom dugmetu; dozvoljene su samo koordinate unutar readiness zone.
-3. Potvrdi Mourinho prozor prema `2.png`.
-4. Do 30 sekundi ceka plavo dugme koje mora sadrzavati prepoznatljiv `POGLEDAJ` tekst/ikonu. Obican plavi pravougaonik se ne prihvata.
-5. Pokrene reklamu i koristi isti OpenCV + Gemini AI tok za X, skip i Google Play kao TV agent.
-6. Zavrsava kada tri uzastopne provjere potvrde gornju Top Eleven traku resursa (tokeni, zeleni, plavi i crveni resursi). Mourinho prozor se nakon reklame ne zahtijeva.
+1. Confirms the main screen using `1.png`.
+2. Sends the current BlueStacks screenshot to Gemini AI and requests the center of the small square button to the right of the `Nivo spremnosti` progress bar and to the left of `PREGLED UTAKMICE`. The AI location is used without an OpenCV decision about that button, and only coordinates inside the readiness area are allowed.
+3. Confirms the Mourinho window using `2.png`.
+4. Waits up to 30 seconds for a blue button that must contain a recognizable `POGLEDAJ` label or icon. A plain blue rectangle is not accepted.
+5. Starts the ad and uses the same OpenCV plus Gemini AI flow for X, skip, and Google Play as the TV agent.
+6. Finishes when three consecutive checks confirm the upper Top Eleven resource bar containing tokens and the green, blue, and red resources. The Mourinho window is not required after the ad.
 
-Izmedju bitnih klikova koristi se sigurnosni buffer od 1500 ms.
+A safety delay of 1500 ms is used between significant clicks.

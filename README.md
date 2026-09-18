@@ -1,72 +1,72 @@
 # Top Eleven AI Agent
 
-Windows alat za automatizaciju svakodnevnih zadataka u igri **Top Eleven** pokrenutoj kroz **BlueStacks**. Agent kombinuje kontrolisanu PowerShell state mašinu, lokalnu OpenCV analizu i vision AI kako bi prepoznao ekran, pokrenuo dozvoljene radnje i sigurno obradio nagradne reklame.
+A Windows automation tool for handling everyday tasks in **Top Eleven** running through **BlueStacks**. The agent combines a controlled PowerShell state machine, local OpenCV analysis, and vision AI to recognize the current screen, perform approved actions, and safely process rewarded ads.
 
 > [!IMPORTANT]
-> Projekat upravlja mišem i BlueStacks prozorom. Prvi put pokreni samo jedan kraći tok i nadgledaj njegovo ponašanje prije korištenja opcije **Pokreni sve**.
+> This project controls the mouse and the BlueStacks window. On your first run, start with a single short workflow and supervise its behavior before using **Pokreni sve** (Run All).
 
-## Šta agent može raditi
+## Features
 
-| Tok | Namjena |
+| Workflow | Purpose |
 | --- | --- |
-| **Uzmi 25 zelenih** | Preuzima dostupne besplatne zelene boostere. |
-| **Odmori ekipu** | Odmara igrače redom, od izabrane početne pozicije. |
-| **Top Eleven TV** | Preuzima TV nagrade i obrađuje tok priručnika. |
-| **Mourinho** | Pokreće i završava Mourinho nagradnu reklamu. |
-| **Kampus** | Obrađuje Kampus objekte koji još nisu dostigli 100%. |
-| **Put saveza** | Završava dnevni video zadatak na Putu saveza. |
-| **Trening igrača** | Ponavlja trening i po potrebi podiže kondiciju igrača. |
-| **Pokreni sve** | Redom pokreće Mourinho, TV, Put saveza, Kampus i 25 zelenih. |
+| **Uzmi 25 zelenih** | Collects available free green boosters. |
+| **Odmori ekipu** | Restores players in order, starting from a selected position. |
+| **Top Eleven TV** | Collects TV rewards and completes the manual reward flow. |
+| **Mourinho** | Starts and completes the Mourinho rewarded ad. |
+| **Kampus** | Processes Campus buildings that have not yet reached 100%. |
+| **Put saveza** | Completes the daily video task in Alliance Road. |
+| **Trening igrača** | Repeats training and restores player condition when required. |
+| **Pokreni sve** | Runs Mourinho, TV, Alliance Road, Campus, and 25 Greens in sequence. |
 
-Centralni Manager nudi izbor toka, zajednički log, sigurno zaustavljanje, nastavak prethodne sesije, izbor početne faze za kombinovani tok i izbor početne pozicije za odmor ekipe.
+The central Manager provides workflow selection, a shared log, safe stopping, session resume, a selectable starting stage for the combined workflow, and a selectable starting position for team rest.
 
-## Preduslovi
+## Requirements
 
-- Windows 10 ili 11
-- BlueStacks sa instaliranim i prijavljenim Top Elevenom
+- Windows 10 or 11
+- BlueStacks with Top Eleven installed and signed in
 - Windows PowerShell 5.1
-- Python 3 za vision komponente, testove i Discord bot
-- Gemini API ključ za podrazumijevanu AI konfiguraciju
+- Python 3 for vision components, tests, and the Discord bot
+- A Gemini API key for the default AI configuration
 
-BlueStacks prozor se podrazumijevano traži pod naslovom `BlueStacks App Player`. Ako tvoja instalacija koristi drugi naslov, promijeni `windowTitle` u `AI-Agent/config.json`.
+By default, the agent looks for a window titled `BlueStacks App Player`. If your installation uses a different title, update `windowTitle` in `AI-Agent/config.json`.
 
-## Brzi početak
+## Quick start
 
-1. Kloniraj ili preuzmi projekat.
-2. Otvori PowerShell u folderu `AI-Agent` i napravi Python okruženje:
+1. Clone or download the project.
+2. Open PowerShell in the `AI-Agent` directory and create a Python environment:
 
    ```powershell
    python -m venv .venv
    .\.venv\Scripts\python.exe -m pip install -r .\requirements.txt
    ```
 
-3. Pokreni `AI-Agent\Postavi Gemini API kljuc.cmd` i unesi Gemini API ključ. Ključ se čuva lokalno u `AI-Agent/.env` i nije uključen u Git.
-4. Pokreni `AI-Agent\Testiraj Gemini.cmd` kako bi provjerio vezu.
-5. Otvori BlueStacks i Top Eleven, zatim pokreni:
+3. Run `AI-Agent\Postavi Gemini API kljuc.cmd` and enter your Gemini API key. The key is stored locally in `AI-Agent/.env`, which is excluded from Git.
+4. Run `AI-Agent\Testiraj Gemini.cmd` to verify the connection.
+5. Open BlueStacks and Top Eleven, then launch:
 
    ```text
    AI-Agent\Pokreni AI Agent.cmd
    ```
 
-6. U Manageru prvo izaberi jedan kraći tok, pritisni **POKRENI AGENTA** i prati log.
+6. In the Manager, select a short workflow first, click **POKRENI AGENTA**, and monitor the log.
 
-Za prečicu na Desktopu pokreni `Napravi desktop precicu.ps1`. Prečica vodi direktno na centralni Manager.
+To create a Desktop shortcut, run `Napravi desktop precicu.ps1`. The shortcut opens the central Manager directly.
 
-## Kako sistem radi
+## How it works
 
-1. `TopElevenManager.ps1` prikazuje korisničko sučelje i pokreće odabrani tok.
-2. `TopElevenAgent.ps1` vodi state mašinu i dozvoljava samo unaprijed definisane akcije.
-3. `VisionAgent.py` snima samo BlueStacks prozor i traži strukturisanu analizu slike od izabranog vision providera.
-4. `XDetector.py` lokalno prepoznaje poznate ekrane i provjerava vizuelne detalje pomoću OpenCV-a.
-5. Agent klikne samo kada rezultat prođe provjere odgovarajuće za trenutni korak.
+1. `TopElevenManager.ps1` displays the user interface and starts the selected workflow.
+2. `TopElevenAgent.ps1` runs the state machine and permits only predefined actions.
+3. `VisionAgent.py` captures only the BlueStacks window and requests structured image analysis from the selected vision provider.
+4. `XDetector.py` recognizes known screens locally and validates visual details with OpenCV.
+5. The agent clicks only after the result passes the checks required for the current step.
 
-Za kontrole unutar reklama AI smije predložiti samo dozvoljene akcije poput zatvaranja, preskakanja ili povratka iz Google Playa. OpenCV ne bira reklamno dugme samostalno. Dugmad za instalaciju, kupovinu i plaćanje nisu dozvoljena.
+For controls inside ads, AI may propose only approved actions such as closing, skipping, or returning from Google Play. OpenCV does not independently choose ad controls. Install, purchase, and payment buttons are never permitted.
 
-Ako ekran nije dovoljno sigurno prepoznat, agent ostaje na istom koraku i ponavlja provjeru umjesto nasumičnog klikanja. Potpuni restart odgovarajuće BlueStacks instance koristi se samo u kontrolisanim recovery scenarijima.
+If a screen cannot be recognized with sufficient confidence, the agent stays on the same step and repeats the check instead of clicking blindly. A full restart of the appropriate BlueStacks instance is used only in controlled recovery scenarios.
 
-## AI konfiguracija
+## AI configuration
 
-Podrazumijevani provider podešen je u `AI-Agent/ai_config.json`:
+The default provider is configured in `AI-Agent/ai_config.json`:
 
 ```json
 {
@@ -76,17 +76,17 @@ Podrazumijevani provider podešen je u `AI-Agent/ai_config.json`:
 }
 ```
 
-Rezervni Gemini ključ možeš dodati preko `AI-Agent\Postavi rezervni Gemini API kljuc.cmd`. Ako glavni ključ dobije odgovor o potrošenoj kvoti, agent može preći na rezervni ključ.
+You can add a backup Gemini key by running `AI-Agent\Postavi rezervni Gemini API kljuc.cmd`. If the primary key reaches its quota limit, the agent can switch to the backup key.
 
-### Lokalni Ollama provider
+### Local Ollama provider
 
-Za lokalnu obradu instaliraj Ollamu i model, na primjer:
+For local processing, install Ollama and download a vision model, for example:
 
 ```powershell
 ollama pull qwen3-vl:2b
 ```
 
-Zatim u `AI-Agent/ai_config.json` postavi:
+Then update `AI-Agent/ai_config.json`:
 
 ```json
 {
@@ -97,30 +97,30 @@ Zatim u `AI-Agent/ai_config.json` postavi:
 }
 ```
 
-Gemini zahtijeva slanje snimka BlueStacks prozora Googleovom API-ju. Ollama obradu radi lokalno na računaru.
+Gemini requires screenshots of the BlueStacks window to be sent to Google's API. Ollama processes them locally on your computer.
 
-## Konfiguracija
+## Configuration files
 
-- `AI-Agent/config.json` — naslov BlueStacks prozora, timeouti, pauze, broj pokušaja i parametri pojedinačnih tokova.
-- `AI-Agent/ai_config.json` — AI provider, model, endpoint, prag pouzdanosti, rate limit i debug postavke.
-- `AI-Agent/.env` — lokalni API ključevi; fajl je ignorisan u Gitu.
-- `AI-Agent/discord_config.json` — lokalni Discord token i dozvoljeni korisnici; fajl je ignorisan u Gitu.
+- `AI-Agent/config.json` — BlueStacks window title, timeouts, delays, retry limits, and workflow parameters.
+- `AI-Agent/ai_config.json` — AI provider, model, endpoint, confidence threshold, rate limit, and debug settings.
+- `AI-Agent/.env` — local API keys; excluded from Git.
+- `AI-Agent/discord_config.json` — local Discord token and authorized users; excluded from Git.
 
-Prije većih promjena vrijednosti sačuvaj kopiju konfiguracije. Pogrešni timeouti ili koordinate mogu učiniti automatizaciju nepouzdanom.
+Back up the configuration before making significant changes. Incorrect timeout or coordinate settings may make the automation unreliable.
 
-## Provjera projekta
+## Project validation
 
-Najlakše je u Manageru otvoriti **Postavke** i izabrati **Provjeri projekat**, ili pokrenuti `AI-Agent\Provjeri projekat.cmd`.
+The easiest option is to open **Postavke** (Settings) in the Manager and select **Provjeri projekat** (Validate Project), or run `AI-Agent\Provjeri projekat.cmd`.
 
-Provjera ne upravlja BlueStacksom. Ona provjerava obavezne fajlove, PowerShell i JSON sintaksu, Python testove i ugrađene SelfTest provjere. Iz komandne linije može se pokrenuti bez grafičkog dijaloga:
+Validation does not control BlueStacks. It checks required files, PowerShell and JSON syntax, Python tests, and the built-in self-tests. To run it from the command line without a graphical dialog:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\AI-Agent\Provjeri projekat.ps1" -NoGui
 ```
 
-Izvještaji provjere i runtime logovi čuvaju se u `%LOCALAPPDATA%\TopElevenAgent\logs`.
+Validation reports and runtime logs are stored in `%LOCALAPPDATA%\TopElevenAgent\logs`.
 
-Pojedinačne razvojne provjere, pokrenute iz foldera `AI-Agent`, su:
+Individual development checks, run from the `AI-Agent` directory, are:
 
 ```powershell
 python -m py_compile .\VisionAgent.py .\XDetector.py
@@ -129,69 +129,69 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TopElevenAgent.ps1 -Se
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TopElevenManager.ps1 -SelfTest
 ```
 
-## Discord kontrola (opcionalno)
+## Discord control (optional)
 
-Agent se može pokretati udaljeno preko ograničenih Discord slash komandi. Bot ne prihvata proizvoljne terminalske naredbe i dozvoljava samo jednog aktivnog agenta.
+The agent can be started remotely through a restricted set of Discord slash commands. The bot does not accept arbitrary terminal commands and permits only one active agent at a time.
 
-1. Instaliraj zavisnosti iz `requirements.txt`.
-2. Pokreni `AI-Agent\Postavi Discord Bot.cmd` i unesi bot token, Server ID i svoj User ID.
-3. Pokreni `AI-Agent\Pokreni Discord Bot.cmd` i ostavi prozor otvoren.
+1. Install the dependencies from `requirements.txt`.
+2. Run `AI-Agent\Postavi Discord Bot.cmd` and enter the bot token, Server ID, and your User ID.
+3. Run `AI-Agent\Pokreni Discord Bot.cmd` and keep its window open.
 
-Detaljne upute i spisak komandi nalaze se u [Discord dokumentaciji](AI-Agent/README_DISCORD.md).
+Detailed setup instructions and the available commands are listed in the [Discord documentation](AI-Agent/README_DISCORD.md).
 
-## Struktura projekta
+## Project structure
 
 ```text
 topeleven/
-├── README.md                         # Glavna dokumentacija
-├── Napravi desktop precicu.ps1       # Kreira Desktop prečicu
+├── README.md                         # Main documentation
+├── Napravi desktop precicu.ps1       # Creates a Desktop shortcut
 └── AI-Agent/
-    ├── Pokreni AI Agent.cmd          # Glavni ulaz u aplikaciju
-    ├── TopElevenManager.ps1           # Grafički Manager
-    ├── TopElevenAgent.ps1             # Automatizacija i state mašina
-    ├── VisionAgent.py                 # Vision AI komunikacija
-    ├── XDetector.py                   # Lokalna OpenCV analiza
-    ├── agent_artifacts.py             # Runtime artefakti i evidencija
-    ├── config.json                    # Opšta konfiguracija
-    ├── ai_config.json                 # AI konfiguracija
-    ├── requirements.txt               # Python zavisnosti
-    ├── tests/                         # Automatizovani testovi
-    ├── regression/                    # Screenshot regresijski runner
-    └── */README*                      # Upute za pojedinačne tokove
+    ├── Pokreni AI Agent.cmd          # Main application entry point
+    ├── TopElevenManager.ps1           # Graphical Manager
+    ├── TopElevenAgent.ps1             # Automation and state machine
+    ├── VisionAgent.py                 # Vision AI communication
+    ├── XDetector.py                   # Local OpenCV analysis
+    ├── agent_artifacts.py             # Runtime artifacts and records
+    ├── config.json                    # General configuration
+    ├── ai_config.json                 # AI configuration
+    ├── requirements.txt               # Python dependencies
+    ├── tests/                         # Automated tests
+    ├── regression/                    # Screenshot regression runner
+    └── */README*                      # Workflow-specific documentation
 ```
 
-## Rješavanje čestih problema
+## Troubleshooting
 
-### Manager ne pronalazi BlueStacks
+### The Manager cannot find BlueStacks
 
-Provjeri da je BlueStacks pokrenut i da naslov prozora odgovara vrijednosti `windowTitle` u `config.json`.
+Make sure BlueStacks is running and its window title matches the `windowTitle` value in `config.json`.
 
-### Python nije pronađen
+### Python cannot be found
 
-Instaliraj aktuelni Python 3 i označi opciju **Add Python to PATH**, ili napravi `.venv` prema koracima iz brzog početka.
+Install a current Python 3 release and enable **Add Python to PATH**, or create a `.venv` by following the Quick start instructions.
 
-### Gemini test ne prolazi
+### The Gemini test fails
 
-Ponovo pokreni alat za postavljanje ključa, provjeri internet vezu i raspoloživu API kvotu. Ključ ne upisuj ručno u Git fajlove.
+Run the API key setup tool again, check your internet connection, and verify that API quota is available. Never commit the key to a Git-tracked file.
 
-### Agent ne klikne dugme
+### The agent does not click a button
 
-To obično znači da ekran ili kontrola nisu dovoljno pouzdano potvrđeni. Provjeri log i debug snimke prije mijenjanja pragova. Odbijene i nepoznate AI analize mogu se čuvati u `AI-Agent/debug`.
+This usually means that the screen or control could not be confirmed with sufficient confidence. Review the log and debug captures before changing any thresholds. Rejected and unknown AI analyses may be stored in `AI-Agent/debug`.
 
-### Reklama je otvorila Play Store ili Chrome
+### An ad opened the Play Store or Chrome
 
-Agent pokušava siguran povratak Android Back komandom, a zatim ponovo potvrđuje ekran. Ako recovery ne uspije, zaustavi tok u Manageru i ručno vrati igru na poznati ekran.
+The agent attempts a safe return using the Android Back command and then validates the screen again. If recovery fails, stop the workflow in the Manager and manually return the game to a known screen.
 
-## Dodatna dokumentacija
+## Additional documentation
 
-- [Detalji AI i sigurnosnog toka](AI-Agent/README_AI.md)
-- [Kombinovani tok „Pokreni sve“](AI-Agent/README_SVE_REDOM.md)
+- [AI and safety flow details](AI-Agent/README_AI.md)
+- [Combined “Pokreni sve” workflow](AI-Agent/README_SVE_REDOM.md)
 - [Discord bot](AI-Agent/README_DISCORD.md)
-- [Put saveza](AI-Agent/Put%20saveza/README.md)
-- [Kampus](AI-Agent/Kampus/README_KAMPUS.md)
+- [Alliance Road](AI-Agent/Put%20saveza/README.md)
+- [Campus](AI-Agent/Kampus/README_KAMPUS.md)
 - [Mourinho](AI-Agent/Mourinho/README_MOURINHO.md)
 - [Top Eleven TV](AI-Agent/za%20TV%20skriptu/README_TV.md)
 
-## Napomena
+## Disclaimer
 
-Ovo je nezavisan alat za ličnu automatizaciju i nije službeni proizvod kompanije Nordeus. Koristi ga odgovorno i na vlastiti rizik, uz poštovanje pravila igre i uslova korištenja povezanih servisa.
+This is an independent personal automation tool and is not an official Nordeus product. Use it responsibly and at your own risk, while respecting the game's rules and the terms of service of all connected services.

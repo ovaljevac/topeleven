@@ -1,49 +1,49 @@
-# Top Eleven AI vision agent
+# Top Eleven AI Vision Agent
 
-Ovaj folder sadrzi aktivnu AI-first verziju projekta. Roditeljski folder sadrzi samo ulaznu dokumentaciju i alat za desktop precicu.
+This directory contains the active AI-first version of the project. The parent directory contains only the entry-point documentation and the Desktop shortcut tool.
 
-Glavni ulaz je `Pokreni AI Agent.cmd`, koji otvara centralni svijetli dashboard sa svim skriptama, zajednickim logom i Start/Stop kontrolama. Svaki modul se moze pokrenuti zasebno. Za `Pokreni sve` moguce je izabrati pocetnu fazu, a za odmor igraca pocetnu poziciju. Odvojivi mini-log ima prekidac `Iznad: DA/NE`; iskljuci `Iznad` ako bi prozor prekrivao BlueStacks i ulazio u AI screenshot.
+The main entry point is `Pokreni AI Agent.cmd`. It opens the central light-themed dashboard with all scripts, a shared log, and Start/Stop controls. Every module can run independently. `Pokreni sve` allows selection of the starting stage, while Team Rest allows selection of the starting player position. The detachable mini-log has an `Iznad: DA/NE` switch. Disable `Iznad` if the window could cover BlueStacks and appear in an AI screenshot.
 
-Obicna AI ili vizuelna neizvjesnost ne gasi Top Eleven: agent ostaje na istom koraku i ponavlja sigurnu provjeru. Potpuni restart tacne BlueStacks instance koristi se samo za potvrdeno zaglavljenu reklamu ili kada je prije sljedece faze neophodan provjeren pocetni ekran. U kombinovanom toku neuspjela faza se evidentira, a agent zatim sigurno prelazi na sljedecu fazu.
+Ordinary AI or visual uncertainty does not close Top Eleven. The agent remains on the current step and repeats a safe check. A full restart of the exact BlueStacks instance is used only for a confirmed stuck ad or when a verified home screen is required before the next stage. In the combined workflow, a failed stage is recorded and the agent then proceeds safely to the next stage.
 
-## Kako radi
+## How it works
 
-1. PowerShell state machine kontrolise dozvoljene akcije.
-2. `VisionAgent.py` snimi samo BlueStacks prozor i salje dijagnosticku sliku izabranom vision provideru.
-3. Model mora vratiti strogo definisan JSON.
-4. Za reklamne kontrole prihvataju se samo AI akcije `click_close`, `click_skip` i `click_google_play` sa koordinatom na originalnoj slici.
-5. OpenCV ne predlaze, ne potvrduje, ne pomjera i ne klika X, skip ili Google Play dugmad reklame.
-6. Ako AI nije dostupan ili ne vidi dozvoljenu kontrolu, agent ne klika nista.
-7. Google Play i Chrome prepoznaju se iskljucivo preko AI analize slike. ADB ostaje samo za slanje Back komande; Escape je rezerva.
-8. Prihvacena AI potvrda Top Eleven ekrana zavrsava reklamni nadzor. Lokalni puni Pocetni ekran i Prodavnica mogu se potvrditi na dva svjeza framea. Android aktivnost, dumpsys i Player.log ne citaju se i ne ucestvuju ni u jednoj odluci.
+1. A PowerShell state machine controls the permitted actions.
+2. `VisionAgent.py` captures only the BlueStacks window and sends the diagnostic image to the selected vision provider.
+3. The model must return strictly defined JSON.
+4. For ad controls, only the AI actions `click_close`, `click_skip`, and `click_google_play`, with coordinates on the original image, are accepted.
+5. OpenCV does not propose, confirm, move, or click an ad's X, skip, or Google Play controls.
+6. If AI is unavailable or does not see an allowed control, the agent clicks nothing.
+7. Google Play and Chrome are recognized only through AI image analysis. ADB is used only to send the Back command, with Escape as a fallback.
+8. An accepted AI confirmation of the Top Eleven screen ends ad monitoring. The full local Home and Store screens may be confirmed on two fresh frames. Android activity, dumpsys, and Player.log are not read and do not participate in any decision.
 
-AI nikada direktno ne upravlja misem. PowerShell prihvata samo poznatu akciju sa odgovarajucom vrstom kontrole i koordinatom unutar originalne slike. `Install`, `Get`, kupovina i placanje se nikada ne klikcu, ali njihovo prisustvo vise ne skriva odvojeni pravi X/skip niti blokira Back iz Storea.
+AI never controls the mouse directly. PowerShell accepts only a known action with the appropriate control type and a coordinate inside the original image. `Install`, `Get`, purchase, and payment controls are never clicked, but their presence no longer hides a separate genuine X or skip control and does not block Back from the Store.
 
-## Gemini 3.5 Flash-Lite (trenutno ukljucen)
+## Gemini 3.5 Flash-Lite (currently enabled)
 
-`ai_config.json` koristi `gemini-3.5-flash-lite` sa `minimal` thinking nivoom radi kratke latencije. Google vise ne daje `gemini-2.5-flash` novim API korisnicima. U Manageru otvori `Postavke` i izaberi `Postavi API kljuc`: alat atomarno sprema `GEMINI_API_KEY` u lokalni `AI-Agent/.env`, bez prikazivanja ili zapisivanja kljuca u log. `.env` je iskljucen iz Gita. Nakon toga provjeri sa `Testiraj Gemini`.
+`ai_config.json` uses `gemini-3.5-flash-lite` with the `minimal` thinking level for low latency. Google no longer provides `gemini-2.5-flash` to new API users. In the Manager, open `Postavke` and select `Postavi API kljuc`. The tool atomically stores `GEMINI_API_KEY` in the local `AI-Agent/.env` file without displaying the key or writing it to the log. `.env` is excluded from Git. Verify the setup afterward with `Testiraj Gemini`.
 
-Free-tier kljuc je dovoljan dok se ne prekorace Googleova ogranicenja zahtjeva. Slike se salju Google Gemini API-ju; ako zelis potpuno lokalnu obradu, vrati Ollama konfiguraciju ispod.
+A free-tier key is sufficient until Google's request limits are exceeded. Images are sent to the Google Gemini API. For fully local processing, use the Ollama configuration below.
 
-## Lokalni Ollama model (rezerva)
+## Local Ollama model (fallback)
 
-Na ovom racunaru je instalirana Ollama `0.32.5`. Agent koristi lokalni vision model `qwen3-vl:2b` (oko 1.9 GB), jer veci 4B model moze ostati bez VRAM-a kada istovremeno radi BlueStacks na RX 580. Konfiguracija koristi lokalni API `http://127.0.0.1:11434/api/chat`.
+Ollama `0.32.5` is installed on the original development computer. The agent uses the local `qwen3-vl:2b` vision model, approximately 1.9 GB, because the larger 4B model may run out of VRAM while BlueStacks is running on an RX 580. The configuration uses the local API at `http://127.0.0.1:11434/api/chat`.
 
-Ako se model nekada obrise, ponovo ga preuzmi naredbom:
+If the model is removed, download it again:
 
 ```powershell
 ollama pull qwen3-vl:2b
 ```
 
-Provjeri da servis i model rade:
+Verify that the service and model are available:
 
 ```powershell
 ollama list
 ```
 
-Model, endpoint i sigurnosni pragovi podesavaju se u `ai_config.json`. Ako je potrebno privremeno iskljuciti AI bez promjene koda, postavi `enabled` na `false`.
+The model, endpoint, and safety thresholds are configured in `ai_config.json`. To disable AI temporarily without changing code, set `enabled` to `false`.
 
-Za povratak na lokalni model postavi:
+To switch back to the local model, set:
 
 ```json
 "provider": "ollama",
@@ -52,84 +52,85 @@ Za povratak na lokalni model postavi:
 "timeoutSeconds": 120
 ```
 
-Prva detekcija X-a pocinje 12 sekundi nakon pokretanja reklame. Model se ucitava u pozadini cim se pritisne `POKRENI`. Google Play Store i Chrome se prepoznaju iz trenutnog `dumpsys` activity stanja i vracaju direktnim Android Back pozivom, pa fokus Managera ili mini-loga ne moze progutati Escape. AI trenutne slike je fallback kada ADB stanje nije dostupno.
+The first X detection begins 12 seconds after an ad starts. The model is loaded in the background as soon as `POKRENI` is clicked.
 
-Za duge interaktivne reklame postoji wake mehanizam. Nakon 75 sekundi bez izlaza agent svakih 12 sekundi dodirne neutralnu zonu oglasa i bez dodatnog cekanja odmah pravi AI screenshot. Time pokusava ponovo prikazati Google Play/skip kontrole koje se pojave samo nakratko. Vrijednosti su podesive kroz `adWakeTapAfterSeconds`, `adWakeTapIntervalSeconds` i `adWakeTapMaximum` u `config.json`.
+Long interactive ads use a wake mechanism. After 75 seconds without an exit, the agent taps a neutral ad area every 12 seconds and immediately captures an AI screenshot without an additional wait. This attempts to reveal Google Play or skip controls that appear only briefly. Configure this behavior with `adWakeTapAfterSeconds`, `adWakeTapIntervalSeconds`, and `adWakeTapMaximum` in `config.json`.
 
-Reklamne kontrole su semanticki `AI-only`: Gemini na cistoj originalnoj BlueStacks slici jedini bira da li je kontrola X, >>/skip ili Google Play/Play Store. OpenCV ne smije sam predloziti drugo dugme niti pokrenuti klik; kod X-a smije samo u maloj zoni oko AI tacke potvrditi dijagonale i vratiti njihov stvarni centar. Ne postoji univerzalni pomak koordinata.
+Ad controls are semantically AI-only: Gemini, using the clean original BlueStacks image, is the sole component that decides whether a control is X, >>/skip, or Google Play/Play Store. OpenCV may not independently propose another button or initiate a click. For X only, it may validate the diagonals within a small area around the AI point and return their actual center. There is no universal coordinate offset.
 
-Za `X` AI i dalje jedini odlucuje koja je kontrola za zatvaranje. Nakon njegove odluke agent uzima novu sliku i samo u maloj zoni oko te tacke pokusava geometrijski centrirati dvije dijagonale istog X-a. Lokalna analiza ne smije traziti drugo dugme niti primijeniti fiksni pomak. Jedna AI odluka je dovoljna kada taj svjezi lokalni frame potvrdi dijagonale i njihov centar; tada se X odmah klikne bez drugog Gemini zahtjeva. AI koordinata bez lokalno pronadjenih dijagonala ostaje samo kandidat i ne moze sama autorizovati klik.
+For X, AI remains the sole component that decides which control closes the ad. After that decision, the agent captures a fresh image and attempts to geometrically center the two diagonals of the same X only within a small area around the proposed point. Local analysis may not search for another button or apply a fixed offset. One AI decision is sufficient when the fresh local frame confirms the diagonals and their center; the X is then clicked immediately without a second Gemini request. An AI coordinate without locally detected diagonals remains only a candidate and cannot authorize a click by itself.
 
-Prva AI provjera pocinje 12 sekundi nakon pokretanja reklame, zatim se Gemini redovno poziva svakih 12 sekundi (`aiProbeIntervalSeconds`). Lokalno potvrden X iz te jedne provjere odmah je spreman za klik, bez dodatnog Gemini zahtjeva. Nakon klika ili gubitka kandidata pre-click tok pokrece stvarni nadzor povratka i novih kontrola: potvrden povratak odmah zavrsava reklamu, a novi lokalno potvrden X koristi se u istoj iteraciji. Ako nadzor ostane neodlucan, naredni pokusaj ceka redovni interval. Potrosene koordinate se brisu prije nadzora. Wake provjera takodjer odmah koristi potvrdu povratka umjesto da je odbaci. Wake dodir kod dugih interaktivnih reklama moze odmah pokrenuti dodatnu AI provjeru, uz postojeca ogranicenja API poziva.
+The first AI check begins 12 seconds after the ad starts, followed by regular Gemini calls every 12 seconds through `aiProbeIntervalSeconds`. An X locally confirmed from that one check is immediately ready to click. After a click or candidate loss, the pre-click flow begins actual monitoring for a return or new controls. A confirmed return ends the ad immediately, while a newly and locally confirmed X is used in the same iteration. If monitoring remains inconclusive, the next attempt waits for the regular interval. Used coordinates are cleared before monitoring. A wake check also uses a confirmed return immediately instead of discarding it. A wake tap during a long interactive ad may initiate an extra AI check, subject to the existing API limits.
 
-Povratak iz Google Play/Chrome toka koristi svjezu AI potvrdu prije Back-a i novu AI sliku poslije njega. Broj Back komandi je ogranicen, a nepromijenjen ekran prekida niz. Android activity provjere potpuno su uklonjene iz pocetka faza, pokretanja reklama, nadzora, treninga i oporavka. ADB sluzi samo kao kanal za komande, ne za prepoznavanje ekrana.
+Returning from a Google Play or Chrome flow uses a fresh AI confirmation before Back and a new AI image afterward. The number of Back commands is limited, and an unchanged screen stops the sequence. Android activity checks have been removed completely from stage startup, ad startup, monitoring, Training, and recovery. ADB serves only as a command channel, not as a screen-recognition source.
 
-TV nagrada `PRIRUCNIK` takodjer ima vlastitu sigurnu izlaznu putanju: nakon vec opazene reklame dva uzastopna lokalna `manual_3` framea (`NABAVLJEN NOVI PRIRUCNIK`) odmah predaju tok obradi prirucnika. Time kasni Android activity zapis vise ne ostavlja agent u reklamnoj petlji na ekranu vec osvojene nagrade.
+The `PRIRUCNIK` TV reward has its own safe exit path. After an ad has already been observed, two consecutive local `manual_3` frames showing `NABAVLJEN NOVI PRIRUCNIK` immediately hand the workflow to manual processing. A delayed Android activity record can therefore no longer leave the agent inside the ad loop after the reward has already been won.
 
-Obicna TV nagrada nakon vec opazene reklame prihvata dva uzastopna lokalna `tv` framea kao povratak, cak i kada Android activity zapis kasni poslije Play Storea. Ova putanja je zabranjena za nagradu `PRIRUCNIK`, koja mora prikazati poseban `manual_3` ekran.
+After an ad has been observed, an ordinary TV reward accepts two consecutive local `tv` frames as a return even when Android activity data is delayed after the Play Store. This path is forbidden for the `PRIRUCNIK` reward, which must show the dedicated `manual_3` screen.
 
-Lokalne brze potvrde povratka (`tv`, `manual_3` i profil igraca) aktiviraju se tek nakon sto je AI na prethodnom svjezem frameu stvarno vidio reklamni ekran. Sam ADB `AdActivity` nije dovoljan, jer se u prvim sekundama iza nove aktivnosti moze jos vidjeti stari ekran igre. Profil igraca uz dva stabilna framea mora imati i vlastiti strogi vizuelni potpis: veliki svijetli modal te poravnate crvenu `POVREDE`, plavu `MORAL` i zelenu `KONDICIJA` kontrolu. Resource zaglavlje nije obavezno jer ga profil moze djelimicno prekriti.
+Fast local return confirmations for `tv`, `manual_3`, and the player profile activate only after AI has genuinely seen an ad screen on a previous fresh frame. ADB `AdActivity` alone is insufficient because the old game screen may remain visible during the first seconds of a new activity. In addition to two stable frames, the player profile must show its strict visual signature: a large light modal with aligned red `POVREDE`, blue `MORAL`, and green `KONDICIJA` controls. The resource header is not required because the profile may partly cover it.
 
-Put saveza nakon AI-potvrdjene reklame prihvata povratak kada dva uzastopna lokalna `alliance_flow` framea vide isti `path` modal i stabilan modalni X. Taj vec potvrden modal ne prolazi kroz dodatnu 75-sekundnu `MainPlayerNativeActivity` kapiju; odmah se predaje postojecoj stabilnoj provjeri X-a i zatvara.
+After an AI-confirmed ad, Alliance Road accepts a return when two consecutive local `alliance_flow` frames see the same `path` modal and a stable modal X. This already confirmed modal does not pass through an additional 75-second `MainPlayerNativeActivity` gate. It is immediately handed to the existing stable-X validation and closed.
 
-Prije pocetka faze stari ADB/Player.log `AdActivity` zapis ne moze sam pokrenuti reklamni watcher. Ako dva uzastopna lokalna TV-flow framea jasno prepoznaju puni ekran `POCETNI`, zapis se smatra zastarjelim i faza nastavlja bez izmisljene reklame. Stvarni Store/Chrome foreground i dalje ima prioritet i mora se prvo zatvoriti.
+Before a stage begins, an old ADB or Player.log `AdActivity` record cannot start the ad watcher by itself. If two consecutive local TV-flow frames clearly identify a full `POCETNI` screen, the record is treated as stale and the stage continues without inventing an ad. An actual Store or Chrome foreground screen still has priority and must be closed first.
 
-Ako Gemini pri potvrdi povratka jednom vrati prekinut ili nedovrsen JSON, agent odmah ponavlja analizu na svjezoj slici. U toku odmora igraca nakon klika na X ostavlja se dovoljno vremena i za narednu provjeru nakon API backoffa, pa jedan neispravan odgovor vise ne prekida cijeli red igraca iako je reklama vec zatvorena.
+If Gemini returns truncated or incomplete JSON once while confirming a return, the agent immediately repeats the analysis using a fresh image. In Team Rest, enough time is allowed after clicking X for another check following API backoff, so one malformed response no longer terminates the entire player sequence after the ad has already closed.
 
-Ako Gemini uprkos 0..1 shemi vrati svoju prostornu skalu 0..1000 (npr. `26,94`), AI-only validator je automatski pretvara u `0.026,0.094` umjesto da odbije pronadjeni X. Podrzane su i doslovne piksel-koordinate kao rezerva.
+If Gemini returns coordinates in its own 0–1000 spatial scale despite the 0–1 schema, for example `26,94`, the AI-only validator automatically converts them to `0.026,0.094` instead of rejecting the detected X. Literal pixel coordinates are also supported as a fallback.
 
-U toku `Odmori ekipu` plava pozadina sama nije dokaz da je nagradno dugme spremno. Lokalni recognizer mora vidjeti puni bijeli natpis `BESPLATNO` rasiren preko dugmeta u stvarnom Top Eleven prozoru; tri tacke i prazno plavo dugme se odbijaju. Natpis mora ostati na istoj lokaciji kroz dvije provjere najmanje 350 ms, a neposredno prije klika radi se jos jedna svjeza provjera. Klik koristi pronadjeni centar dugmeta bez fiksnog pomaka. Poslije klika agent zasebno potvrdi da je reklama pokrenuta; ponovni klik nije dozvoljen prije osam sekundi. Ako se vrati stabilni natpis ili ostane loading, agent se vraca na sigurno cekanje umjesto da prerano pokrene X nadzor.
+During `Odmori ekipu`, a blue background alone is not proof that the rewarded button is ready. The local recognizer must see the complete white `BESPLATNO` label spread across the button in the real Top Eleven window. Loading dots and an empty blue button are rejected. The label must remain at the same location over two checks spanning at least 350 ms, followed by one more fresh check immediately before clicking. The click uses the detected button center without a fixed offset. Afterward, the agent separately confirms that the ad started, and another click is forbidden for eight seconds. If the stable label returns or loading continues, the agent resumes safe waiting instead of starting X monitoring too early.
 
-Prozor za `Odmori ekipu` ima listu `Pocni od pozicije`. Izabrana stavka je prvi igrac kojeg agent obradi, a sve ranije stavke preskace i nastavlja postojecim redoslijedom do kraja, ukljucujuci stavke drugog kruga. Isto se moze zadati iz komandne linije, npr. `OdmoriEkipu.ps1 -TeamRestStart AMR`.
+The `Odmori ekipu` window contains a `Pocni od pozicije` list. The selected item is the first player processed; earlier items are skipped, and the agent continues in the existing order through the end, including second-round entries. The same option is available from the command line, for example `OdmoriEkipu.ps1 -TeamRestStart AMR`.
 
-U Campus toku jedan validan AI izbor objekta sa parsabilnim `TARGET` nazivom i procentom ispod 100% odmah ide na klik, jer lokalni Campus recognizer zatim mora potvrditi da se otvorio detalj sa stvarnim plavim reward podrucjem za `100%`; sam bilo koji detail ekran nije dovoljan. Time vise objekata sa istim procentom ne mogu zaglaviti potvrdu na `1/2`. Odluka da nema vise objekata i dalje zahtijeva dvije svjeze AI potvrde. Ako klik promasi ili otvori objekat bez tog reward podrucja, detalj se zatvara, a sve prethodno promasene tacke oznacavaju se crvenim prekrizenim krugovima na novoj AI slici i zabranjuju pri narednom pokusaju. Klik i dalje koristi direktnu novu AI koordinatu bez univerzalnog pomaka.
+In the Campus workflow, one valid AI building selection with a parseable `TARGET` name and a percentage below 100% proceeds directly to a click. The local Campus recognizer must then confirm that details opened with a genuine blue `100%` reward area; an arbitrary details screen is insufficient. Multiple buildings with the same percentage therefore cannot stall confirmation at `1/2`. A decision that no buildings remain still requires two fresh AI confirmations. If the click misses or opens a building without that reward area, details are closed and all previous missed points are marked with red crossed circles on the next AI image and forbidden on the next attempt. The click continues to use a fresh direct AI coordinate without a universal offset.
 
-Put saveza tok koristi lokalne vizuelne anchore samo za Top Eleven navigaciju: pronalazi red `Savezi`, plocicu `PUT SAVEZA`, tacni plavi video-`IDI` i modalni `X`. Zelena `IDI` dugmad se odbijaju. Plavi `IDI` mora imati video ikonu i puni tekst kroz dvije stabilne provjere, pa jos jednu svjezu provjeru neposredno prije klika. Sama plava pozadina ili loading stanje nisu dovoljni. Reklama zatim koristi isti AI-only nadzor X/skip/Google Play kao ostali tokovi.
+The Alliance Road workflow uses local visual anchors only for Top Eleven navigation. It locates the `Savezi` row, the `PUT SAVEZA` tile, the correct blue video `IDI`, and the modal X. Green `IDI` buttons are rejected. The blue `IDI` must contain the video icon and complete text across two stable checks, followed by another fresh check immediately before clicking. A blue background or loading state alone is insufficient. The ad then uses the same AI-only X, skip, and Google Play monitoring as other workflows.
 
-Nakon otvaranja bocnog menija Put saveza tok pravi tacno jedan wheel korak prema dolje i zatim trazi `Savezi`. Ako red tada nije prepoznat, tok se sigurno zaustavlja umjesto da ponavlja scroll deset puta.
+After opening the side menu, Alliance Road performs exactly one downward wheel step and then searches for `Savezi`. If the row is not recognized, the workflow stops safely instead of scrolling ten times.
 
-## Pokretanje
+## Running the agent
 
-Za automatizovano ponavljanje najnovijeg treninga koristi `Trening igraca\Pokreni Trening igraca Agent.cmd`. Tok provjerava kondiciju odabranog igraca, koristi puni tekst `BESPLATNO` i postojeci AI-only nadzor reklame dok igrac ne dostigne najmanje 85%, zatim pokrece trening i ponavlja ciklus.
+For automated repetition of the latest training session, use `Trening igraca\Pokreni Trening igraca Agent.cmd`. The workflow checks the selected player's condition, uses the complete `BESPLATNO` text and the existing AI-only ad monitor until the player reaches at least 85%, then starts training and repeats the cycle.
 
-Prvo otvori BlueStacks i Top Eleven, zatim pokreni:
+Open BlueStacks and Top Eleven first, then run:
 
 ```text
 Pokreni AI Agent.cmd
 ```
 
-Za sigurnu provjeru koordinata koristi opciju Kalibracija. Ona ne klikce.
+Use the Calibration option to validate coordinates safely. Calibration does not click.
 
-## Offline provjere
+## Offline validation
 
-Kampus poslije prvog otvaranja objekta ostaje u detalju i bira naredne objekte iz donje lijeve trake. Puni zeleni indikatori se preskacu, a potpuno vidljive kartice s bijelim ostatkom biraju se uz svjezu lokalnu potvrdu. Traka se prvo dovodi do lijevog kraja, a zatim se za naredne objekte povlaci zdesna nalijevo. Zavrsavanje zahtijeva dva pokusaja bez pomjeranja na desnom kraju i bez vidljivih nepotpunih kartica. Reklama se pokrece samo preko potvrdenog plavog video dugmeta `100%`, nikad preko placenog `+10%` ili `UNAPRIJEDI`.
+After opening the first Campus building, the workflow remains in the details view and selects subsequent buildings from the lower-left strip. Full green indicators are skipped, while fully visible cards with a white remainder are selected after fresh local validation. The strip is first moved to its left edge and is then dragged from right to left for later buildings. Completion requires two attempts with no movement at the right edge and no visible incomplete cards. An ad starts only from a confirmed blue video `100%` button, never from the paid `+10%` or `UNAPRIJEDI` controls.
 
-Najjednostavnije je u Manageru otvoriti `Postavke` i pritisnuti `Provjeri projekat`, ili pokrenuti `Provjeri projekat.cmd`. Provjera ne upravlja BlueStacksom: validira obavezne fajlove, PowerShell i JSON sintaksu, Python testove i oba SelfTesta. Iz komandne linije se moze pokrenuti bez dijaloga:
+The easiest validation method is to open `Postavke` in the Manager and click `Provjeri projekat`, or run `Provjeri projekat.cmd`. Validation does not control BlueStacks. It checks required files, PowerShell and JSON syntax, Python tests, and both self-tests. To run it without dialogs:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Provjeri projekat.ps1" -NoGui
 ```
 
-Ako racunar nema ugradjeni Codex Python runtime, napravi `.venv` ili `venv` i instaliraj zavisnosti:
+If the computer does not have the bundled Codex Python runtime, create a `.venv` or `venv` and install the dependencies:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r .\requirements.txt
 ```
 
-Pojedinacne provjere su:
+Individual checks are:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TopElevenAgent.ps1 -SelfTest
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TopElevenManager.ps1 -SelfTest
 python -m unittest discover -s .\tests -v
 python -m py_compile .\VisionAgent.py .\XDetector.py
-python .\regression\run_opencv_regression.py --zip "C:\putanja\do\ss.zip"
+python .\regression\run_opencv_regression.py --zip "C:\path\to\ss.zip"
 ```
 
-Regresijski runner cita screenshotove direktno iz zadatog `ss.zip`; ne raspakuje ih u projekat i ne mijenja arhivu. Ako arhiva nije prisutna, kompletna provjera je jasno oznacava kao opcionalno preskocenu.
+The regression runner reads screenshots directly from the specified `ss.zip`; it does not extract files into the project or modify the archive. If the archive is absent, full validation clearly marks this optional check as skipped.
 
-Ne ukljucuj puni automatizovani red prije testiranja jedne reklame pod nadzorom. Odbijeni i nepoznati AI rezultati spremaju se u `debug` folder radi naknadne analize; zadrzava se najvise `maximumDebugCaptures` snimaka (standardno 200) zajedno sa njihovim JSON metapodacima.
-# Rezervni Gemini API kljuc
+Do not enable the complete automated sequence before testing one ad under supervision. Rejected and unknown AI results are stored in the `debug` directory for later analysis. At most `maximumDebugCaptures` captures, 200 by default, are retained together with their JSON metadata.
 
-Pokreni `Postavi rezervni Gemini API kljuc.cmd` za unos drugog kljuca. Kada Gemini vrati HTTP 429 zbog potrosene kvote, VisionAgent automatski prelazi na sljedeci konfigurirani kljuc. Rezervni kljuc treba pripadati drugom Google Cloud projektu s vlastitom dostupnom kvotom; kljucevi istog projekta dijele limit.
+## Backup Gemini API key
+
+Run `Postavi rezervni Gemini API kljuc.cmd` to enter a second key. When Gemini returns HTTP 429 because the quota is exhausted, VisionAgent automatically switches to the next configured key. The backup key should belong to a different Google Cloud project with its own available quota; keys from the same project share the limit.

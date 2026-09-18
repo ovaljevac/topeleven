@@ -1,12 +1,12 @@
-# Dorade nakon pregleda propusta
+# Changes Following the Safety Review
 
-Implementirane su stavke 1, 2, 3, 4, 6 i 7. Stavka 5 nije proširena: Kampus i dalje čeka tačno 5 sekundi nakon potvrđenog povratka, prije postojećeg nastavka.
+Items 1, 2, 3, 4, 6, and 7 were implemented. Item 5 was not expanded: Campus still waits exactly five seconds after a confirmed return before continuing through the existing path.
 
-- Trening recognizer odbija preslabe podudarnosti i prazne slike. IZVJEŠTAJI, PONOVI, početak i završni X treninga potvrđuju se lokalnim traženjem referentnog izgleda dugmeta, ne samo fiksnom koordinatom.
-- Lokalni povratak u TV/priručnik, trening i Put saveza prihvata prethodno potvrđen odlazak u Store/Chrome kao alternativu AI snimku reklame, kao Kampus. Svaki tok i dalje zahtijeva svoj povratni ekran. Ponovni ulazak u vanjsku aplikaciju resetuje niz stabilnih povratnih frameova.
-- Čekanje zelenih/trening ponuda ponavlja AI klasifikaciju i kada je ranije viđeno plavo BESPLATNO, ali lokalna provjera nije uspjela. Prelaz na sivo ili ograničenje zato se ne gubi u zasebnom lokalnom čekanju. Odsustvo dugmeta ostaje nepoznato stanje.
-- Kampus pokušava alternativno sporije povlačenje ako se traka nije pomjerila. Za dokaz kraja zahtijeva pomjeranje u suprotnom smjeru i povratak na iste kartice (pozicije i vizuelne potpise). Zaglavljena traka ili izgubljen fokus izazivaju grešku, ne lažni uspjeh.
-- Back ima ukupan limit šest pokušaja po reklamnom kontekstu, ne resetuje ga novi klik/restore epizoda. Tri uzastopna Back pokušaja bez promjene slike prekidaju vanjsku navigaciju ranije.
-- Hard recovery zavisi od `Exception.Data['AgentFailureKind']`, uključujući unutrašnje izuzetke. Sam tekst poruke nikad ne aktivira restart. `AdTimeout`, `AdCloseFailed` i `ExternalReturnTimeout` dozvoljavaju stari hard recovery; `ExternalNavigationStuck`, `ScreenUnknown`, `FocusLost` i `CampusBoundaryUnknown` ne dozvoljavaju ga.
+- The Training recognizer rejects weak matches and blank images. `IZVJEŠTAJI`, `PONOVI`, the training start control, and the final training X are confirmed by locally matching the reference button appearance rather than by fixed coordinates alone.
+- Local return detection for TV/manual, Training, and Alliance Road accepts a previously confirmed transition to Store or Chrome as an alternative to an AI ad screenshot, as Campus already does. Each workflow still requires its own return screen. Re-entering an external app resets the stable-return frame sequence.
+- Waiting for Greens or Training offers repeats AI classification even when a blue `BESPLATNO` was previously seen but local validation failed. A transition to gray or to the limit state is therefore not lost inside a separate local wait. An absent button remains an unknown state.
+- Campus attempts an alternative slower drag when the strip does not move. Proving the end requires movement in the opposite direction and a return to the same cards, including positions and visual signatures. A stuck strip or lost focus produces an error, not false success.
+- Back has a total limit of six attempts per ad context; a new click or restore episode does not reset it. Three consecutive Back attempts without an image change terminate external navigation earlier.
+- Hard recovery depends on `Exception.Data['AgentFailureKind']`, including nested exceptions. Message text alone never triggers a restart. `AdTimeout`, `AdCloseFailed`, and `ExternalReturnTimeout` permit the existing hard recovery; `ExternalNavigationStuck`, `ScreenUnknown`, `FocusLost`, and `CampusBoundaryUnknown` do not.
 
-Validacija uključuje referentne slike, crne/bijele/nasumične slike, uklonjen X, skalirane prikaze i simulirane PowerShell tokove. Ovo nije zamjena za provjeru uživo na novim reklamnim formatima.
+Validation includes reference images, black, white, and random images, a removed X, scaled views, and simulated PowerShell workflows. This does not replace live validation against new ad formats.

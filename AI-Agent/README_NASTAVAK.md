@@ -1,32 +1,32 @@
-# Nastavak i screenshot greške
+# Resume and Error Screenshots
 
-## Pokretanje
+## Starting a resumed run
 
-- Discord: `/nastavi skripta:` pa izaberi fazu ili `sve`.
-- Manager → Skripte: označi **Nastavi danasnji sacuvani napredak**, pa pokreni odabranu skriptu.
-- Direktno: pokreni `TopElevenAgent.ps1` s uobičajenim parametrima i dodatnim `-Resume`.
-- Obični `/pokreni` i Manager bez označene opcije započinju novu sesiju i novi zapis napretka. Ne nastavljaju automatski.
+- Discord: use `/nastavi skripta:`, then select a stage or `sve`.
+- Manager -> Scripts: enable **Nastavi danasnji sacuvani napredak**, then start the selected script.
+- Direct launch: run `TopElevenAgent.ps1` with the usual parameters and add `-Resume`.
+- The normal `/pokreni` command and the Manager without the resume option begin a new session and create a new progress record. They do not resume automatically.
 
-Za učitavanje novih Discord komandi potrebno je ponovo pokrenuti Discord bot. Za novu Manager opciju ponovo otvori Manager.
+Restart the Discord bot to load new Discord commands. Reopen the Manager to load its new option.
 
-## Šta se pamti
+## Stored state
 
-Napredak se čuva odvojeno po projektu, režimu i BlueStacks instanci u `%LOCALAPPDATA%\TopElevenAgent\checkpoints`. Zapis sadrži datum, otisak konfiguracije, završene faze, potvrđene odmore po pozicijama, broj završenih trening ciklusa, posljednji potvrđen korak i odvojeno započetu akciju. Ne sadrži screenshot, API ključ ni koordinate klikova. Prethodni zapis ostaje kao `.bak`.
+Progress is stored separately by project, mode, and BlueStacks instance under `%LOCALAPPDATA%\TopElevenAgent\checkpoints`. A record contains the date, configuration fingerprint, completed stages, confirmed rest operations by position, completed training-cycle count, last confirmed step, and a separately recorded action that was started. It does not contain screenshots, API keys, or click coordinates. The previous record is retained as a `.bak` file.
 
-Nastavak prihvata samo današnji zapis iste konfiguracije. Ako zapis nedostaje, neispravan je ili zastario, prijavljuje grešku bez tihog pokretanja od početka.
+Resume accepts only a record created today with the same configuration. If the record is missing, invalid, or stale, the agent reports an error instead of silently starting over.
 
-Završene faze u `Sve` se preskaču. Odmor preskače potvrđene pozicije; trening nastavlja broj ciklusa i ponovo čita kondiciju. TV, Kampus i zeleni ponovo provjeravaju stvarno dostupne ponude/procente. Započeta reklama ili klik nisu dokaz dobijene nagrade.
+Completed stages in `Sve` are skipped. Team Rest skips confirmed positions. Training resumes the cycle count and reads condition again. TV, Campus, and Greens recheck the offers or percentages that are actually available. A started ad or click is not proof that a reward was received.
 
-Prije nastavka nezavršene faze provjerava se trenutni početni ekran. Ako on nije sigurno potvrđen, koristi se postojeći kontrolisani restart tačne instance i povratak na početni ekran. Zatim se do nezavršenog koraka dolazi uobičajenom navigacijom i novim provjerama. Ovo nije vraćanje stare pozicije miša niti nastavak instrukcije usred reklame.
+Before resuming an unfinished stage, the agent verifies the current starting screen. If it cannot be confirmed safely, the agent uses the existing controlled restart of the exact instance and returns to the home screen. It then reaches the unfinished step through normal navigation and fresh validation. This does not restore an old mouse position or resume an instruction in the middle of an ad.
 
-Koristi nastavak samo na istom nalogu i ne mijenjaj raspored igrača između prekida i nastavka odmora. Zapis identifikuje instancu, ne prijavljeni nalog niti igrača po imenu. Prekid između stvarne nagrade i njenog spremanja ostaje nepotvrđen: nije moguće garantovati tačno-jednom izvršavanje preko takvog prekida.
+Use resume only with the same account, and do not change the player order between interruption and resuming Team Rest. The record identifies the instance, not the signed-in account or a player by name. An interruption between receiving a reward and saving its completion remains unconfirmed; exactly-once execution cannot be guaranteed across such an interruption.
 
-## Greške i slike
+## Errors and images
 
-Prije recoveryja faze čuva se izvještaj uz log, u direktoriju `<log>.errors`. Sadrži fazu, posljednju potvrdu, očekivani korak, grešku i PNG BlueStacks prozora kada je snimanje dostupno. Ista poruka ne šalje se ponovo u istom pokretanju; najviše osam izvještaja po pokretanju.
+Before stage recovery, the agent stores a report next to the log in a `<log>.errors` directory. It contains the stage, last confirmation, expected step, error, and a PNG of the BlueStacks window when capture is available. The same message is not sent again during the same run, and no more than eight reports are created per run.
 
-Discord šalje izvještaj i sliku u kanal iz kojeg je pokrenuta skripta, i kada je obični live log isključen. Manager prikazuje lokalnu putanju izvještaja u logu. Ne snima se cijeli desktop niti se koristi desktop kao zamjena ako snimanje BlueStacksa ne uspije. GPU renderovanje može vratiti crnu sliku; tada ide tekstualni izvještaj s razlogom, bez lažne slike.
+Discord sends the report and image to the channel from which the script was started, even when the normal live log is disabled. The Manager displays the local report path in its log. The entire desktop is never captured and is not used as a fallback if BlueStacks capture fails. GPU rendering may produce a black image; in that case, the agent sends a text report with the reason and no misleading image.
 
-Slike mogu sadržavati naziv tima i druge podatke vidljive u igri. Koristi privatni Discord kanal ako ih ne želiš dijeliti. Izvještaji ostaju lokalno; nema automatskog brisanja starih slika.
+Images may contain the team name and other data visible in the game. Use a private Discord channel if you do not want to share this information. Reports remain stored locally; old images are not deleted automatically.
 
-STOP nije greška i sam po sebi ne šalje sliku. Privremeno odbijen AI prijedlog također ne pravi sliku; izvještaji se prave pri izuzetku faze ili završnoj grešci.
+STOP is not an error and does not send an image by itself. A temporarily rejected AI suggestion also does not create an image. Reports are created for a stage exception or final error.

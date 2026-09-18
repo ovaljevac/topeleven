@@ -1,16 +1,16 @@
 # Top Eleven TV AI Agent
 
-Pokreni Top Eleven i ostavi ga na pocetnom ekranu kao na `1.png`, zatim dvoklikni `Pokreni TV Agent.cmd` i pritisni `POKRENI`.
+Start Top Eleven and leave it on the home screen as shown in `1.png`. Then double-click `Pokreni TV Agent.cmd` and click `POKRENI`.
 
-Tok:
+Workflow:
 
-1. Otvori bocni meni, ceka 2 sekunde, pritisne `Pocetni`, pa ponovo ceka 2 sekunde.
-2. Potvrdi pocetni ekran, vizuelno pronadje bijelu monitor/play TV ikonu u gornjoj traci i klikne njen stvarni centar. Ne koristi fiksnu X koordinatu, jer sirina brojeva resursa pomjera TV dugme.
-3. Na TV ekranu prihvata dugme samo kada istovremeno vidi odgovarajuci plavi pravougaonik i bijeli uzorak ikone/teksta `POGLEDAJ`; sama plava boja nije dovoljna. Dugmad obradjuje slijeva nadesno.
-4. Reklame koriste isti potpuno AI-only tok iz glavnog agenta: prva redovna Gemini provjera je nakon 20.5 sekundi, zatim svakih 20.5 sekundi, a wake dodir po potrebi pokrece dodatnu provjeru odmah.
-5. Za `PRIRUCNIK` potvrdi ekrane 3, 4 i 5, izvrsi dva pojedinacna dodira i zatim klikne `NASTAVI`. Dinamicki detektor prepoznaje zeleni button sa stvarnim bijelim tekstom bez obzira zauzima li dio ili skoro cijelu sirinu; postojeca referentna koordinata ostaje kao drugi recognizer/fallback.
-6. Zaustavlja se tek nakon najmanje 30 neprekidnih sekundi bez dostupnog `POGLEDAJ` dugmeta. Pojava bilo kojeg validnog dugmeta resetuje taj timer (`tvWatchButtonWaitSeconds` u roditeljskom `config.json`).
+1. Opens the side menu, waits two seconds, clicks `Pocetni`, and waits another two seconds.
+2. Confirms the home screen, visually locates the white monitor/play TV icon in the upper bar, and clicks its actual center. It does not use a fixed X coordinate because the width of the resource numbers moves the TV button.
+3. On the TV screen, accepts a button only when it sees both the appropriate blue rectangle and a white icon or `POGLEDAJ` text pattern. Blue color alone is insufficient. Buttons are processed from left to right.
+4. Ads use the same fully AI-only workflow as the main agent: the first regular Gemini check occurs after 20.5 seconds, followed by checks every 20.5 seconds, while a wake tap may request an immediate additional check when necessary.
+5. For `PRIRUCNIK`, confirms screens 3, 4, and 5, performs two individual taps, and then clicks `NASTAVI`. The dynamic detector recognizes a green button with real white text whether it occupies part or nearly all of the width; the existing reference coordinate remains a secondary recognizer and fallback.
+6. Stops only after at least 30 uninterrupted seconds without an available `POGLEDAJ` button. Any valid button resets this timer through `tvWatchButtonWaitSeconds` in the parent `config.json`.
 
-Izmedju uvodnih klikova na bocni meni i `Pocetni` postoji buffer od 2000 ms (`tvNavigationBufferMs`). Ostali navigacijski klikovi koriste 1500 ms (`tvClickBufferMs`), uz dodatno cekanje da detektor potvrdi sljedeci ekran.
+A delay of 2000 ms (`tvNavigationBufferMs`) is used between the initial side-menu and `Pocetni` clicks. Other navigation clicks use 1500 ms (`tvClickBufferMs`), with additional waiting until the detector confirms the next screen.
 
-Reference `1.png` do `5.png` ostaju u ovom folderu i koriste se samo za lokalnu klasifikaciju ekrana.
+References `1.png` through `5.png` remain in this directory and are used only for local screen classification.
