@@ -11,6 +11,36 @@ SPEC.loader.exec_module(x_detector)
 
 
 class CampusFlowTests(unittest.TestCase):
+    def strip_image(self):
+        image = x_detector.np.zeros((632, 1094, 3), dtype=x_detector.np.uint8)
+        image[160:600, 570:1040] = 245
+        for x, fill in ((40, 100), (180, 90), (320, 80)):
+            image[480:507, x:x+100] = 230
+            image[480:507, x:x+fill] = (45, 210, 45)
+        return image
+
+    def test_strip_distinguishes_full_and_incomplete_cards(self):
+        strip = x_detector._campus_object_strip(self.strip_image())
+        self.assertTrue(strip['verified'])
+        self.assertEqual([False, True, True], [c['incomplete'] for c in strip['cards']])
+        self.assertTrue(all(c['x'] < .5 and .8 < c['y'] < .94 for c in strip['cards']))
+
+    def test_strip_without_detail_panel_cannot_authorize_navigation(self):
+        image = self.strip_image()
+        image[:, 570:] = 0
+        self.assertFalse(x_detector._campus_object_strip(image)['verified'])
+
+    def test_strip_swipe_stays_left_and_releases_mouse_on_cancellation(self):
+        script = (ROOT / 'TopElevenAgent.ps1').read_text(encoding='utf-8-sig')
+        start = script.index('function Move-CampusObjectStrip')
+        end = script.index('function Run-CampusAutomation', start)
+        flow = script[start:end]
+        self.assertIn('if ($TowardsRight) { 0.455 } else { 0.065 }', flow)
+        self.assertIn('finally { [Win32Agent]::mouse_event(0x0004', flow)
+        self.assertIn('$endChecks -ge 2', flow)
+        self.assertIn('$watched -ge 12', flow)
+        self.assertNotIn('zatvori detalj', flow)
+
     def load(self, number):
         return x_detector.load_image(ROOT / "Kampus" / f"{number}.png")
 

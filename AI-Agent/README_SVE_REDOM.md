@@ -10,6 +10,8 @@ Redoslijed je:
 4. Kampus objekti ispod 100%.
 5. Uzmi 25 zelenih (`Zeleni` tok).
 
-Svaka faza ima najvise tri pokusaja. Nakon greske agent potpuno ugasi aktivnu BlueStacks instancu, ponovo pokrene Top Eleven, potvrdi stabilan pocetni ekran i ponovi istu fazu. Tek nakon treceg neuspjeha greska se zapisuje u log, radi se cisti restart i prelazi na sljedecu fazu. Dugme `ZAUSTAVI` prekida cijeli zajednicki tok.
+Kod obicne AI ili vizuelne neizvjesnosti agent ne gasi igru nego ponavlja sigurnu provjeru na istom koraku. Tvrdi restart tacne BlueStacks instance koristi se samo kada je reklama potvrdeno zaglavljena ili kada je prije nastavka potreban provjeren pocetni ekran. Neuspjela faza se zapisuje u log, nakon sigurnog preflighta prelazi se na sljedecu fazu, a Manager zavrsetak prikazuje kao upozorenje `Zavrseno uz greske`. Dugme `ZAUSTAVI` prekida cijeli zajednicki tok.
+
+Ako reklama otvori Google Play Store ili Chrome, agent preko trenutnog BlueStacks ADB activity stanja salje Android Back, vraca se u reklamu i zavrsava njen X. Sljedeca faza ne dobija pravo na klik dok `MainPlayerNativeActivity` i Top Eleven zaglavlje nisu stabilno potvrdeni.
 
 Postojeci pojedinacni launcheri i dalje rade nepromijenjeno.

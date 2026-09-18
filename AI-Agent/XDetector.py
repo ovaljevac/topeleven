@@ -1512,6 +1512,45 @@ def _campus_maintenance_badges(bgr):
     return badges
 
 
+def _campus_object_strip(bgr):
+    height, width = bgr.shape[:2]
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, np.array([35, 90, 100]), np.array([85, 255, 255]))
+    mask[:int(height * .72)] = 0
+    mask[int(height * .86):] = 0
+    mask[:, int(width * .50):] = 0
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 5), np.uint8))
+    count, _, stats, _ = cv2.connectedComponentsWithStats(mask)
+    cards = []
+    for x, y, w, h, area in stats[1:count]:
+        x, y, w, h = map(int, (x, y, w, h))
+        if not (.060 * width <= w <= .12 * width and .025 * height <= h <= .06 * height):
+            continue
+        if x < width * .018 or x + w >= width * .48 or area < w * h * .65:
+            continue
+        tail = 0
+        for column in range(x + w, min(int(width * .50), x + w + int(width * .035))):
+            pixels = bgr[y + 2:y + h - 2, column]
+            if not pixels.size or np.mean(np.all(pixels >= 175, axis=1)) < .65:
+                if tail == 0 and column < x + w + 3:
+                    continue
+                break
+            tail += 1
+        if x + w + tail >= width * .495:
+            continue
+        thumbnail = bgr[y+h:min(height, y+h+int(height*.11)), x:x+w+tail]
+        identity = cv2.resize(cv2.cvtColor(thumbnail, cv2.COLOR_BGR2GRAY), (16, 8)).flatten().tolist()
+        cards.append({"identity": identity, "x": (x + (w + tail) / 2) / width,
+                      "y": min(.92, (y + h + height * .055) / height),
+                      "incomplete": tail >= width * .004})
+    cards.sort(key=lambda card: card["x"])
+    panel = hsv[int(height * .26):int(height * .94), int(width * .53):int(width * .94)]
+    panel_ready = bool(panel.size and np.mean((panel[:, :, 1] < 65) & (panel[:, :, 2] > 190)) > .60)
+    roi = bgr[int(height * .74):int(height * .94), int(width * .02):int(width * .49)]
+    fingerprint = cv2.resize(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), (32, 8)).flatten().tolist()
+    return {"verified": panel_ready and len(cards) >= 2, "cards": cards, "fingerprint": fingerprint}
+
+
 def detect_campus_flow(bgr):
     """Classify Campus screens and verify the exact blue 100% ad button."""
     height, width = bgr.shape[:2]
@@ -1592,11 +1631,13 @@ def detect_campus_flow(bgr):
         }
         break
 
+    strip = _campus_object_strip(bgr)
     state = "unknown"
     if (
         hundred_button is not None
         or hundred_button_visible is not None
         or (nearest in (5, 6) and nearest_distance <= 38)
+        or strip["verified"]
     ):
         state = "campus_detail"
     elif len(maintenance_badges) >= 3 and tool_button is not None:
@@ -1613,7 +1654,9 @@ def detect_campus_flow(bgr):
         "hundredButton": hundred_button if state == "campus_detail" else None,
         "hundredButtonVisible": hundred_button_visible if state == "campus_detail" else None,
         "maintenanceBadgeCount": len(maintenance_badges),
+        "maintenanceBadges": maintenance_badges if state == "campus_maintenance" else [],
         "referenceDistance": round(nearest_distance, 2),
+        "objectStrip": strip,
     }
 
 
@@ -2110,11 +2153,12 @@ def detect_alliance_flow(bgr):
 
 
 def detect_team_rest_free_button(bgr):
-    """Accept the team-rest ad button only when its full white label is rendered.
+    """Accept a rest/store ad button only when its full white label is rendered.
 
     The loading state uses the same blue rectangle but contains only three dots.
     Nine separated, letter-sized bright glyphs spread across the button distinguish
-    the actual BESPLATNO label without relying on the blue background alone.
+    the actual BESPLATNO label without relying on the blue background alone. Both
+    the player-rest modal and the upper-right 25-green Store layout are supported.
     """
     height, width = bgr.shape[:2]
     if width < 600 or height < 400:
@@ -2127,12 +2171,19 @@ def detect_team_rest_free_button(bgr):
         }
 
     top_eleven_context = detect_top_resource_cards(bgr)["found"]
+    store_roi = bgr[
+        int(height * 0.30):int(height * 0.54),
+        int(width * 0.02):int(width * 0.22),
+    ]
+    store_light = np.all(store_roi >= 185, axis=2) if store_roi.size else np.zeros((1, 1), dtype=bool)
+    store_loaded = bool(top_eleven_context and float(np.mean(store_light)) >= 0.18)
     if not top_eleven_context:
         return {
             "found": False,
             "ready": False,
             "buttonVisible": False,
             "topElevenContext": False,
+            "storeLoaded": False,
             "glyphCount": 0,
         }
 
@@ -2141,11 +2192,201 @@ def detect_team_rest_free_button(bgr):
     count, _, stats, centers = cv2.connectedComponentsWithStats(blue)
     visible_candidates = []
 
+    # U Prodavnici je dugme ponekad istog plavog tona kao cijela pozadina.
+    # Tada HSV komponenta postane ogroman spojeni oblik i nema zaseban okvir.
+    # Tekst sam po sebi nije dovoljan: POGLEDAJ i kartica BESPLATNI imaju isti
+    # broj bijelih slova. Stvarno reward dugme ima video-kameru lijevo i obojenu
+    # ikonu resursa desno, sa punom rijeci (ne tri loading tacke) izmedju njih.
+    store_text_candidate = None
+    store_x1, store_x2 = int(width * 0.78), int(width * 0.99)
+    store_y1, store_y2 = int(height * 0.18), int(height * 0.70)
+    store_text_roi = bgr[store_y1:store_y2, store_x1:store_x2]
+    if store_loaded and store_text_roi.size:
+        bright_text = np.all(store_text_roi >= 185, axis=2).astype(np.uint8)
+        text_count, text_labels, text_stats, text_centers = cv2.connectedComponentsWithStats(bright_text)
+        glyphs = []
+        for label_index, (glyph, center) in enumerate(
+            zip(text_stats[1:text_count], text_centers[1:text_count]), start=1
+        ):
+            glyph_x, glyph_y, glyph_width, glyph_height, glyph_area = map(int, glyph)
+            # The camera glyph is one connected, landscape component and is
+            # wider than an individual letter (29 px on a 1024 px capture).
+            if not (2 <= glyph_width <= max(40, int(width * 0.040))):
+                continue
+            if not (height * 0.012 <= glyph_height <= height * 0.040):
+                continue
+            if glyph_area < max(10, int(width * height * 0.000015)):
+                continue
+            component = (
+                text_labels[
+                    glyph_y:glyph_y + glyph_height,
+                    glyph_x:glyph_x + glyph_width,
+                ] == label_index
+            ).astype(np.uint8)
+            contours, hierarchy = cv2.findContours(
+                component, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE
+            )
+            holes = (
+                sum(1 for index in range(len(contours)) if hierarchy[0][index][3] >= 0)
+                if hierarchy is not None else 0
+            )
+            glyphs.append({
+                "x": float(center[0]),
+                "y": float(center[1]),
+                "width": glyph_width,
+                "height": glyph_height,
+                "area": glyph_area,
+                "holes": holes,
+            })
+
+        # Svako slovo predlaze red; najbolji red mora imati raspon cijele
+        # rijeci BESPLATNO, ne samo nekoliko susjednih ikona ili cifara.
+        checked_rows = set()
+        store_hsv = cv2.cvtColor(store_text_roi, cv2.COLOR_BGR2HSV)
+        for seed in glyphs:
+            row_y, row_height = seed["y"], seed["height"]
+            tolerance = max(4.0, row_height * 0.55)
+            row = sorted(
+                (glyph for glyph in glyphs if abs(glyph["y"] - row_y) <= tolerance),
+                key=lambda glyph: glyph["x"],
+            )
+            row_key = tuple(round(glyph["x"]) for glyph in row)
+            if row_key in checked_rows:
+                continue
+            checked_rows.add(row_key)
+            if not (9 <= len(row) <= 14):
+                continue
+            # Na stvarnom Top Eleven fontu anti-aliasing ponekad razdvoji
+            # jedan znak na dvije bijele komponente, a uz lijevi rub reda moze
+            # ostati mali bijeli komadic prethodne kartice. Red zato prvo
+            # pocinje od stvarne landscape video-kamere, ne od row[0].
+            camera_index = next(
+                (
+                    index for index, glyph in enumerate(row)
+                    if glyph["width"] >= 12.0
+                    and glyph["width"] >= glyph["height"] * 1.25
+                ),
+                None,
+            )
+            if camera_index is None:
+                continue
+            row = row[camera_index:]
+            if not (9 <= len(row) <= 14):
+                continue
+            widths = [glyph["width"] for glyph in row]
+            median_width = float(np.median(widths))
+            left_icon = row[0]
+            right_icon = row[-1]
+            if not (
+                left_icon["width"] >= max(12.0, median_width * 1.65)
+                and left_icon["width"] >= left_icon["height"] * 1.25
+            ):
+                continue
+            # The colored green/blue resource tile surrounds the rightmost
+            # white glyph. A plain word or BESPLATNI navigation tab has no
+            # video/resource pair and therefore cannot pass this check.
+            icon_radius = max(12, round(right_icon["height"] * 1.35))
+            icon_x1 = max(0, round(right_icon["x"] - icon_radius))
+            icon_x2 = min(store_hsv.shape[1], round(right_icon["x"] + icon_radius + 1))
+            icon_y1 = max(0, round(right_icon["y"] - icon_radius))
+            icon_y2 = min(store_hsv.shape[0], round(right_icon["y"] + icon_radius + 1))
+            icon_patch = store_hsv[icon_y1:icon_y2, icon_x1:icon_x2]
+            colored_ratio = (
+                float(np.mean((icon_patch[:, :, 1] >= 90) & (icon_patch[:, :, 2] >= 90)))
+                if icon_patch.size else 0.0
+            )
+            if colored_ratio < 0.08:
+                continue
+            # Ovaj detector pripada iskljucivo fazi "Uzmi 25 zelenih".
+            # Donji red Prodavnice ima isto BESPLATNO dugme, ali plavu ikonu
+            # morala; njega se nikada ne smije kliknuti. Zahtijevaj stvarne
+            # zelene pixele oko desne ikone odmora, ne samo bilo koju boju.
+            green_resource_ratio = (
+                float(np.mean(
+                    (icon_patch[:, :, 0] >= 35)
+                    & (icon_patch[:, :, 0] <= 85)
+                    & (icon_patch[:, :, 1] >= 90)
+                    & (icon_patch[:, :, 2] >= 90)
+                ))
+                if icon_patch.size else 0.0
+            )
+            if green_resource_ratio < 0.05:
+                continue
+            text_components = row[1:-1]
+            # Spoji komponente koje pripadaju istom slovu i imaju gotovo isti
+            # horizontalni centar. Na prilozenom stvarnom BESPLATNO redu S, P
+            # i O mogu biti podijeljeni pragom svjetline; bez ovog grupiranja
+            # ispravna rijec izgleda kao 10-11 umjesto 8 komponenti.
+            text_glyphs = []
+            merge_tolerance = max(1.5, width * 0.002)
+            for component in text_components:
+                if text_glyphs and abs(component["x"] - text_glyphs[-1]["x"]) <= merge_tolerance:
+                    group = text_glyphs[-1]
+                    group["x"] = (group["x"] * group["parts"] + component["x"]) / (group["parts"] + 1)
+                    group["width"] = max(group["width"], component["width"])
+                    group["height"] = max(group["height"], component["height"])
+                    group["area"] += component["area"]
+                    group["holes"] += component["holes"]
+                    group["parts"] += 1
+                else:
+                    text_glyphs.append({**component, "parts": 1})
+            # Exact lightweight word signature for BESPLATNO. At the sizes used
+            # by Top Eleven, L+A can touch, so the nine letters form eight
+            # components. B has two counters, P has one and the final O has
+            # one. This rejects POGLEDAJ/BESPLATNI/random text even if another
+            # blue row happens to be flanked by similar icons.
+            if len(text_glyphs) != 8:
+                continue
+            hole_pattern = [int(glyph["holes"]) for glyph in text_glyphs]
+            if not (
+                hole_pattern[0] >= 2
+                and hole_pattern[3] >= 1
+                and hole_pattern[-1] >= 1
+            ):
+                continue
+            row_x = [glyph["x"] for glyph in row]
+            span = (max(row_x) - min(row_x)) / float(width)
+            if not (0.055 <= span <= 0.16):
+                continue
+            center_x = (store_x1 + (min(row_x) + max(row_x)) * 0.5) / float(width)
+            center_y = (store_y1 + sum(glyph["y"] for glyph in row) / len(row)) / float(height)
+            candidate = {
+                "found": True,
+                "ready": True,
+                "buttonVisible": True,
+                "topElevenContext": True,
+                "storeLoaded": True,
+                "layout": "store",
+                "x": center_x,
+                "y": center_y,
+                "glyphCount": len(row),
+                "whitePixels": int(sum(glyph["area"] for glyph in row)),
+                "textSpan": round(span, 3),
+                "occupiedColumns": 0.0,
+                "textFirst": True,
+                "flankedByRewardIcons": True,
+                "resourceColorRatio": round(colored_ratio, 3),
+                "greenResourceRatio": round(green_resource_ratio, 3),
+                "letterHolePattern": hole_pattern,
+            }
+            if store_text_candidate is None or candidate["glyphCount"] > store_text_candidate["glyphCount"]:
+                store_text_candidate = candidate
+
     for stat, center in zip(stats[1:count], centers[1:count]):
         x, y, component_width, component_height, area = map(int, stat)
         normalized_x = float(center[0] / width)
         normalized_y = float(center[1] / height)
-        if not (0.66 <= normalized_x <= 0.87 and 0.78 <= normalized_y <= 0.96):
+        team_zone = 0.66 <= normalized_x <= 0.87 and 0.78 <= normalized_y <= 0.96
+        # Store kartice se vertikalno pomjeraju zavisno od broja/visine
+        # ponuda. U praksi je BESPLATNO vidjeno od gornje petine pa sve do
+        # oko 70% prozora; stara uska zona je propustala potpuno ispisano
+        # dugme i cekala svih 90 sekundi.
+        store_zone = (
+            store_loaded
+            and 0.78 <= normalized_x <= 0.985
+            and 0.18 <= normalized_y <= 0.70
+        )
+        if not (team_zone or store_zone):
             continue
         if not (width * 0.09 <= component_width <= width * 0.19):
             continue
@@ -2155,6 +2396,20 @@ def detect_team_rest_free_button(bgr):
             continue
 
         button = bgr[y:y + component_height, x:x + component_width]
+        if store_zone:
+            button_hsv = cv2.cvtColor(button, cv2.COLOR_BGR2HSV)
+            right_icon_patch = button_hsv[:, int(component_width * 0.78):]
+            green_resource_ratio = (
+                float(np.mean(
+                    (right_icon_patch[:, :, 0] >= 35)
+                    & (right_icon_patch[:, :, 0] <= 85)
+                    & (right_icon_patch[:, :, 1] >= 90)
+                    & (right_icon_patch[:, :, 2] >= 90)
+                ))
+                if right_icon_patch.size else 0.0
+            )
+            if green_resource_ratio < 0.025:
+                continue
         bright = np.all(button >= 190, axis=2).astype(np.uint8)
         white_pixels = int(np.sum(bright))
         ys, xs = np.where(bright > 0)
@@ -2186,6 +2441,8 @@ def detect_team_rest_free_button(bgr):
                 "ready": ready,
                 "buttonVisible": True,
                 "topElevenContext": True,
+                "storeLoaded": bool(store_loaded or store_zone),
+                "layout": "store" if store_zone else "team_rest",
                 "x": normalized_x,
                 "y": normalized_y,
                 "glyphCount": letters,
@@ -2195,12 +2452,15 @@ def detect_team_rest_free_button(bgr):
             }
         )
 
+    if store_text_candidate is not None:
+        return store_text_candidate
     if not visible_candidates:
         return {
             "found": False,
             "ready": False,
             "buttonVisible": False,
             "topElevenContext": True,
+            "storeLoaded": store_loaded,
             "glyphCount": 0,
         }
     ready_candidates = [candidate for candidate in visible_candidates if candidate["ready"]]
@@ -2223,6 +2483,110 @@ def _training_player_reference_features():
             features[index] = _tv_feature(reference)
     _TRAINING_PLAYER_REFERENCE_FEATURES = features
     return features
+
+
+def _training_player_profile_signature(bgr):
+    """Verify the three-column player profile independently of reference similarity."""
+    height, width = bgr.shape[:2]
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    y1, y2 = int(height * 0.48), int(height * 0.72)
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    hue = hsv[:, :, 0]
+
+    def colored_count(x1, x2, hue_mask):
+        region = (
+            hue_mask[y1:y2, int(width * x1):int(width * x2)]
+            & (saturation[y1:y2, int(width * x1):int(width * x2)] >= 100)
+            & (value[y1:y2, int(width * x1):int(width * x2)] >= 100)
+        )
+        return int(np.sum(region))
+
+    red = colored_count(0.22, 0.36, (hue <= 12) | (hue >= 170))
+    blue = colored_count(0.42, 0.58, (hue >= 90) & (hue <= 125))
+    green = colored_count(0.64, 0.80, (hue >= 35) & (hue <= 85))
+    modal = hsv[
+        int(height * 0.12):int(height * 0.94),
+        int(width * 0.07):int(width * 0.90),
+    ]
+    light_modal_ratio = (
+        float(np.mean((modal[:, :, 1] <= 55) & (modal[:, :, 2] >= 130)))
+        if modal.size else 0.0
+    )
+    pixels = float(width * height)
+    verified = (
+        red >= pixels * 0.00035
+        and blue >= pixels * 0.00035
+        and green >= pixels * 0.00080
+        and light_modal_ratio >= 0.58
+    )
+    return {
+        "verified": bool(verified),
+        "redPixels": red,
+        "bluePixels": blue,
+        "greenPixels": green,
+        "lightModalRatio": round(light_modal_ratio, 3),
+    }
+
+
+def _training_condition_modal_close(bgr):
+    """Ground the recovery panel in its dark body, column markers and red X."""
+    h, w = bgr.shape[:2]
+    signature = _training_player_profile_signature(bgr)
+    if any(signature[key] < w * h * .00035
+           for key in ("redPixels", "bluePixels", "greenPixels")):
+        return None
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    body = hsv[int(h * .73):int(h * .81), int(w * .30):int(w * .85)]
+    # Gold/rare profile layouts leave more colored controls inside this band;
+    # the recovery panel is still unambiguous when its red close and the blue
+    # BESPLATNO control are grounded below.
+    if float(np.mean(body[:, :, 2] < 65)) < .50:
+        return None
+    red = (((hsv[:, :, 0] <= 12) | (hsv[:, :, 0] >= 170))
+           & (hsv[:, :, 1] >= 130) & (hsv[:, :, 2] >= 130)).astype(np.uint8)
+    count, _, stats, _ = cv2.connectedComponentsWithStats(red)
+    for x, y, bw, bh, area in stats[1:count]:
+        if not (.50 <= (x + bw / 2) / w <= .65 and .80 <= (y + bh / 2) / h <= .96
+                and .04 <= bw / w <= .09 and .06 <= bh / h <= .13
+                and area >= bw * bh * .65):
+            continue
+        button = hsv[y:y + bh, x:x + bw]
+        pale = (button[:, :, 1] < 130) & (button[:, :, 2] >= 140)
+        if float(np.mean(pale)) >= .03:
+            return {"x": float((x + bw / 2) / w), "y": float((y + bh / 2) / h)}
+    return None
+
+
+def _training_condition_plus(bgr):
+    """Locate the rightmost green KONDICIJA plus on a verified player profile."""
+    height, width = bgr.shape[:2]
+    signature = _training_player_profile_signature(bgr)
+    if not signature["verified"]:
+        return None
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    green = (((hsv[:, :, 0] >= 35) & (hsv[:, :, 0] <= 85))
+             & (hsv[:, :, 1] >= 90) & (hsv[:, :, 2] >= 100)).astype(np.uint8)
+    count, _, stats, centers = cv2.connectedComponentsWithStats(green)
+    candidates = []
+    for stat, center in zip(stats[1:count], centers[1:count]):
+        x, y, component_width, component_height, area = map(int, stat)
+        nx, ny = float(center[0] / width), float(center[1] / height)
+        if not (.82 <= nx <= .985 and .52 <= ny <= .78):
+            continue
+        if not (.025 <= component_width / width <= .09 and
+                .045 <= component_height / height <= .16 and
+                area >= component_width * component_height * .45):
+            continue
+        patch = hsv[y:y + component_height, x:x + component_width]
+        pale_plus = (patch[:, :, 1] <= 95) & (patch[:, :, 2] >= 175)
+        if float(np.mean(pale_plus)) < .025:
+            continue
+        candidates.append({"x": nx, "y": ny, "area": area})
+    if not candidates:
+        return None
+    best = max(candidates, key=lambda candidate: (candidate["x"], candidate["area"]))
+    return {"x": best["x"], "y": best["y"]}
 
 
 def _training_free_button(bgr):
@@ -2263,10 +2627,37 @@ def _training_free_button(bgr):
     return max(ready or candidates, key=lambda candidate: candidate.get("glyphCount", 0))
 
 
+def _training_control_anchor(bgr, reference_index, center, half_size=(.06, .022)):
+    """Locate the reference control locally; never return a blind fixed click."""
+    reference = cv2.imread(os.path.join(TRAINING_PLAYER_REFERENCE_DIR, f"{reference_index}.png"))
+    if reference is None:
+        return None
+    h, w = bgr.shape[:2]
+    reference = cv2.resize(reference, (w, h))
+    cx, cy = int(center[0] * w), int(center[1] * h)
+    rx, ry = max(5, int(half_size[0] * w)), max(5, int(half_size[1] * h))
+    template = cv2.cvtColor(reference[max(0, cy-ry):cy+ry, max(0, cx-rx):cx+rx], cv2.COLOR_BGR2GRAY)
+    x1, y1 = max(0, cx-rx-int(.035*w)), max(0, cy-ry-int(.035*h))
+    roi = cv2.cvtColor(bgr[y1:min(h, cy+ry+int(.035*h)), x1:min(w, cx+rx+int(.035*w))], cv2.COLOR_BGR2GRAY)
+    if template.std() < 12 or roi.shape[0] < template.shape[0] or roi.shape[1] < template.shape[1]:
+        return None
+    _, score, _, location = cv2.minMaxLoc(cv2.matchTemplate(roi, template, cv2.TM_CCOEFF_NORMED))
+    if not np.isfinite(score) or score < .80:
+        return None
+    return {"x": (x1+location[0]+template.shape[1]/2)/w,
+            "y": (y1+location[1]+template.shape[0]/2)/h, "score": round(score, 3)}
+
+
 def detect_training_player_flow(bgr):
     height, width = bgr.shape[:2]
     if width < 600 or height < 400:
         return {"state": "unknown"}
+    # Match the invariant title and close control, excluding names/percentages.
+    exhausted_title = _training_control_anchor(bgr, "exhausted", (.184, .298), (.077, .027))
+    if exhausted_title is not None:
+        exhausted_close = _training_control_anchor(bgr, "exhausted", (.830, .300), (.018, .027))
+        if exhausted_close is not None:
+            return {"state": "exhausted_players", "closeButton": exhausted_close}
     feature = _tv_feature(bgr)
     distances = {
         index: float(np.mean(np.abs(feature - reference)))
@@ -2276,21 +2667,54 @@ def detect_training_player_flow(bgr):
         return {"state": "unknown"}
     nearest = min(distances, key=distances.get)
     distance = distances[nearest]
+    # Do not require the whole profile to resemble reference 7. Rare/gold
+    # profiles can be visually distant while the modal controls themselves
+    # are freshly and independently verified.
+    modal_close = _training_condition_modal_close(bgr)
+    modal_free = _training_free_button(bgr) if modal_close is not None else None
+    if modal_close is not None:
+        return {"state": "condition_modal", "reference": nearest,
+                "distance": round(distance, 3), "modalClose": modal_close,
+                "freeButton": modal_free}
+    # Player identity, kit and profile contents vary considerably. When the
+    # profile is still the closest reference, its independent three-column
+    # signature can confirm it despite a large whole-frame distance.
+    profile_signature = _training_player_profile_signature(bgr) if nearest == 6 else None
+    if profile_signature is not None and profile_signature["verified"]:
+        result = {"state": "player_detail", "reference": nearest,
+                  "distance": round(distance, 3), "profileVerified": True,
+                  "profileSignature": profile_signature}
+        condition_plus = _training_condition_plus(bgr)
+        if condition_plus is not None:
+            result["conditionPlus"] = condition_plus
+        return result
+    if distance > 35 or float(np.std(bgr)) < 12:
+        return {"state": "unknown", "distance": round(distance, 3)}
     state = {
         1: "home", 2: "training_home", 3: "reports", 4: "setup",
         5: "training_result", 6: "player_detail", 7: "condition_modal",
         8: "training_home",
     }.get(nearest, "unknown")
     result = {"state": state, "reference": nearest, "distance": round(distance, 3)}
-    if state == "training_home":
-        result["reportsButton"] = {"x": 0.490, "y": 0.915}
-    elif state == "reports":
-        result["repeatButton"] = {"x": 0.920, "y": 0.350}
-    elif state == "setup":
-        result["startButton"] = {"x": 0.862, "y": 0.360}
-    elif state == "training_result":
-        result["closeButton"] = {"x": 0.951, "y": 0.100}
+    anchors = {"training_home": ("reportsButton", (.490, .915)),
+               "reports": ("repeatButton", (.920, .350)),
+               "setup": ("startButton", (.862, .360)),
+               "training_result": ("closeButton", (.951, .100))}
+    if state in anchors:
+        key, center = anchors[state]
+        anchor = _training_control_anchor(bgr, nearest, center,
+                    (.014, .023) if state == "training_result" else (.06, .022))
+        if anchor is None:
+            return {"state": "unknown", "distance": round(distance, 3), "reason": "control_not_verified"}
+        result[key] = anchor
     elif state in {"player_detail", "condition_modal"}:
+        if state == "player_detail":
+            profile_signature = _training_player_profile_signature(bgr)
+            result["profileVerified"] = profile_signature["verified"]
+            result["profileSignature"] = profile_signature
+            condition_plus = _training_condition_plus(bgr)
+            if condition_plus is not None:
+                result["conditionPlus"] = condition_plus
         if state == "condition_modal":
             result["freeButton"] = _training_free_button(bgr)
             result["modalClose"] = {"x": 0.596, "y": 0.881}
@@ -2311,6 +2735,8 @@ def capture_rect(rect):
 
 
 def run_detector(image, mode=None, live=False):
+    if mode == "frame_fingerprint":
+        return {"pixels": cv2.resize(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), (32, 18)).flatten().tolist()}
     if mode == "top_resource_cards":
         return detect_top_resource_cards(image)
     if mode == "yellow_ad_control":

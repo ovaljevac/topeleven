@@ -1,0 +1,6 @@
+# Runtime dependencies for a clean Python 3 installation.
+# The existing pydeps folder can still be used as the bundled/offline copy.
+numpy>=2.0,<3
+opencv-python-headless>=4.10,<6
+Pillow>=10,<13
+discord.py>=2.4,<3

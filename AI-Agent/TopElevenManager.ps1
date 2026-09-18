@@ -46,7 +46,8 @@ function Get-AgentArgumentTokens {
         [string]$CombinedStartStage = 'Mourinho',
         [string]$TeamRestStart = 'GK',
         [string]$LogPath = 'manager.log',
-        [string]$StopSignalPath = 'manager.stop'
+        [string]$StopSignalPath = 'manager.stop',
+        [switch]$Resume
     )
 
     if ($Mode -notin @($script:ModeCatalog.Mode)) {
@@ -64,6 +65,7 @@ function Get-AgentArgumentTokens {
         '-LogPath', $LogPath,
         '-StopSignalPath', $StopSignalPath
     )
+    if ($Resume) { $tokens += '-Resume' }
     if ($Mode -eq 'Sve') {
         if ($CombinedStartStage -notin @($script:CombinedStartCatalog.Key)) {
             throw "Nepoznata pocetna faza: $CombinedStartStage"
@@ -198,7 +200,7 @@ Add-Type -AssemblyName WindowsBase
 
         <Border Grid.Row="0" Grid.ColumnSpan="2" Background="#FFFFFF" BorderBrush="#D5DEE9" BorderThickness="1,1,1,1">
             <Grid x:Name="HeaderDragArea">
-                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="150"/></Grid.ColumnDefinitions>
+                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="260"/></Grid.ColumnDefinitions>
                 <StackPanel Orientation="Horizontal" Margin="22,0,0,0" VerticalAlignment="Center">
                     <Border Width="32" Height="32" CornerRadius="9" Background="#DDEAFF">
                         <TextBlock Text="AI" Foreground="#145CC5" FontWeight="Bold" FontSize="12" HorizontalAlignment="Center" VerticalAlignment="Center"/>
@@ -206,6 +208,9 @@ Add-Type -AssemblyName WindowsBase
                     <TextBlock Text="Top Eleven AI Agent Manager" FontSize="16" FontWeight="SemiBold" Margin="11,0,0,0" VerticalAlignment="Center"/>
                 </StackPanel>
                 <StackPanel Grid.Column="1" Orientation="Horizontal" HorizontalAlignment="Right">
+                    <Button x:Name="MiniLogToggle" Style="{StaticResource RoundedButton}" Width="108" Height="36" Padding="8,0"
+                            Margin="0,1,4,1" Background="#E8F1FF" BorderBrush="#BCD2F4" Foreground="#124EAA"
+                            Content="Prikazi mini log" FontSize="12"/>
                     <Button x:Name="WindowMinimize" Style="{StaticResource RoundedButton}" Width="48" Height="38" Padding="0" Background="Transparent" BorderThickness="0" Content="&#x2014;"/>
                     <Button x:Name="WindowMaximize" Style="{StaticResource RoundedButton}" Width="48" Height="38" Padding="0" Background="Transparent" BorderThickness="0" Content="&#x25A1;"/>
                     <Button x:Name="WindowClose" Style="{StaticResource RoundedButton}" Width="48" Height="38" Padding="0" Background="Transparent" BorderThickness="0" Content="X"/>
@@ -367,6 +372,7 @@ Add-Type -AssemblyName WindowsBase
                                     </StackPanel>
                                 </Border>
 
+                                <CheckBox x:Name="ResumeCheck" Content="Nastavi danasnji sacuvani napredak" Margin="0,0,0,12" ToolTip="Provjerava ekran i preskace potvrdene korake. Ako ekran nije siguran, restartuje tacnu instancu."/>
                                 <Button x:Name="ScriptsStart" Style="{StaticResource RoundedButton}" Foreground="White" Background="#1769E0" BorderBrush="#1769E0" Content="Pokreni odabranu skriptu"/>
                                 <Button x:Name="ScriptsStop" Style="{StaticResource RoundedButton}" Margin="0,10,0,0" Content="Zaustavi agenta" IsEnabled="False"/>
                             </StackPanel>
@@ -401,10 +407,11 @@ Add-Type -AssemblyName WindowsBase
                         <StackPanel>
                             <TextBlock Text="Gemini AI" FontSize="19" FontWeight="SemiBold"/>
                             <TextBlock Text="API kljuc ostaje u lokalnom .env fajlu i ne prikazuje se u manageru." Foreground="{StaticResource MutedBrush}" Margin="0,7,0,18"/>
-                            <WrapPanel>
-                                <Button x:Name="ConfigureGemini" Style="{StaticResource RoundedButton}" Foreground="White" Background="#1769E0" BorderBrush="#1769E0" Content="Postavi API kljuc" Margin="0,0,10,0"/>
-                                <Button x:Name="TestGemini" Style="{StaticResource RoundedButton}" Content="Testiraj Gemini"/>
-                            </WrapPanel>
+                             <WrapPanel>
+                                 <Button x:Name="ConfigureGemini" Style="{StaticResource RoundedButton}" Foreground="White" Background="#1769E0" BorderBrush="#1769E0" Content="Postavi API kljuc" Margin="0,0,10,0"/>
+                                <Button x:Name="TestGemini" Style="{StaticResource RoundedButton}" Content="Testiraj Gemini" Margin="0,0,10,0"/>
+                                <Button x:Name="ProjectCheck" Style="{StaticResource RoundedButton}" Content="Provjeri projekat"/>
+                             </WrapPanel>
                             <Separator Background="#D8E0EA" Margin="0,22"/>
                             <TextBlock Text="Radni folder" FontSize="19" FontWeight="SemiBold"/>
                             <TextBlock x:Name="WorkingFolderText" Foreground="{StaticResource MutedBrush}" Margin="0,7,0,14" TextWrapping="Wrap"/>
@@ -421,15 +428,134 @@ Add-Type -AssemblyName WindowsBase
 $reader = New-Object System.Xml.XmlNodeReader $xaml
 $window = [Windows.Markup.XamlReader]::Load($reader)
 
+# Odvojivi live-log koristi isti WPF dispatcher i isti timer kao glavni Manager.
+# Namjerno nije modalni prozor: moze stajati iznad BlueStacksa dok se glavni
+# Manager normalno koristi, pomjera ili minimizira.
+[xml]$miniLogXaml = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Name="MiniLogWindow"
+        Title="Top Eleven AI - Live log"
+        Width="460" Height="318" MinWidth="360" MinHeight="230"
+        WindowStartupLocation="Manual" WindowStyle="None" ResizeMode="CanResizeWithGrip"
+        ShowInTaskbar="True" Topmost="True"
+        Background="#F4F7FB" Foreground="#172033" FontFamily="Segoe UI">
+    <Window.Resources>
+        <Style TargetType="Button" x:Key="MiniButton">
+            <Setter Property="Foreground" Value="#172033"/>
+            <Setter Property="Background" Value="#E9EFF6"/>
+            <Setter Property="BorderBrush" Value="#C8D3E0"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Padding" Value="12,6"/>
+            <Setter Property="FontSize" Value="12"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="MiniButtonBorder" Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="7" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="MiniButtonBorder" Property="Opacity" Value="0.84"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="MiniButtonBorder" Property="Opacity" Value="0.68"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="MiniButtonBorder" Property="Opacity" Value="0.38"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </Window.Resources>
+    <Border Background="#FFFFFF" BorderBrush="#B8C5D4" BorderThickness="1" CornerRadius="10">
+        <Grid Margin="1">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="48"/>
+                <RowDefinition Height="58"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="46"/>
+            </Grid.RowDefinitions>
+
+            <Border Grid.Row="0" x:Name="MiniHeaderDragArea" Background="#E8F1FF" CornerRadius="9,9,0,0"
+                    BorderBrush="#BCD2F4" BorderThickness="0,0,0,1">
+                <Grid Margin="12,0,7,0">
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/><ColumnDefinition Width="38"/></Grid.ColumnDefinitions>
+                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                        <Border Width="28" Height="28" CornerRadius="8" Background="#CFE0FC">
+                            <TextBlock Text="AI" Foreground="#145CC5" FontWeight="Bold" FontSize="11"
+                                       HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <TextBlock Text="Live log" FontSize="15" FontWeight="Bold" Margin="9,0,0,0" VerticalAlignment="Center"/>
+                        <TextBlock Text="  - povuci ovaj naslov" Foreground="#607089" FontSize="11" VerticalAlignment="Center"/>
+                    </StackPanel>
+                    <Button x:Name="MiniTopmostToggle" Grid.Column="1" Style="{StaticResource MiniButton}"
+                            Content="Iznad: DA" ToolTip="Iskljucite ako mini log prekriva BlueStacks"
+                            Width="82" Height="29" Margin="6,0,5,0" Padding="5,0"
+                            Background="#DCEBFF" BorderBrush="#AFC8EE" Foreground="#124EAA"/>
+                    <Button x:Name="MiniHide" Grid.Column="2" Style="{StaticResource MiniButton}" Content="X"
+                            Padding="0" Width="31" Height="29" Background="Transparent" BorderThickness="0"/>
+                </Grid>
+            </Border>
+
+            <Grid Grid.Row="1" Margin="14,9,14,7">
+                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                <StackPanel>
+                    <StackPanel Orientation="Horizontal">
+                        <Ellipse x:Name="MiniStatusDot" Width="9" Height="9" Fill="#118A52" Margin="0,4,7,0"/>
+                        <TextBlock x:Name="MiniStatusText" Text="Spreman" Foreground="#118A52" FontWeight="SemiBold" FontSize="13"/>
+                    </StackPanel>
+                    <TextBlock x:Name="MiniActiveScriptText" Text="Nema aktivne skripte" Foreground="#334155"
+                               FontWeight="SemiBold" FontSize="14" Margin="16,4,0,0" TextTrimming="CharacterEllipsis"/>
+                </StackPanel>
+                <Button x:Name="MiniStop" Grid.Column="1" Style="{StaticResource MiniButton}" Content="Zaustavi"
+                        Foreground="White" Background="#C73745" BorderBrush="#A92C39" IsEnabled="False"
+                        MinWidth="88" VerticalAlignment="Center"/>
+            </Grid>
+
+            <Border Grid.Row="2" Margin="14,0,14,8" Background="#F8FAFD" BorderBrush="#D5DEE9"
+                    BorderThickness="1" CornerRadius="7" Padding="9">
+                <TextBox x:Name="MiniLogTextBox" IsReadOnly="True" Background="Transparent" BorderThickness="0"
+                         Foreground="#172033" FontFamily="Consolas" FontSize="12" TextWrapping="NoWrap"
+                         HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto"/>
+            </Border>
+
+            <Grid Grid.Row="3" Margin="14,0,14,9">
+                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                <TextBlock Text="Prikazuje zadnjih 40 linija" Foreground="#66758A" FontSize="11" VerticalAlignment="Center"/>
+                <Button x:Name="MiniOpenFullLogs" Grid.Column="1" Style="{StaticResource MiniButton}"
+                        Content="Puni logovi" Background="#E8F1FF" BorderBrush="#BCD2F4" Foreground="#124EAA"/>
+            </Grid>
+        </Grid>
+    </Border>
+</Window>
+'@
+
+$miniLogReader = New-Object System.Xml.XmlNodeReader $miniLogXaml
+$miniLogWindow = [Windows.Markup.XamlReader]::Load($miniLogReader)
+
 function Find-Control {
     param([string]$Name)
     return $window.FindName($Name)
+}
+
+function Find-MiniControl {
+    param([string]$Name)
+    return $miniLogWindow.FindName($Name)
 }
 
 $mainTabs = Find-Control 'MainTabs'
 $scriptList = Find-Control 'ScriptList'
 $combinedStartCombo = Find-Control 'CombinedStartCombo'
 $teamRestStartCombo = Find-Control 'TeamRestStartCombo'
+$resumeCheck = Find-Control 'ResumeCheck'
 $combinedStartPanel = Find-Control 'CombinedStartPanel'
 $teamRestStartPanel = Find-Control 'TeamRestStartPanel'
 $selectedScriptName = Find-Control 'SelectedScriptName'
@@ -448,6 +574,13 @@ $dashboardStart = Find-Control 'DashboardStart'
 $dashboardStop = Find-Control 'DashboardStop'
 $scriptsStart = Find-Control 'ScriptsStart'
 $scriptsStop = Find-Control 'ScriptsStop'
+$miniLogToggle = Find-Control 'MiniLogToggle'
+$miniLogTextBox = Find-MiniControl 'MiniLogTextBox'
+$miniStatusText = Find-MiniControl 'MiniStatusText'
+$miniStatusDot = Find-MiniControl 'MiniStatusDot'
+$miniActiveScriptText = Find-MiniControl 'MiniActiveScriptText'
+$miniStop = Find-MiniControl 'MiniStop'
+$miniTopmostToggle = Find-MiniControl 'MiniTopmostToggle'
 $navButtons = @(
     (Find-Control 'NavDashboard'),
     (Find-Control 'NavScripts'),
@@ -471,6 +604,9 @@ $script:StopRequestedAt = $null
 $script:StopWasRequested = $false
 $script:CloseRequested = $false
 $script:LastExitHandledProcessId = $null
+$script:CurrentScriptName = 'Nema aktivne skripte'
+$script:MiniLogPositionInitialized = $false
+$script:ManagerClosing = $false
 $script:LogsRoot = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'TopElevenAgent\logs'
 [System.IO.Directory]::CreateDirectory($script:LogsRoot) | Out-Null
 
@@ -491,12 +627,12 @@ function Set-NavigationPage {
 function Set-ManagerState {
     param(
         [string]$Text,
-        [ValidateSet('Ready', 'Running', 'Stopping', 'Success', 'Error')]
+        [ValidateSet('Ready', 'Running', 'Stopping', 'Success', 'Warning', 'Error')]
         [string]$Kind = 'Ready'
     )
 
     $colors = @{
-        Ready = '#118A52'; Running = '#118A52'; Stopping = '#A66600'; Success = '#1769E0'; Error = '#C73745'
+        Ready = '#118A52'; Running = '#118A52'; Stopping = '#A66600'; Success = '#1769E0'; Warning = '#A66600'; Error = '#C73745'
     }
     $brush = [System.Windows.Media.BrushConverter]::new().ConvertFromString($colors[$Kind])
     $dashboardStatusText.Text = $Text
@@ -507,11 +643,59 @@ function Set-ManagerState {
     $sidebarStatusDot.Fill = $brush
     $selectedStatusText.Text = $Text
     $selectedStatusText.Foreground = $brush
+    $miniStatusText.Text = $Text
+    $miniStatusText.Foreground = $brush
+    $miniStatusDot.Fill = $brush
 }
 
 function Test-AgentRunning {
     if ($null -eq $script:AgentProcess) { return $false }
     try { return -not $script:AgentProcess.HasExited } catch { return $false }
+}
+
+function Get-GeminiKeyEnvironmentVariableName {
+    $name = 'GEMINI_API_KEY'
+    $configPath = Join-Path $PSScriptRoot 'ai_config.json'
+    try {
+        if (Test-Path -LiteralPath $configPath) {
+            $config = Get-Content -Raw -LiteralPath $configPath | ConvertFrom-Json
+            if (-not [string]::IsNullOrWhiteSpace([string]$config.apiKeyEnvironmentVariable)) {
+                $name = [string]$config.apiKeyEnvironmentVariable
+            }
+        }
+    }
+    catch {
+        # Ne blokiraj Manager zbog opcionalne provjere; agent ce prikazati
+        # preciznu gresku ako je sama AI konfiguracija neispravna.
+    }
+    return $name
+}
+
+function Test-LocalDotEnvContainsKey {
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    $envPath = Join-Path $PSScriptRoot '.env'
+    if (-not (Test-Path -LiteralPath $envPath)) { return $false }
+    $keyPattern = '^\s*{0}\s*=\s*\S+' -f [regex]::Escape($Name)
+    try {
+        foreach ($line in [System.IO.File]::ReadLines($envPath)) {
+            if ($line -match $keyPattern) { return $true }
+        }
+    }
+    catch { }
+    return $false
+}
+
+function Use-LocalDotEnvForChildProcess {
+    param([Parameter(Mandatory = $true)][System.Diagnostics.ProcessStartInfo]$StartInfo)
+
+    $keyName = Get-GeminiKeyEnvironmentVariableName
+    if (Test-LocalDotEnvContainsKey $keyName) {
+        # VisionAgent prvo cita inherited environment. Uklanjanjem samo iz
+        # child okruzenja sprijecavamo da stara User vrijednost zasjeni novi
+        # lokalni .env, bez mijenjanja globalnog okruzenja drugih programa.
+        $StartInfo.EnvironmentVariables.Remove($keyName)
+    }
 }
 
 function Set-RunButtons {
@@ -523,6 +707,8 @@ function Set-RunButtons {
     $scriptList.IsEnabled = -not $Running
     $combinedStartCombo.IsEnabled = -not $Running
     $teamRestStartCombo.IsEnabled = -not $Running
+    $resumeCheck.IsEnabled = -not $Running
+    $miniStop.IsEnabled = $Running
 }
 
 function Update-SelectedScript {
@@ -545,6 +731,41 @@ function Add-ManagerLogLine {
     }
     $logTextBox.AppendText("$line`r`n")
     $logTextBox.ScrollToEnd()
+    $miniLogTextBox.AppendText("$line`r`n")
+    $miniLogTextBox.ScrollToEnd()
+}
+
+function Set-MiniLogLines {
+    param([string[]]$Lines)
+
+    $allLines = @($Lines)
+    if ($allLines.Count -eq 0) {
+        $miniLogTextBox.Clear()
+        return
+    }
+    $tailStart = [Math]::Max(0, $allLines.Count - 40)
+    $tailLines = @($allLines[$tailStart..($allLines.Count - 1)])
+    $miniLogTextBox.Text = $tailLines -join "`r`n"
+    $miniLogTextBox.AppendText("`r`n")
+    $miniLogTextBox.ScrollToEnd()
+}
+
+function Show-MiniLogWindow {
+    if ($miniLogWindow.IsVisible) {
+        $miniLogWindow.Hide()
+        $miniLogToggle.Content = 'Prikazi mini log'
+        return
+    }
+
+    if (-not $script:MiniLogPositionInitialized) {
+        $workArea = [System.Windows.SystemParameters]::WorkArea
+        $miniLogWindow.Left = $workArea.Left + 18
+        $miniLogWindow.Top = [Math]::Max($workArea.Top + 18, $workArea.Bottom - $miniLogWindow.Height - 18)
+        $script:MiniLogPositionInitialized = $true
+    }
+    $miniLogWindow.Show()
+    $miniLogWindow.Activate()
+    $miniLogToggle.Content = 'Sakrij mini log'
 }
 
 function Update-LogViews {
@@ -558,6 +779,7 @@ function Update-LogViews {
             $recentStart = [Math]::Max(0, $lines.Count - 10)
             $dashboardRecentLog.Text = @($lines[$recentStart..([Math]::Max($recentStart, $lines.Count - 1))]) -join "`r`n"
             $dashboardRecentLog.ScrollToEnd()
+            Set-MiniLogLines -Lines $lines
             $script:DisplayedLogLineCount = $lines.Count
         }
     }
@@ -592,7 +814,7 @@ function Start-SelectedAgent {
     $logPathText.Text = $script:CurrentLogPath
 
     try {
-        $tokens = Get-AgentArgumentTokens -Mode $mode -CombinedStartStage $combinedStart -TeamRestStart $teamRestStart -LogPath $script:CurrentLogPath -StopSignalPath $script:CurrentStopSignalPath
+        $tokens = Get-AgentArgumentTokens -Mode $mode -CombinedStartStage $combinedStart -TeamRestStart $teamRestStart -LogPath $script:CurrentLogPath -StopSignalPath $script:CurrentStopSignalPath -Resume:([bool]$resumeCheck.IsChecked)
         $arguments = ($tokens | ForEach-Object { ConvertTo-NativeArgument ([string]$_) }) -join ' '
         $powerShellExe = (Get-Command 'powershell.exe' -ErrorAction Stop).Source
         $startInfo = New-Object System.Diagnostics.ProcessStartInfo
@@ -601,7 +823,10 @@ function Start-SelectedAgent {
         $startInfo.WorkingDirectory = $PSScriptRoot
         $startInfo.UseShellExecute = $false
         $startInfo.CreateNoWindow = $true
+        Use-LocalDotEnvForChildProcess $startInfo
         $script:AgentProcess = [System.Diagnostics.Process]::Start($startInfo)
+        $script:CurrentScriptName = [string]$selected.Name
+        $miniActiveScriptText.Text = $script:CurrentScriptName
         Add-ManagerLogLine "Pokrenuta skripta '$($selected.Name)' (PID $($script:AgentProcess.Id))."
         if ($mode -eq 'Sve') { Add-ManagerLogLine "Pocetna faza: $combinedStart." }
         if ($mode -eq 'OdmoriEkipu') { Add-ManagerLogLine "Pocetna pozicija: $teamRestStart." }
@@ -609,6 +834,8 @@ function Start-SelectedAgent {
         Set-RunButtons $true
     }
     catch {
+        $script:CurrentScriptName = 'Nema aktivne skripte'
+        $miniActiveScriptText.Text = $script:CurrentScriptName
         Add-ManagerLogLine "Pokretanje nije uspjelo: $($_.Exception.Message)"
         Set-ManagerState 'Greska pri pokretanju' 'Error'
         Set-RunButtons $false
@@ -635,7 +862,16 @@ function Start-HelperScript {
     param([string]$ScriptName)
     $path = Join-Path $PSScriptRoot $ScriptName
     if (-not (Test-Path -LiteralPath $path)) { return }
-    Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', $path) -WorkingDirectory $PSScriptRoot
+    $tokens = @('-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', $path)
+    $arguments = ($tokens | ForEach-Object { ConvertTo-NativeArgument ([string]$_) }) -join ' '
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = (Get-Command 'powershell.exe' -ErrorAction Stop).Source
+    $startInfo.Arguments = $arguments
+    $startInfo.WorkingDirectory = $PSScriptRoot
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $false
+    Use-LocalDotEnvForChildProcess $startInfo
+    [System.Diagnostics.Process]::Start($startInfo) | Out-Null
 }
 
 $scriptList.Add_SelectionChanged({ Update-SelectedScript })
@@ -643,6 +879,41 @@ $dashboardStart.Add_Click({ Start-SelectedAgent })
 $scriptsStart.Add_Click({ Start-SelectedAgent })
 $dashboardStop.Add_Click({ Request-AgentStop })
 $scriptsStop.Add_Click({ Request-AgentStop })
+$miniLogToggle.Add_Click({ Show-MiniLogWindow })
+$miniStop.Add_Click({ Request-AgentStop })
+$miniTopmostToggle.Add_Click({
+    $miniLogWindow.Topmost = -not $miniLogWindow.Topmost
+    $miniTopmostToggle.Content = if ($miniLogWindow.Topmost) { 'Iznad: DA' } else { 'Iznad: NE' }
+    $miniTopmostToggle.ToolTip = if ($miniLogWindow.Topmost) {
+        'Mini log je uvijek iznad. Iskljucite ako prekriva BlueStacks.'
+    }
+    else {
+        'Mini log se moze sakriti iza igre; kliknite za uvijek iznad.'
+    }
+})
+(Find-MiniControl 'MiniHide').Add_Click({
+    $miniLogWindow.Hide()
+    $miniLogToggle.Content = 'Prikazi mini log'
+})
+(Find-MiniControl 'MiniOpenFullLogs').Add_Click({
+    Set-NavigationPage 2
+    if ($window.WindowState -eq [System.Windows.WindowState]::Minimized) {
+        $window.WindowState = [System.Windows.WindowState]::Normal
+    }
+    $window.Activate()
+})
+(Find-MiniControl 'MiniHeaderDragArea').Add_MouseLeftButtonDown({
+    if ($_.ChangedButton -eq [System.Windows.Input.MouseButton]::Left) {
+        try { $miniLogWindow.DragMove() } catch { }
+    }
+})
+$miniLogWindow.Add_Closing({
+    if (-not $script:ManagerClosing) {
+        $_.Cancel = $true
+        $miniLogWindow.Hide()
+        $miniLogToggle.Content = 'Prikazi mini log'
+    }
+})
 
 (Find-Control 'NavDashboard').Add_Click({ Set-NavigationPage 0 })
 (Find-Control 'NavScripts').Add_Click({ Set-NavigationPage 1 })
@@ -657,9 +928,10 @@ $scriptsStop.Add_Click({ Request-AgentStop })
     Set-NavigationPage 1
 })
 (Find-Control 'OpenLogFolder').Add_Click({ Start-Process -FilePath 'explorer.exe' -ArgumentList @($script:LogsRoot) })
-(Find-Control 'ClearLogView').Add_Click({ $logTextBox.Clear(); $dashboardRecentLog.Clear() })
+(Find-Control 'ClearLogView').Add_Click({ $logTextBox.Clear(); $dashboardRecentLog.Clear(); $miniLogTextBox.Clear() })
 (Find-Control 'ConfigureGemini').Add_Click({ Start-HelperScript 'Postavi Gemini API kljuc.ps1' })
 (Find-Control 'TestGemini').Add_Click({ Start-HelperScript 'Testiraj Gemini.ps1' })
+(Find-Control 'ProjectCheck').Add_Click({ Start-HelperScript 'Provjeri projekat.ps1' })
 (Find-Control 'OpenWorkingFolder').Add_Click({ Start-Process -FilePath 'explorer.exe' -ArgumentList @($PSScriptRoot) })
 (Find-Control 'WindowMinimize').Add_Click({ $window.WindowState = [System.Windows.WindowState]::Minimized })
 (Find-Control 'WindowMaximize').Add_Click({
@@ -713,13 +985,15 @@ $timer.Add_Tick({
                 Add-ManagerLogLine 'Agent je zavrsio rad.'
             }
             elseif ($exitCode -eq 2) {
-                Set-ManagerState 'Zavrseno uz greske' 'Stopping'
+                Set-ManagerState 'Zavrseno uz greske' 'Warning'
                 Add-ManagerLogLine 'Sve odabrane faze su obradjene, ali najmanje jedna nije uspjela nakon tri pokusaja.'
             }
             else {
                 Set-ManagerState "Greska (kod $exitCode)" 'Error'
                 Add-ManagerLogLine "Agent je zavrsio sa kodom greske $exitCode."
             }
+            $script:CurrentScriptName = 'Nema aktivne skripte'
+            $miniActiveScriptText.Text = $script:CurrentScriptName
             Set-RunButtons $false
             $script:StopRequestedAt = $null
             $script:StopWasRequested = $false
@@ -753,6 +1027,10 @@ $window.Add_Closing({
             return
         }
     }
+    $script:ManagerClosing = $true
+    # Zatvori i prethodno sakriven mini prozor; Closing handler ga vise ne
+    # pretvara u Hide kada je ManagerClosing postavljen.
+    $miniLogWindow.Close()
     $timer.Stop()
 })
 

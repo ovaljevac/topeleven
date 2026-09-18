@@ -28,6 +28,31 @@ class PutSavezaIntegrationTests(unittest.TestCase):
         self.assertIn("'put_saveza'", watcher)
         self.assertGreaterEqual(watcher.count("$ReturnFlow -ne 'tv'"), 3)
 
+    def test_put_saveza_return_uses_two_stable_path_modal_frames(self):
+        watcher_start = self.script.index("function Watch-TVAdvertisement")
+        watcher_end = self.script.index("function Complete-TVManualReward", watcher_start)
+        watcher = self.script[watcher_start:watcher_end]
+        branch = watcher[watcher.index("$putSavezaReturnStableCount = 0") :]
+        self.assertIn("$ReturnFlow -eq 'put_saveza'", branch)
+        self.assertIn("$aiAdVisuallyObserved", branch)
+        self.assertIn("Get-PutSavezaFlowSnapshot $Handle", branch)
+        self.assertIn("$putSavezaReturn.state -eq 'path'", branch)
+        self.assertIn("$putSavezaReturn.closeButton", branch)
+        self.assertIn("$putSavezaReturnStableCount -ge 2", branch)
+        self.assertIn("return 'top_eleven'", branch)
+        self.assertLess(
+            branch.index("Get-PutSavezaFlowSnapshot $Handle"),
+            branch.index("Test-TopElevenReturnedAfterAd $Handle"),
+        )
+
+    def test_confirmed_put_saveza_modal_skips_redundant_main_activity_gate(self):
+        flow_start = self.script.index("function Run-PutSavezaAutomation")
+        flow_end = self.script.index("function Get-TrainingPlayerFlowSnapshot", flow_start)
+        flow = self.script[flow_start:flow_end]
+        ad_exit = flow[flow.index("Watch-TVAdvertisement $Handle $false 'put_saveza'") :]
+        self.assertIn("$putSavezaAdExit -ne 'top_eleven'", ad_exit)
+        self.assertNotIn("Restore-ExternalNavigationBeforeGameAction", ad_exit)
+
     def test_standalone_mode_launcher_and_config_exist(self):
         self.assertIn("'PutSaveza'", self.script)
         launcher = ROOT / "Put saveza" / "Pokreni Put saveza Agent.cmd"

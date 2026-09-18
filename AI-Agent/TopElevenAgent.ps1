@@ -1,8 +1,8 @@
-param(
+﻿param(
     [switch]$SelfTest,
     [switch]$DryRun,
     [switch]$Calibration,
-    [ValidateSet('Zeleni', 'OdmoriEkipu', 'TV', 'Mourinho', 'Kampus', 'PutSaveza', 'TreningIgraca', 'Sve')]
+    [ValidateSet('Zeleni', 'OdmoriEkipu', 'TV', 'Mourinho', 'Kampus', 'PutSaveza', 'TreningIgraca', 'Sve', 'Start', 'Restart')]
     [string]$Mode = 'Zeleni',
     [ValidateSet('GK', 'DL', 'DC1', 'DC2', 'DR', 'DMC', 'MC1', 'MC2', 'AML', 'AMR', 'ST', 'DL_2', 'ST_2', 'AMR_2', 'AML_2')]
     [string]$TeamRestStart = 'GK',
@@ -10,11 +10,13 @@ param(
     [string]$CombinedStartStage = 'Mourinho',
     [switch]$AutoStart,
     [switch]$ExitAfterRun,
+    [switch]$Resume,
     [string]$LogPath = '',
     [string]$StopSignalPath = ''
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'AgentPersistence.ps1')
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -25,6 +27,8 @@ using System.Text;
 using System.Runtime.InteropServices;
 
 public static class Win32Agent {
+    [DllImport("user32.dll")]
+    public static extern bool PrintWindow(IntPtr handle, IntPtr destination, uint flags);
     public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
     [StructLayout(LayoutKind.Sequential)]
@@ -44,6 +48,10 @@ public static class Win32Agent {
     public static extern bool SetForegroundWindow(IntPtr hWnd);
     [DllImport("user32.dll")]
     public static extern bool ShowWindow(IntPtr hWnd, int command);
+    [DllImport("user32.dll")]
+    public static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll")]
+    public static extern bool BringWindowToTop(IntPtr hWnd);
     [DllImport("user32.dll")]
     public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")]
@@ -99,13 +107,14 @@ public static class Win32Agent {
 [Win32Agent]::SetProcessDPIAware() | Out-Null
 
 $script:BlueStacksExe = 'C:\Program Files\BlueStacks_nxt\HD-Player.exe'
+$script:BlueStacksAdbExe = 'C:\Program Files\BlueStacks_nxt\HD-Adb.exe'
 $script:BlueStacksInstance = 'Pie64'
 $script:TopElevenPackage = 'eu.nordeus.topeleven.android'
 $script:WindowTitle = 'BlueStacks App Player'
 $script:BlueStacksConfigPath = 'C:\ProgramData\BlueStacks_nxt\bluestacks.conf'
 $script:BlueStacksInstanceDisplayName = $null
 $script:TopElevenShortcut = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Top Eleven.lnk'
-$script:PythonExe = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'
+$script:PythonExe = $null
 $script:XDetectorScript = Join-Path $PSScriptRoot 'XDetector.py'
 $script:VisionAgentScript = Join-Path $PSScriptRoot 'VisionAgent.py'
 $script:VisionConfigPath = Join-Path $PSScriptRoot 'ai_config.json'
@@ -113,26 +122,31 @@ $script:VisionAgentProcess = $null
 $script:VisionEnabled = $true
 $script:VisionAnalysisIntervalMs = 2500
 $script:VisionAiOnlyFallbackAfterSeconds = 60
-$script:VisionAiProbeIntervalSeconds = 20.5
+$script:VisionAiProbeIntervalSeconds = 12.0
 $script:AdControlsAiOnly = $true
 $script:LastGooglePlayClickAt = $null
 $script:VisionRetryAfterErrorSeconds = 16
 $script:VisionUnavailableUntil = [datetime]::MinValue
 $script:VisionMalformedJsonRetryActive = $false
 $script:VisionCacheByState = @{}
+# Dva pokusaja po kljucu traju najvise 15 + 10 s. Sa glavnim i jednim
+# rezervnim kljucem to je 50 s; ostatak je rezerva za capture i obradu JSON-a.
+$script:VisionResponseTimeoutSeconds = 60
+$script:XDetectorResponseTimeoutSeconds = 20
 $script:AiTopElevenReturned = $false
 $script:AiAdVisible = $false
+$script:DetectedAdCloseLocallyVerified = $false
+$script:LastLoggedGeminiKeySlot = 1
 $script:ConnectionPopupLastCheckAt = [datetime]::MinValue
 $script:ConnectionPopupRecoveryActive = $false
-$script:BlueStacksPlayerLog = 'C:\ProgramData\BlueStacks_nxt\Logs\Player.log'
 $script:ConfigPath = Join-Path $PSScriptRoot 'config.json'
 $script:Config = $null
-$script:ForegroundStateCache = $null
-$script:ForegroundStateCheckedAt = $null
-$script:LastHandledGooglePlayEvent = $null
+$script:BlueStacksAdbSerial = $null
+$script:BlueStacksAdbSerialCheckedAt = [datetime]::MinValue
 $script:LastGooglePlayBackAt = $null
 $script:GooglePlayRestoreKey = $null
 $script:GooglePlayBackAttemptCount = 0
+$script:ExternalNavigationBackAttempts = 6
 $script:PlayDestinationCheckedAt = $null
 $script:PlayDestinationCache = $false
 $script:DetectedPlayDestinationCloseX = $null
@@ -141,6 +155,8 @@ $script:DetectedFreeButtonX = $null
 $script:DetectedFreeButtonY = $null
 $script:FreeButtonStableCount = 0
 $script:FreeButtonStableSince = $null
+$script:TopResourceSnapshotCheckedAt = [datetime]::MinValue
+$script:TopResourceSnapshotCache = $null
 $script:Mode = $Mode
 $script:TeamRestStartKey = $TeamRestStart
 $script:CombinedStartStage = $CombinedStartStage
@@ -183,11 +199,13 @@ $script:CampusOpenBufferMs = 3000
 $script:CampusBuildingClickAttempts = 3
 $script:CampusDetailOpenWaitSeconds = 8
 $script:PutSavezaAdButtonWaitSeconds = 30
-$script:PutSavezaMenuScrollAttempts = 10
-$script:PutSavezaMenuScrollSteps = 2
+$script:PutSavezaMenuScrollAttempts = 1
+$script:PutSavezaMenuScrollSteps = 1
 $script:StageRetryAttempts = 3
 $script:StageRecoveryLaunchTimeoutSeconds = 90
 $script:StagePreflightRecoveryRequired = $false
+$script:AiSoftRetryTimeoutSeconds = 180
+$script:AiSoftRetryIntervalSeconds = 10
 $script:TrainingPlayerClickBufferMs = 1800
 $script:TrainingPlayerCloseBufferMs = 1500
 $script:ConnectionRecoveryWaitMs = 12000
@@ -195,6 +213,8 @@ $script:AdWakeTapAfterSeconds = 75
 $script:AdWakeTapIntervalSeconds = 12
 $script:AdWakeBurstSeconds = 6
 $script:AdWakeTapMaximum = 20
+$script:AgentInstanceMutex = $null
+$script:AgentInstanceMutexOwned = $false
 
 if (Test-Path -LiteralPath $script:ConfigPath) {
     try {
@@ -218,6 +238,9 @@ if (Test-Path -LiteralPath $script:ConfigPath) {
         if ($null -ne $script:Config.putSavezaMenuScrollSteps) { $script:PutSavezaMenuScrollSteps = [int]$script:Config.putSavezaMenuScrollSteps }
         if ($null -ne $script:Config.stageRetryAttempts) { $script:StageRetryAttempts = [Math]::Max(1, [int]$script:Config.stageRetryAttempts) }
         if ($null -ne $script:Config.stageRecoveryLaunchTimeoutSeconds) { $script:StageRecoveryLaunchTimeoutSeconds = [Math]::Max(20, [int]$script:Config.stageRecoveryLaunchTimeoutSeconds) }
+        if ($null -ne $script:Config.aiSoftRetryTimeoutSeconds) { $script:AiSoftRetryTimeoutSeconds = [Math]::Max(30, [int]$script:Config.aiSoftRetryTimeoutSeconds) }
+        if ($null -ne $script:Config.aiSoftRetryIntervalSeconds) { $script:AiSoftRetryIntervalSeconds = [Math]::Max(4, [int]$script:Config.aiSoftRetryIntervalSeconds) }
+        if ($null -ne $script:Config.externalNavigationBackAttempts) { $script:ExternalNavigationBackAttempts = [Math]::Max(2, [Math]::Min(10, [int]$script:Config.externalNavigationBackAttempts)) }
         if ($null -ne $script:Config.trainingPlayerClickBufferMs) { $script:TrainingPlayerClickBufferMs = [int]$script:Config.trainingPlayerClickBufferMs }
         if ($null -ne $script:Config.trainingPlayerCloseBufferMs) { $script:TrainingPlayerCloseBufferMs = [int]$script:Config.trainingPlayerCloseBufferMs }
         if ($null -ne $script:Config.connectionRecoveryWaitMs) { $script:ConnectionRecoveryWaitMs = [int]$script:Config.connectionRecoveryWaitMs }
@@ -267,6 +290,7 @@ function Add-Log {
 
 function Set-Status {
     param([string]$Text, [System.Drawing.Color]$Color = [System.Drawing.Color]::FromArgb(220, 235, 255))
+    $script:LastStatusText = $Text
     $status.Text = $Text
     $status.ForeColor = $Color
     Add-Log $Text
@@ -312,6 +336,160 @@ function Get-BlueStacksInstanceDisplayName {
     return $null
 }
 
+function Get-AiPreClickRetryIntervalSeconds {
+    # Zavrsna potvrda X-a smije biti trenutna samo prvi put. Ako je odbijena,
+    # naredna AI slika prati redovni probe interval i nikada ne pravi petlju
+    # koja bi trosila svaki raspolozivi Gemini slot.
+    return [Math]::Max(4.1, [double]$script:VisionAiProbeIntervalSeconds)
+}
+
+function Stop-AgentProcessAfterIoFailure {
+    param([System.Diagnostics.Process]$Process)
+
+    if ($null -eq $Process) { return }
+    try {
+        if (-not $Process.HasExited) {
+            $Process.Kill()
+            $Process.WaitForExit(1000) | Out-Null
+        }
+    }
+    catch {
+        # Primarna greska citanja je korisnija od sekundarne greske gasenja.
+    }
+}
+
+function Read-AgentProcessLine {
+    param(
+        [System.Diagnostics.Process]$Process,
+        [string]$Label,
+        [int]$TimeoutSeconds
+    )
+
+    if ($null -eq $Process) { throw "$Label proces nije pokrenut." }
+    $deadline = (Get-Date).AddSeconds([Math]::Max(1, $TimeoutSeconds))
+    try {
+        $readTask = $Process.StandardOutput.ReadLineAsync()
+        while (-not $readTask.IsCompleted) {
+            Test-Cancelled
+            if ((Get-Date) -ge $deadline) {
+                Stop-AgentProcessAfterIoFailure $Process
+                throw "$Label nije vratio odgovor tokom $TimeoutSeconds sekundi; proces je zaustavljen da automatizacija ne ostane blokirana."
+            }
+            Start-Sleep -Milliseconds 50
+        }
+        $awaiter = $readTask.GetAwaiter()
+        return $awaiter.GetResult()
+    }
+    catch [System.OperationCanceledException] {
+        Stop-AgentProcessAfterIoFailure $Process
+        throw
+    }
+}
+
+function Enter-AgentInstanceMutex {
+    $safeInstance = ([string]$script:BlueStacksInstance -replace '[^A-Za-z0-9_.-]', '_')
+    $mutexNames = @(
+        "Global\TopElevenAiAgent_$safeInstance",
+        "Local\TopElevenAiAgent_$safeInstance"
+    )
+
+    foreach ($mutexName in $mutexNames) {
+        $createdNew = $false
+        $mutex = $null
+        try {
+            $mutex = [System.Threading.Mutex]::new($false, $mutexName, [ref]$createdNew)
+        }
+        catch {
+            # Global namespace moze biti zabranjen obicnom Windows korisniku.
+            # Samo tada koristi session-local mutex; zauzet globalni mutex nikad
+            # ne smije pasti kroz ovu granu i otvoriti paralelnog agenta.
+            if ($mutexName.StartsWith('Global\', [System.StringComparison]::OrdinalIgnoreCase)) {
+                continue
+            }
+            throw
+        }
+
+        $acquired = $false
+        try {
+            $acquired = $mutex.WaitOne(0)
+        }
+        catch [System.Threading.AbandonedMutexException] {
+            $acquired = $true
+        }
+        if (-not $acquired) {
+            $mutex.Dispose()
+            throw "Drugi Top Eleven agent vec upravlja BlueStacks instancom $script:BlueStacksInstance. Zaustavite ga prije pokretanja ovog toka."
+        }
+
+        $script:AgentInstanceMutex = $mutex
+        $script:AgentInstanceMutexOwned = $true
+        Add-Log "Ekskluzivna kontrola BlueStacks instance $script:BlueStacksInstance je zakljucana."
+        return
+    }
+    throw 'Nije moguce napraviti ni globalni ni lokalni sigurnosni mutex za agenta.'
+}
+
+function Exit-AgentInstanceMutex {
+    if ($null -eq $script:AgentInstanceMutex) { return }
+    try {
+        if ($script:AgentInstanceMutexOwned) {
+            $script:AgentInstanceMutex.ReleaseMutex()
+        }
+    }
+    catch { }
+    finally {
+        $script:AgentInstanceMutexOwned = $false
+        $script:AgentInstanceMutex.Dispose()
+        $script:AgentInstanceMutex = $null
+    }
+}
+
+function Test-PythonRuntimePath {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $false
+    }
+    try {
+        & $Path -c 'import sys; raise SystemExit(0 if sys.version_info.major >= 3 else 1)' 2>$null | Out-Null
+        return $LASTEXITCODE -eq 0
+    }
+    catch {
+        return $false
+    }
+}
+
+function Resolve-PythonRuntime {
+    if (-not [string]::IsNullOrWhiteSpace([string]$script:PythonExe) -and
+        (Test-PythonRuntimePath $script:PythonExe)) {
+        return $script:PythonExe
+    }
+
+    $profileCandidates = @(
+        [string]$env:USERPROFILE,
+        [string][Environment]::GetFolderPath('UserProfile')
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique
+    $candidates = @(
+        (Join-Path $PSScriptRoot '.venv\Scripts\python.exe'),
+        (Join-Path $PSScriptRoot 'venv\Scripts\python.exe')
+    ) + @($profileCandidates | ForEach-Object {
+        Join-Path $_ '.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe'
+    })
+    foreach ($candidate in $candidates) {
+        if (Test-PythonRuntimePath $candidate) {
+            $script:PythonExe = $candidate
+            return $script:PythonExe
+        }
+    }
+
+    $command = Get-Command python.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $command -and (Test-PythonRuntimePath ([string]$command.Source))) {
+        $script:PythonExe = [string]$command.Source
+        return $script:PythonExe
+    }
+    throw 'Python runtime nije pronadjen. Napravite AI-Agent\.venv ili instalirajte python.exe u PATH.'
+}
+
 function Get-BlueStacksWindow {
     param([switch]$RequireConfiguredInstance)
 
@@ -351,6 +529,33 @@ function Get-BlueStacksWindow {
 
     # Fail-closed: dvosmislen prozor se ne smije koristiti za klik niti force quit.
     return [IntPtr]::Zero
+}
+
+function Set-BlueStacksWindowForeground {
+    param([Parameter(Mandatory = $true)][IntPtr]$Handle)
+
+    if ($Handle -eq [IntPtr]::Zero) { return $false }
+
+    # Discord je foreground aplikacija kada komanda stigne. Windows ponekad
+    # odbije obican SetForegroundWindow iz novog child procesa. Vrati prozor
+    # ako je minimiziran i koristi dozvoljeni Alt aktivacijski signal prije
+    # fokusiranja, bez klika po Discordu ili igri.
+    if ([Win32Agent]::IsIconic($Handle)) {
+        [Win32Agent]::ShowWindow($Handle, 9) | Out-Null # SW_RESTORE
+    }
+    else {
+        [Win32Agent]::ShowWindow($Handle, 5) | Out-Null # SW_SHOW
+    }
+    [Win32Agent]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero) # ALT down
+    try {
+        [Win32Agent]::BringWindowToTop($Handle) | Out-Null
+        $focused = [Win32Agent]::SetForegroundWindow($Handle)
+    }
+    finally {
+        [Win32Agent]::keybd_event(0x12, 0, 0x0002, [UIntPtr]::Zero) # ALT up
+    }
+    Start-Sleep -Milliseconds 120
+    return [bool]$focused
 }
 
 function Wait-ForCondition {
@@ -413,6 +618,12 @@ function Click-Relative {
         [double]$Y,
         [string]$Name
     )
+    Test-Cancelled
+    if ([double]::IsNaN($X) -or [double]::IsNaN($Y) -or
+        $X -lt 0 -or $X -gt 1 -or $Y -lt 0 -or $Y -gt 1) {
+        throw "Neispravne koordinate za klik: $Name."
+    }
+    Set-AgentPendingAction $Name
     $rect = Get-WindowRectangle $Handle
     $screenX = [int]($rect.Left + (($rect.Right - $rect.Left) * $X))
     $screenY = [int]($rect.Top + (($rect.Bottom - $rect.Top) * $Y))
@@ -435,6 +646,12 @@ function Click-GameRelative {
         [double]$Y,
         [string]$Name
     )
+    Test-Cancelled
+    if ([double]::IsNaN($X) -or [double]::IsNaN($Y) -or
+        $X -lt 0 -or $X -gt 1 -or $Y -lt 0 -or $Y -gt 1) {
+        throw "Neispravne koordinate za klik: $Name."
+    }
+    Set-AgentPendingAction $Name
     $rect = Get-GameViewportRectangle $Handle
     $gameLeft = $rect.Left
     $gameTop = $rect.Top
@@ -464,88 +681,152 @@ function Send-Escape {
     Add-Log 'Pokusaj zatvaranja popupa: Back / Escape'
 }
 
-function Send-BlueStacksBack {
-    param([IntPtr]$Handle)
-    if ($script:DryRun) { Add-Log 'DRY RUN: BlueStacks Back'; return }
-    [Win32Agent]::SetForegroundWindow($Handle) | Out-Null
-    Wait-Agent 50
-    # Escape je Android Back u BlueStacksu, pa nema zavisnosti od koordinata.
-    [Win32Agent]::keybd_event(0x1B, 0, 0, [UIntPtr]::Zero)
-    [Win32Agent]::keybd_event(0x1B, 0, 0x0002, [UIntPtr]::Zero)
-    Add-Log 'BlueStacks Back poslan preko Escape tipke.'
-}
+function Invoke-BlueStacksAdbCommand {
+    param(
+        [string[]]$Arguments,
+        [int]$TimeoutMs = 2500
+    )
 
-function Get-BlueStacksForegroundState {
-    $now = Get-Date
-    if ($null -ne $script:ForegroundStateCheckedAt -and
-        ($now - $script:ForegroundStateCheckedAt).TotalMilliseconds -lt 250) {
-        return $script:ForegroundStateCache
+    if (-not (Test-Path -LiteralPath $script:BlueStacksAdbExe)) {
+        return [PSCustomObject]@{ Success = $false; Output = ''; Error = 'HD-Adb.exe nije pronadjen.' }
     }
 
-    $script:ForegroundStateCheckedAt = $now
-    $state = $null
+    $process = $null
     try {
-        if (Test-Path -LiteralPath $script:BlueStacksPlayerLog) {
-            $lines = @(Get-Content -LiteralPath $script:BlueStacksPlayerLog -Tail 400 -ErrorAction Stop)
-            for ($index = $lines.Count - 1; $index -ge 0; $index--) {
-                $line = [string]$lines[$index]
-                if ($line -match 'hcallOnActivityDisplayedClbk\s*:\s*package\s*=\s*(?<Package>[^\s]+)\s+activity\s*=\s*(?<Activity>[^\s]+)') {
-                    $eventTime = $null
-                    if ($line.Length -ge 28) {
-                        $parsedTime = [DateTimeOffset]::MinValue
-                        if ([DateTimeOffset]::TryParse($line.Substring(0, 28), [ref]$parsedTime)) {
-                            $eventTime = $parsedTime.LocalDateTime
-                        }
-                    }
-                    $state = [PSCustomObject]@{
-                        Package = [string]$Matches.Package
-                        Activity = [string]$Matches.Activity
-                        Signature = $line
-                        EventTime = $eventTime
-                    }
-                    break
-                }
-            }
+        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $script:BlueStacksAdbExe
+        $startInfo.Arguments = (($Arguments | ForEach-Object {
+            if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
+        }) -join ' ')
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $startInfo
+        if (-not $process.Start()) {
+            return [PSCustomObject]@{ Success = $false; Output = ''; Error = 'ADB proces nije pokrenut.' }
+        }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($TimeoutMs)) {
+            try { $process.Kill() } catch { }
+            return [PSCustomObject]@{ Success = $false; Output = ''; Error = "ADB timeout nakon $TimeoutMs ms." }
+        }
+        $output = [string]$stdoutTask.Result
+        $errorText = [string]$stderrTask.Result
+        return [PSCustomObject]@{
+            Success = ($process.ExitCode -eq 0)
+            Output = $output
+            Error = $errorText
         }
     }
     catch {
-        # Player.log je samo dodatna sigurnosna provjera; cekanje X-a i dalje radi.
+        return [PSCustomObject]@{ Success = $false; Output = ''; Error = $_.Exception.Message }
     }
-
-    $script:ForegroundStateCache = $state
-    return $state
+    finally {
+        if ($null -ne $process) { $process.Dispose() }
+    }
 }
 
-function Get-RecentGooglePlayLinkEvent {
-    param([datetime]$AdStartedAt)
+function Resolve-BlueStacksAdbSerial {
+    $now = Get-Date
+    if (-not [string]::IsNullOrWhiteSpace($script:BlueStacksAdbSerial) -and
+        ($now - $script:BlueStacksAdbSerialCheckedAt).TotalSeconds -lt 30) {
+        return $script:BlueStacksAdbSerial
+    }
 
+    $script:BlueStacksAdbSerialCheckedAt = $now
+    $devicesResult = Invoke-BlueStacksAdbCommand @('devices') 2000
+    if (-not $devicesResult.Success) {
+        $script:BlueStacksAdbSerial = $null
+        return $null
+    }
+    $deviceSerials = @([regex]::Matches([string]$devicesResult.Output, '(?m)^(?<Serial>\S+)\s+device\s*$') |
+        ForEach-Object { [string]$_.Groups['Serial'].Value })
+    if ($deviceSerials.Count -eq 0) {
+        # Prvi `adb devices` ponekad samo pokrene lokalni daemon; instanca se
+        # registruje nekoliko stotina milisekundi kasnije. Ponovi tacno jednom.
+        Start-Sleep -Milliseconds 350
+        $devicesResult = Invoke-BlueStacksAdbCommand @('devices') 2000
+        if ($devicesResult.Success) {
+            $deviceSerials = @([regex]::Matches([string]$devicesResult.Output, '(?m)^(?<Serial>\S+)\s+device\s*$') |
+                ForEach-Object { [string]$_.Groups['Serial'].Value })
+        }
+    }
+
+    $configuredSerial = $null
     try {
-        if (-not (Test-Path -LiteralPath $script:BlueStacksPlayerLog)) { return $null }
-        $lines = @(Get-Content -LiteralPath $script:BlueStacksPlayerLog -Tail 500 -ErrorAction Stop)
-        for ($index = $lines.Count - 1; $index -ge 0; $index--) {
-            $line = [string]$lines[$index]
-            if ($line -notmatch 'hcallOnActivityDisplayedClbk\s*:\s*package\s*=\s*(?<Package>com\.android\.(?:vending|chrome))') {
-                continue
-            }
-            $eventTime = $null
-            if ($line.Length -ge 28) {
-                $parsedTime = [DateTimeOffset]::MinValue
-                if ([DateTimeOffset]::TryParse($line.Substring(0, 28), [ref]$parsedTime)) {
-                    $eventTime = $parsedTime.LocalDateTime
-                }
-            }
-            if ($null -ne $eventTime -and $eventTime -lt $AdStartedAt.AddSeconds(-2)) {
-                return $null
-            }
-            return [PSCustomObject]@{
-                Package = [string]$Matches.Package
-                Signature = $line
-                EventTime = $eventTime
+        if (Test-Path -LiteralPath $script:BlueStacksConfigPath) {
+            $instancePattern = [regex]::Escape($script:BlueStacksInstance)
+            $configText = Get-Content -Raw -LiteralPath $script:BlueStacksConfigPath -ErrorAction Stop
+            $configPattern = 'bst\.instance\.' + $instancePattern + '\.adb_port="(?<Port>\d+)"'
+            if ($configText -match $configPattern) {
+                $adbPort = [int]$Matches.Port
+                if ($adbPort -gt 1) { $configuredSerial = "emulator-$($adbPort - 1)" }
             }
         }
     }
     catch { }
-    return $null
+
+    if (-not [string]::IsNullOrWhiteSpace($configuredSerial) -and $configuredSerial -in $deviceSerials) {
+        $script:BlueStacksAdbSerial = $configuredSerial
+    }
+    elseif ($deviceSerials.Count -eq 1) {
+        # Fallback je dozvoljen samo kada postoji tacno jedna ADB instanca;
+        # tako nikada ne saljemo Back nekom drugom BlueStacksu.
+        $script:BlueStacksAdbSerial = [string]$deviceSerials[0]
+    }
+    else {
+        $script:BlueStacksAdbSerial = $null
+    }
+    return $script:BlueStacksAdbSerial
+}
+
+
+
+
+
+function Send-BlueStacksBack {
+    param([IntPtr]$Handle)
+    if ($script:DryRun) { Add-Log 'DRY RUN: BlueStacks Back'; return }
+
+    $serial = Resolve-BlueStacksAdbSerial
+    if (-not [string]::IsNullOrWhiteSpace($serial)) {
+        $adbBack = Invoke-BlueStacksAdbCommand @('-s', $serial, 'shell', 'input', 'keyevent', 'KEYCODE_BACK') 2500
+        if ($adbBack.Success) {
+            Add-Log "BlueStacks Android Back poslan direktno preko ADB-a ($serial)."
+            return
+        }
+        $script:BlueStacksAdbSerial = $null
+        $script:BlueStacksAdbSerialCheckedAt = [datetime]::MinValue
+        Add-Log "ADB Back trenutno nije uspio; koristim sigurnosni Escape fallback. $($adbBack.Error)"
+    }
+
+    [Win32Agent]::SetForegroundWindow($Handle) | Out-Null
+    Wait-Agent 80
+    [Win32Agent]::keybd_event(0x1B, 0, 0, [UIntPtr]::Zero)
+    [Win32Agent]::keybd_event(0x1B, 0, 0x0002, [UIntPtr]::Zero)
+    Add-Log 'BlueStacks Back poslan preko Escape fallbacka.'
+}
+
+
+
+
+
+
+
+function Get-AdNavigationFingerprint {
+    param([IntPtr]$Handle)
+    Start-XDetector
+    $rect = Get-WindowRectangle $Handle
+    $request = @{ rect = @($rect.Left, $rect.Top, $rect.Right, $rect.Bottom); mode = 'frame_fingerprint' } | ConvertTo-Json -Compress
+    $script:XDetectorProcess.StandardInput.WriteLine($request)
+    $script:XDetectorProcess.StandardInput.Flush()
+    $result = Read-AgentProcessLine $script:XDetectorProcess 'Vanjska navigacija - slika' $script:XDetectorResponseTimeoutSeconds | ConvertFrom-Json
+    if (@($result.pixels).Count -ne 576) { throw (New-AgentFailure 'ScreenUnknown' 'Nema ispravne slike za provjeru Back napretka.') }
+    return ,@($result.pixels)
 }
 
 function Restore-AdFromGooglePlay {
@@ -554,25 +835,15 @@ function Restore-AdFromGooglePlay {
         [datetime]$AdStartedAt
     )
 
-    $state = Get-BlueStacksForegroundState
-    $externalEventSignature = if ($null -ne $state -and
-        ($state.Package -eq 'com.android.vending' -or $state.Package -eq 'com.android.chrome')) {
-        [string]$state.Signature
+    $externalByAi = Test-AiExternalNavigationVisible $Handle $AdStartedAt -ForceRefresh
+    if ($externalByAi -ne $true) { return $false }
+
+    # Total budget belongs to the whole ad, not to one click or restore episode.
+    if ($script:ExternalBackSession -ne $AdStartedAt.Ticks) {
+        $script:ExternalBackSession = $AdStartedAt.Ticks
+        $script:ExternalBackTotal = 0
+        $script:ExternalBackNoProgress = 0
     }
-    else { $null }
-    $externalByPackage = $null -ne $state -and
-        ($state.Package -eq 'com.android.vending' -or $state.Package -eq 'com.android.chrome') -and
-        $null -ne $state.EventTime -and
-        $state.EventTime -ge $AdStartedAt.AddSeconds(-2) -and
-        $state.Signature -ne $script:LastHandledGooglePlayEvent
-    $recentAiPlayClick = $null -ne $script:LastGooglePlayClickAt -and
-        ((Get-Date) - $script:LastGooglePlayClickAt).TotalSeconds -le 15
-    $externalByAi = $null
-    if (-not $externalByPackage -and $recentAiPlayClick) {
-        $externalByAi = Test-AiExternalNavigationVisible $Handle $AdStartedAt
-    }
-    if (-not $externalByPackage -and $externalByAi -ne $true) { return $false }
-    $externalWasAiOnly = -not $externalByPackage -and $externalByAi -eq $true
 
     $clickKey = if ($null -ne $script:LastGooglePlayClickAt) {
         [string]$script:LastGooglePlayClickAt.Ticks
@@ -585,85 +856,84 @@ function Restore-AdFromGooglePlay {
         $script:LastGooglePlayBackAt = $null
     }
 
-    $destination = if ($null -ne $state -and $state.Package -eq 'com.android.chrome') {
-        'play.google/Chrome'
-    }
-    else { 'Google Play Store' }
-
-    # Ne salji vise Back komandi u brzom nizu. Nakon prve, svaka naredna
-    # zahtijeva novu AI potvrdu da je Store/Chrome zaista jos na ekranu.
+    $destination = 'Google Play/Chrome'
     if ($null -ne $script:LastGooglePlayBackAt -and
         ((Get-Date) - $script:LastGooglePlayBackAt).TotalMilliseconds -lt 1600) {
         return $true
     }
-    if ($script:GooglePlayBackAttemptCount -ge 3) {
-        Set-Status "$destination je i dalje otvoren nakon 3 potvrdena Back pokusaja." ([System.Drawing.Color]::FromArgb(255, 150, 100))
-        return $true
-    }
-    if ($script:GooglePlayBackAttemptCount -gt 0) {
-        $aiBeforeAnotherBack = Test-AiExternalNavigationVisible $Handle $AdStartedAt -ForceRefresh
-        if ($aiBeforeAnotherBack -eq $false) {
-            if ($null -ne $externalEventSignature) {
-                $script:LastHandledGooglePlayEvent = $externalEventSignature
-            }
-            $script:LastGooglePlayClickAt = $null
-            $script:GooglePlayRestoreKey = $null
-            $script:GooglePlayBackAttemptCount = 0
-            Add-Log 'AI vise ne vidi Google Play/Chrome; dodatni Back nije poslan.'
-            return $true
-        }
-        if ($null -eq $aiBeforeAnotherBack) {
-            Add-Log 'AI nije potvrdio da je Store jos otvoren; cekam bez dodatnog Back klika.'
-            return $true
-        }
+    if ($script:ExternalBackTotal -ge $script:ExternalNavigationBackAttempts) {
+        throw (New-AgentFailure 'ExternalNavigationStuck' "$destination je jos otvoren nakon $script:ExternalNavigationBackAttempts Back pokusaja.")
     }
 
     $script:GooglePlayBackAttemptCount++
-    $backAttempt = $script:GooglePlayBackAttemptCount
-    Set-Status "Otvoren je $destination - saljem Back ($backAttempt/3)..." ([System.Drawing.Color]::FromArgb(255, 210, 100))
+    $script:ExternalBackTotal++
+    $backAttempt = $script:ExternalBackTotal
+    $beforeBack = Get-AdNavigationFingerprint $Handle
+    Set-Status "Otvoren je $destination - saljem Back ($backAttempt/$script:ExternalNavigationBackAttempts)..." ([System.Drawing.Color]::FromArgb(255, 210, 100))
     Send-BlueStacksBack $Handle
     $script:LastGooglePlayBackAt = Get-Date
     Wait-Agent 900
 
-    $script:ForegroundStateCheckedAt = $null
-    $state = Get-BlueStacksForegroundState
-    $externalByPackage = $null -ne $state -and
-        ($state.Package -eq 'com.android.vending' -or $state.Package -eq 'com.android.chrome')
-    if (-not $externalByPackage) {
-        # Ako package signal nije dostupan, ne pretpostavljaj da je Back uspio.
-        # Nova AI slika prvo provjerava je li Store/Chrome jos uvijek vidljiv.
-        if ($externalWasAiOnly -or $null -eq $state -or [string]::IsNullOrWhiteSpace([string]$state.Package)) {
-            $aiAfterBack = Test-AiExternalNavigationVisible $Handle $AdStartedAt -ForceRefresh
-            if ($aiAfterBack -eq $true) {
-                Add-Log 'AI i dalje vidi Google Play/Chrome nakon Back-a; ostajem u sigurnom restore toku.'
-                return $true
-            }
-            if ($null -eq $aiAfterBack) {
-                Add-Log 'Nema svjezeg package ni AI signala nakon Back-a; cekam novu provjeru bez klika po ekranu.'
-                return $true
-            }
-        }
-        $script:LastGooglePlayClickAt = $null
-        if ($null -ne $externalEventSignature) {
-            $script:LastHandledGooglePlayEvent = $externalEventSignature
-        }
-        $script:GooglePlayRestoreKey = $null
-        $script:GooglePlayBackAttemptCount = 0
-        Add-Log 'Google Play/Chrome vise nije foreground; reklamni tok sada potvrduje trenutni ekran.'
-        return $true
+    $afterBack = Get-AdNavigationFingerprint $Handle
+    $difference = 0.0
+    for ($pixel = 0; $pixel -lt 576; $pixel++) { $difference += [Math]::Abs([double]$beforeBack[$pixel] - [double]$afterBack[$pixel]) }
+    $script:ExternalBackNoProgress = if ($difference / 576 -le 2) { $script:ExternalBackNoProgress + 1 } else { 0 }
+    if ($script:ExternalBackNoProgress -ge 3) {
+        throw (New-AgentFailure 'ExternalNavigationStuck' 'Tri Back komande nisu promijenile ekran; prekidam vanjsku navigaciju bez novih klikova.')
     }
 
-    # Ako Player.log jos pokazuje Store, sljedeci Back se ne salje dok AI na
-    # novoj slici opet ne potvrdi da je vanjska destinacija stvarno otvorena.
-    $aiStillExternal = Test-AiExternalNavigationVisible $Handle $AdStartedAt -ForceRefresh
-    if ($aiStillExternal -eq $false) {
-        $script:LastHandledGooglePlayEvent = [string]$state.Signature
+    $aiAfterBack = Test-AiExternalNavigationVisible $Handle $AdStartedAt -ForceRefresh
+    if ($aiAfterBack -eq $false) {
         $script:LastGooglePlayClickAt = $null
         $script:GooglePlayRestoreKey = $null
         $script:GooglePlayBackAttemptCount = 0
-        Add-Log 'AI vise ne vidi Google Play/Chrome; povratak u reklamni tok je potvrden.'
+        Add-Log 'Svjeza AI slika vise ne pokazuje Google Play/Chrome; provjeravam povratak u igru.'
     }
+    elseif ($null -eq $aiAfterBack) {
+        Add-Log 'AI jos nije potvrdio ekran nakon Back-a; cekam novu sliku.'
+        Wait-Agent 700
+    }
+    else { Add-Log 'AI i dalje vidi Google Play/Chrome nakon Back-a.' }
     return $true
+}
+
+function Restore-ExternalNavigationBeforeGameAction {
+    param(
+        [IntPtr]$Handle,
+        [string]$Context = 'sljedeci klik u igri',
+        [double]$QuietPeriodSeconds = 2.5,
+        [int]$TimeoutSeconds = 75
+    )
+    $startedAt = Get-Date
+    $deadline = $startedAt.AddSeconds($TimeoutSeconds)
+    $expectedState = "ad_control_ai_only_preflight_$($startedAt.Ticks)"
+    while ((Get-Date) -lt $deadline) {
+        Test-Cancelled
+        # Puni lokalni ekran igre dovoljan je za obicne prelaze bez AI poziva.
+        if (Test-TopElevenReturnedAfterAd $Handle -ForceRefresh) { return $true }
+        $script:VisionCacheByState.Remove($expectedState)
+        $vision = Invoke-VisionAnalysis $Handle $expectedState
+        if ($null -ne $vision -and $vision.accepted) {
+            if ($vision.decision.screenType -eq 'top_eleven' -and
+                $vision.decision.topElevenReturned -and
+                $vision.decision.recommendedAction -eq 'none') {
+                Add-Log "$Context`: svjeza AI slika potvrdjuje igru."
+                return $true
+            }
+            if ($vision.decision.screenType -in @('google_play_store', 'play_google_chrome') -and
+                $vision.decision.recommendedAction -eq 'send_back') {
+                Restore-AdFromGooglePlay $Handle $startedAt | Out-Null
+                continue
+            }
+            if ($vision.decision.screenType -eq 'ad' -and -not $vision.decision.topElevenReturned) {
+                Watch-TVAdvertisement $Handle $false 'recovery' | Out-Null
+                continue
+            }
+        }
+        Add-Log "$Context`: ekran jos nije vizuelno potvrdjen; cekam novu sliku bez klika."
+        Wait-Agent ([int]([Math]::Max(1, $script:VisionAiProbeIntervalSeconds) * 1000))
+    }
+    throw "$Context nije dozvoljen: trenutni ekran nije vizuelno potvrdjen tokom $TimeoutSeconds sekundi."
 }
 
 function Wait-ForAdXAfterGooglePlayReturn {
@@ -764,8 +1034,7 @@ function Get-TeamRestFreeButtonSnapshot {
     param([IntPtr]$Handle)
     Start-XDetector
     if ($script:XDetectorProcess.HasExited) {
-        $details = $script:XDetectorProcess.StandardError.ReadToEnd()
-        throw "Recognizer teksta BESPLATNO se neocekivano zatvorio. $details"
+        throw "Recognizer teksta BESPLATNO se neocekivano zatvorio (exit code $($script:XDetectorProcess.ExitCode))."
     }
     $rect = Get-WindowRectangle $Handle
     $request = @{
@@ -774,7 +1043,7 @@ function Get-TeamRestFreeButtonSnapshot {
     } | ConvertTo-Json -Compress
     $script:XDetectorProcess.StandardInput.WriteLine($request)
     $script:XDetectorProcess.StandardInput.Flush()
-    $line = $script:XDetectorProcess.StandardOutput.ReadLine()
+    $line = Read-AgentProcessLine $script:XDetectorProcess 'Recognizer teksta BESPLATNO' $script:XDetectorResponseTimeoutSeconds
     if ([string]::IsNullOrWhiteSpace($line)) {
         throw 'Recognizer teksta BESPLATNO nije vratio rezultat.'
     }
@@ -783,45 +1052,34 @@ function Get-TeamRestFreeButtonSnapshot {
 
 function Test-FreeButtonReady {
     param([IntPtr]$Handle)
-    if ($script:Mode -eq 'OdmoriEkipu') {
-        $result = Get-TeamRestFreeButtonSnapshot $Handle
-        if (-not [bool]$result.ready) {
-            $script:DetectedFreeButtonX = $null
-            $script:DetectedFreeButtonY = $null
-            $script:FreeButtonStableCount = 0
-            $script:FreeButtonStableSince = $null
-            return $false
-        }
+    $result = Get-TeamRestFreeButtonSnapshot $Handle
+    if (-not [bool]$result.ready) {
+        $script:DetectedFreeButtonX = $null
+        $script:DetectedFreeButtonY = $null
+        $script:FreeButtonStableCount = 0
+        $script:FreeButtonStableSince = $null
+        return $false
+    }
 
-        $x = [double]$result.x
-        $y = [double]$result.y
-        $sameButton = $null -ne $script:DetectedFreeButtonX -and
-            [Math]::Abs($x - $script:DetectedFreeButtonX) -le 0.01 -and
-            [Math]::Abs($y - $script:DetectedFreeButtonY) -le 0.01
-        if ($sameButton) {
-            $script:FreeButtonStableCount++
-        }
-        else {
-            $script:FreeButtonStableCount = 1
-            $script:FreeButtonStableSince = Get-Date
-        }
-        $script:DetectedFreeButtonX = $x
-        $script:DetectedFreeButtonY = $y
-        $stableMilliseconds = if ($null -ne $script:FreeButtonStableSince) {
-            ((Get-Date) - $script:FreeButtonStableSince).TotalMilliseconds
-        }
-        else { 0 }
-        return $script:FreeButtonStableCount -ge 2 -and $stableMilliseconds -ge 350
+    $x = [double]$result.x
+    $y = [double]$result.y
+    $sameButton = $null -ne $script:DetectedFreeButtonX -and
+        [Math]::Abs($x - $script:DetectedFreeButtonX) -le 0.01 -and
+        [Math]::Abs($y - $script:DetectedFreeButtonY) -le 0.01
+    if ($sameButton) {
+        $script:FreeButtonStableCount++
     }
-    $left = 0.805
-    $top = 0.205
-    $right = 0.975
-    $bottom = 0.285
-    $cyanCount = Get-ColorMatchCount $Handle $left $top $right $bottom {
-        param($r, $g, $b)
-        $b -gt 150 -and $g -gt 115 -and $b -gt ($r * 1.15)
+    else {
+        $script:FreeButtonStableCount = 1
+        $script:FreeButtonStableSince = Get-Date
     }
-    return $cyanCount -ge 18
+    $script:DetectedFreeButtonX = $x
+    $script:DetectedFreeButtonY = $y
+    $stableMilliseconds = if ($null -ne $script:FreeButtonStableSince) {
+        ((Get-Date) - $script:FreeButtonStableSince).TotalMilliseconds
+    }
+    else { 0 }
+    return $script:FreeButtonStableCount -ge 2 -and $stableMilliseconds -ge 250
 }
 
 function Test-ResourcePlusReady {
@@ -863,37 +1121,71 @@ function Test-AdGooglePlayBadge {
 
 function Test-StoreLoaded {
     param([IntPtr]$Handle)
-    $whiteCount = Get-ColorMatchCount $Handle 0.020 0.300 0.220 0.540 {
-        param($r, $g, $b)
-        $r -gt 185 -and $g -gt 185 -and $b -gt 185 -and
-        ([Math]::Abs($r - $g) -lt 35) -and ([Math]::Abs($g - $b) -lt 35)
+    $snapshot = Get-TeamRestFreeButtonSnapshot $Handle
+    return [bool]$snapshot.storeLoaded
+}
+
+function Get-TopResourceCardsSnapshot {
+    param(
+        [IntPtr]$Handle,
+        [switch]$ForceRefresh
+    )
+
+    if (-not $ForceRefresh -and $null -ne $script:TopResourceSnapshotCache -and
+        ((Get-Date) - $script:TopResourceSnapshotCheckedAt).TotalMilliseconds -lt 250) {
+        return $script:TopResourceSnapshotCache
     }
-    return $whiteCount -ge 80
+
+    Start-XDetector
+    if ($script:XDetectorProcess.HasExited) {
+        throw "Recognizer Top Eleven zaglavlja se neocekivano zatvorio (exit code $($script:XDetectorProcess.ExitCode))."
+    }
+    $rect = Get-WindowRectangle $Handle
+    $request = @{
+        rect = @($rect.Left, $rect.Top, $rect.Right, $rect.Bottom)
+        mode = 'top_resource_cards'
+    } | ConvertTo-Json -Compress
+    $script:XDetectorProcess.StandardInput.WriteLine($request)
+    $script:XDetectorProcess.StandardInput.Flush()
+    $line = Read-AgentProcessLine $script:XDetectorProcess 'Recognizer Top Eleven zaglavlja' $script:XDetectorResponseTimeoutSeconds
+    if ([string]::IsNullOrWhiteSpace($line)) {
+        throw 'Recognizer Top Eleven zaglavlja nije vratio rezultat.'
+    }
+    $script:TopResourceSnapshotCache = ($line | ConvertFrom-Json)
+    $script:TopResourceSnapshotCheckedAt = Get-Date
+    return $script:TopResourceSnapshotCache
+}
+
+function Test-TopElevenResourceHeaderReady {
+    param(
+        [IntPtr]$Handle,
+        [switch]$ForceRefresh
+    )
+
+    try {
+        $snapshot = Get-TopResourceCardsSnapshot $Handle -ForceRefresh:$ForceRefresh
+        return [bool]$snapshot.found
+    }
+    catch {
+        Add-Log "Brza provjera Top Eleven zaglavlja trenutno nije dostupna: $($_.Exception.Message)"
+        return $false
+    }
 }
 
 function Test-TopElevenReturnedAfterAd {
     param(
         [IntPtr]$Handle,
-        [datetime]$Since = ([datetime]::MinValue)
+        [datetime]$Since = ([datetime]::MinValue),
+        [switch]$ForceRefresh
     )
-
-    # Ne vjeruj vise OpenCV slicnosti gornje trake. Player.log daje tacnu
-    # Android aktivnost: reklama je AdActivity, a igra je MainPlayerNativeActivity.
-    $script:ForegroundStateCheckedAt = $null
-    $state = Get-BlueStacksForegroundState
-    $isMainActivity = $null -ne $state -and
-        $state.Package -eq 'eu.nordeus.topeleven.android' -and
-        $state.Activity -eq 'eu.nordeus.common.MainPlayerNativeActivity'
-    if (-not $isMainActivity) { return $false }
-
-    # Stari MainPlayerNativeActivity zapis od prije reklame nije dokaz povratka.
-    # Prihvati samo novi Android activity dogadjaj nastao nakon pokretanja reklame.
-    if ($Since -ne ([datetime]::MinValue)) {
-        if ($null -eq $state.EventTime -or $state.EventTime -lt $Since.AddSeconds(-1)) {
-            return $false
-        }
+    # Sam header nije dokaz: provjeri puni ekran na dva nova snimka.
+    $first = Get-TVFlowSnapshot $Handle
+    if ([string]$first.state -eq 'home') {
+        Wait-Agent 300
+        $second = Get-TVFlowSnapshot $Handle
+        return [string]$second.state -eq 'home'
     }
-    return $true
+    return (Test-StoreReturnVisualProof $Handle)
 }
 
 function Test-YellowAdControlReady {
@@ -909,7 +1201,7 @@ function Test-YellowAdControlReady {
     } | ConvertTo-Json -Compress
     $script:XDetectorProcess.StandardInput.WriteLine($request)
     $script:XDetectorProcess.StandardInput.Flush()
-    $result = $script:XDetectorProcess.StandardOutput.ReadLine() | ConvertFrom-Json
+    $result = Read-AgentProcessLine $script:XDetectorProcess 'Recognizer zute reklamne kontrole' $script:XDetectorResponseTimeoutSeconds | ConvertFrom-Json
     if (-not $result.found) { return $false }
 
     $requiresAiConfirmation = $script:VisionEnabled -and [string]$result.kind -ne 'google_play'
@@ -976,7 +1268,7 @@ function Test-PlayDestinationScreen {
     } | ConvertTo-Json -Compress
     $script:XDetectorProcess.StandardInput.WriteLine($request)
     $script:XDetectorProcess.StandardInput.Flush()
-    $result = $script:XDetectorProcess.StandardOutput.ReadLine() | ConvertFrom-Json
+    $result = Read-AgentProcessLine $script:XDetectorProcess 'Recognizer Play destinacije' $script:XDetectorResponseTimeoutSeconds | ConvertFrom-Json
     $found = [bool]$result.found
     $script:PlayDestinationCheckedAt = $now
     if (-not $found) {
@@ -1110,11 +1402,19 @@ function Test-AdCloseReadyLegacy {
 function Start-VisionAgent {
     if (-not $script:VisionEnabled -or (Get-Date) -lt $script:VisionUnavailableUntil) { return $false }
     if ($null -ne $script:VisionAgentProcess -and -not $script:VisionAgentProcess.HasExited) { return $true }
-    if (-not (Test-Path -LiteralPath $script:PythonExe) -or
-        -not (Test-Path -LiteralPath $script:VisionAgentScript)) { return $false }
+    if ($null -ne $script:VisionAgentProcess) {
+        try { $script:VisionAgentProcess.Dispose() } catch { }
+        $script:VisionAgentProcess = $null
+    }
+    try { $pythonExe = Resolve-PythonRuntime }
+    catch {
+        Add-Log $_.Exception.Message
+        return $false
+    }
+    if (-not (Test-Path -LiteralPath $script:VisionAgentScript)) { return $false }
 
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $startInfo.FileName = $script:PythonExe
+    $startInfo.FileName = $pythonExe
     $startInfo.Arguments = ('"{0}" --server --config "{1}"' -f $script:VisionAgentScript, $script:VisionConfigPath)
     $startInfo.WorkingDirectory = $PSScriptRoot
     $startInfo.UseShellExecute = $false
@@ -1126,6 +1426,9 @@ function Start-VisionAgent {
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $startInfo
     if (-not $process.Start()) { return $false }
+    # StandardError je preusmjeren, pa ga obavezno kontinuirano dreniraj. Bez
+    # ovoga dovoljno Python upozorenja napuni OS pipe i blokira oba procesa.
+    $process.BeginErrorReadLine()
     $script:VisionAgentProcess = $process
     Add-Log 'AI vision agent je pokrenut.'
     return $true
@@ -1169,7 +1472,7 @@ function Invoke-VisionAnalysis {
         } | ConvertTo-Json -Compress
         $script:VisionAgentProcess.StandardInput.WriteLine($request)
         $script:VisionAgentProcess.StandardInput.Flush()
-        $line = $script:VisionAgentProcess.StandardOutput.ReadLine()
+        $line = Read-AgentProcessLine $script:VisionAgentProcess 'AI vision agent' $script:VisionResponseTimeoutSeconds
         if ([string]::IsNullOrWhiteSpace($line)) { throw 'AI nije vratio rezultat.' }
         $result = $line | ConvertFrom-Json
         if (-not $result.ok) { throw [string]$result.error }
@@ -1186,8 +1489,21 @@ function Invoke-VisionAnalysis {
         elseif (-not $result.accepted) {
             Add-Log ("AI ceka potvrdu odluke ({0}/{1})." -f $result.stableCount, $result.requiredStableCount)
         }
+        if ($null -ne $result.keySlotUsed) {
+            $usedKeySlot = [int]$result.keySlotUsed
+            if ($usedKeySlot -ne $script:LastLoggedGeminiKeySlot) {
+                if ($usedKeySlot -gt 1) {
+                    Add-Log ("Gemini je automatski presao na rezervni API kljuc #{0}." -f $usedKeySlot)
+                }
+                else {
+                    Add-Log 'Gemini je ponovo presao na glavni API kljuc.'
+                }
+                $script:LastLoggedGeminiKeySlot = $usedKeySlot
+            }
+        }
         return $result
     }
+    catch [System.OperationCanceledException] { throw }
     catch {
         $visionError = [string]$_.Exception.Message
         $isMalformedJson = $visionError -match 'JSONDecodeError|Unterminated string|Expecting (property name|value|delimiter)'
@@ -1214,6 +1530,19 @@ function Invoke-VisionAnalysis {
     }
 }
 
+function Test-StoreReturnVisualProof {
+    param([IntPtr]$Handle)
+
+    # Dva nova snimka pune prodavnice su lokalni dokaz povratka.
+    # Sam header nije dovoljan.
+    for ($frame = 0; $frame -lt 2; $frame++) {
+        $store = Get-TeamRestFreeButtonSnapshot $Handle
+        if (-not [bool]$store.storeLoaded) { return $false }
+        if ($frame -eq 0) { Wait-Agent 300 }
+    }
+    return $true
+}
+
 function Test-AiOnlyAdControlReady {
     param(
         [IntPtr]$Handle,
@@ -1227,6 +1556,7 @@ function Test-AiOnlyAdControlReady {
     $script:DetectedAdCloseX = $null
     $script:DetectedAdCloseY = $null
     $script:DetectedAdCloseKind = $null
+    $script:DetectedAdCloseLocallyVerified = $false
     if ($ForceRefresh) { $script:VisionCacheByState.Remove($ExpectedState) }
     $vision = Invoke-VisionAnalysis $Handle $ExpectedState
     if ($null -eq $vision -or -not $vision.accepted) { return $false }
@@ -1239,11 +1569,12 @@ function Test-AiOnlyAdControlReady {
     if ([string]$vision.decision.screenType -eq 'top_eleven' -and
         [bool]$vision.decision.topElevenReturned -and
         $action -eq 'none') {
-        $script:AiTopElevenReturned = $true
         $script:DetectedAdCloseX = $null
         $script:DetectedAdCloseY = $null
         $script:DetectedAdCloseKind = $null
-        Add-Log 'AI je potvrdio povratak Top Eleven zaglavlja s resursima.'
+        $script:DetectedAdCloseLocallyVerified = $false
+        $script:AiTopElevenReturned = $true
+        Add-Log 'Prihvacena AI analiza svjeze slike potvrdila je povratak u Top Eleven; zavrsavam nadzor reklame.'
         return $false
     }
     if ($action -notin @('click_close', 'click_skip', 'click_google_play')) { return $false }
@@ -1257,10 +1588,24 @@ function Test-AiOnlyAdControlReady {
     }
 
     if ($action -eq 'click_close' -and $null -ne $vision.closeRefinement -and [bool]$vision.closeRefinement.applied) {
+        $script:DetectedAdCloseLocallyVerified = $true
         Add-Log ("AI je izabrao X; lokalno je centriran bez pomaka: AI={0:N3},{1:N3}, centar={2:N3},{3:N3}, razlika={4:N1}px" -f $vision.closeRefinement.aiX, $vision.closeRefinement.aiY, $vision.closeRefinement.pixelX, $vision.closeRefinement.pixelY, $vision.closeRefinement.distancePixels)
     }
     elseif ($action -eq 'click_close' -and $null -ne $vision.closeRefinement -and [bool]$vision.closeRefinement.fallbackToAiCoordinate) {
-        Add-Log 'AI je svjeze potvrdio X; lokalni verifier ne poznaje ovaj stil X-a pa koristim tacan AI centar bez pomaka.'
+        Add-Log ("AI je predlozio X na {0:N3},{1:N3}, ali lokalni verifier nije nasao X blizu te tacke; kandidat je odbijen i ne moze pokrenuti pre-click petlju." -f $script:DetectedAdCloseX, $script:DetectedAdCloseY)
+        $script:DetectedAdCloseX = $null
+        $script:DetectedAdCloseY = $null
+        $script:DetectedAdCloseKind = $null
+        $script:DetectedAdCloseLocallyVerified = $false
+        return $false
+    }
+    elseif ($action -eq 'click_close') {
+        Add-Log 'AI je predlozio X bez svjeze lokalne geometrijske potvrde; kandidat je sigurnosno odbijen.'
+        $script:DetectedAdCloseX = $null
+        $script:DetectedAdCloseY = $null
+        $script:DetectedAdCloseKind = $null
+        $script:DetectedAdCloseLocallyVerified = $false
+        return $false
     }
 
     Add-Log ("AI-only je pronasao kontrolu: akcija={0}, confidence={1:N2}, centar={2:N3},{3:N3}" -f $action, $vision.decision.control.confidence, $script:DetectedAdCloseX, $script:DetectedAdCloseY)
@@ -1268,19 +1613,64 @@ function Test-AiOnlyAdControlReady {
 }
 
 function Confirm-AiAdCloseImmediatelyBeforeClick {
-    param([IntPtr]$Handle, [string]$Label = 'reklama')
+    param(
+        [IntPtr]$Handle,
+        [string]$Label = 'reklama',
+        [datetime]$AdStartedAt = ([datetime]::MinValue)
+    )
 
-    $freshState = "ad_control_ai_only_preclick_$((Get-Date).Ticks)"
-    $ready = Test-AiOnlyAdControlReady $Handle $freshState -ForceRefresh
-    if ($script:AiTopElevenReturned) {
-        Add-Log "$Label se vec sama zatvorila; ponistavam stari X i ne klikcem."
-        return 'returned'
-    }
-    if ($ready -and $script:DetectedAdCloseKind -eq 'close') {
+    # Prethodna kontrolna provjera je vec na istoj AI analizi uzela svjezu
+    # lokalnu sliku i geometrijski centrirala dijagonale X-a. Ta jedna AI odluka je
+    # dovoljna; ovdje se namjerno ne pravi drugi Gemini zahtjev.
+    if ($script:DetectedAdCloseKind -eq 'close' -and
+        $null -ne $script:DetectedAdCloseX -and
+        $null -ne $script:DetectedAdCloseY -and
+        [bool]$script:DetectedAdCloseLocallyVerified) {
+        Add-Log ("Jedna AI provjera i svjezi lokalni verifier potvrdili su X; koristim centar {0:N3},{1:N3}." -f $script:DetectedAdCloseX, $script:DetectedAdCloseY)
         return 'close'
     }
-    Add-Log "$Label vise nema svjeze potvrdjen X; stara koordinata se nece kliknuti."
+
+    # Nakon klika/follow-up timeouta stari kandidat vise ne postoji. Tada je
+    # potrebna stvarna nova analiza, a ne petlja koja samo cita prazne koordinate.
+    Add-Log "$Label nema svjeze lokalno potvrden X; provjeravam povratak ili novu kontrolu."
+    $followupState = Wait-ForAdExitOrControl $Handle 10 $AdStartedAt
+    if ($followupState -eq 'exited') { return 'returned' }
+    if ($followupState -eq 'control' -and
+        $script:DetectedAdCloseKind -eq 'close' -and
+        $null -ne $script:DetectedAdCloseX -and
+        $null -ne $script:DetectedAdCloseY -and
+        [bool]$script:DetectedAdCloseLocallyVerified) {
+        return 'close'
+    }
     return 'not_confirmed'
+}
+
+function Test-AdWakeTapAllowed {
+    param(
+        [IntPtr]$Handle,
+        [datetime]$AdStartedAt,
+        [string]$Label
+    )
+
+    # Wake dodir je namjerno fail-closed: dozvoljen je samo na potpuno svjezoj
+    # AI slici koja jos pokazuje reklamu, ali nema X/skip/Play kontrolu. Ako se
+    # igra vratila, kontrola je vec dostupna ili AI nije siguran, ekran se ne dira.
+    $wakeState = "ad_control_ai_only_wake_$($AdStartedAt.Ticks)_$((Get-Date).Ticks)"
+    $controlReady = Test-AiOnlyAdControlReady $Handle $wakeState -ForceRefresh
+    if ($script:AiTopElevenReturned) {
+        Add-Log "$Label se vec vratila u Top Eleven; wake dodir je otkazan."
+        return $false
+    }
+    if ($controlReady) {
+        Add-Log "$Label vec ima aktivnu reklamnu kontrolu; wake dodir je otkazan."
+        return $false
+    }
+    if (-not $script:AiAdVisible) {
+        Add-Log "AI nije svjeze potvrdio da je $Label jos reklama; wake dodir je sigurnosno preskocen."
+        return $false
+    }
+    Add-Log "AI je svjeze potvrdio reklamu bez aktivne kontrole; wake dodir je dozvoljen."
+    return $true
 }
 
 function Try-RecoverConnectionInterruptedPopup {
@@ -1379,15 +1769,17 @@ function Start-XDetector {
     if ($null -ne $script:XDetectorProcess -and -not $script:XDetectorProcess.HasExited) {
         return
     }
-    if (-not (Test-Path -LiteralPath $script:PythonExe)) {
-        throw "Python runtime za OpenCV nije pronadjen: $script:PythonExe"
+    if ($null -ne $script:XDetectorProcess) {
+        try { $script:XDetectorProcess.Dispose() } catch { }
+        $script:XDetectorProcess = $null
     }
+    $pythonExe = Resolve-PythonRuntime
     if (-not (Test-Path -LiteralPath $script:XDetectorScript)) {
         throw "OpenCV detektor nije pronadjen: $script:XDetectorScript"
     }
 
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-    $startInfo.FileName = $script:PythonExe
+    $startInfo.FileName = $pythonExe
     $startInfo.Arguments = ('"{0}" --server' -f $script:XDetectorScript)
     $startInfo.WorkingDirectory = $PSScriptRoot
     $startInfo.UseShellExecute = $false
@@ -1401,6 +1793,7 @@ function Start-XDetector {
     if (-not $process.Start()) {
         throw 'Nije moguce pokrenuti OpenCV X detektor.'
     }
+    $process.BeginErrorReadLine()
 
     $script:XDetectorProcess = $process
     $script:XDetectorStableCount = 0
@@ -1441,8 +1834,7 @@ function Test-AdCloseReady {
 
     Start-XDetector
     if ($script:XDetectorProcess.HasExited) {
-        $details = $script:XDetectorProcess.StandardError.ReadToEnd()
-        throw "OpenCV X detektor se neocekivano zatvorio. $details"
+        throw "OpenCV X detektor se neocekivano zatvorio (exit code $($script:XDetectorProcess.ExitCode))."
     }
 
     $rect = Get-WindowRectangle $Handle
@@ -1451,7 +1843,7 @@ function Test-AdCloseReady {
     } | ConvertTo-Json -Compress
     $script:XDetectorProcess.StandardInput.WriteLine($request)
     $script:XDetectorProcess.StandardInput.Flush()
-    $line = $script:XDetectorProcess.StandardOutput.ReadLine()
+    $line = Read-AgentProcessLine $script:XDetectorProcess 'OpenCV X detektor' $script:XDetectorResponseTimeoutSeconds
     if ([string]::IsNullOrWhiteSpace($line)) {
         throw 'OpenCV X detektor nije vratio rezultat.'
     }
@@ -1538,28 +1930,22 @@ function Wait-ForAdExitOrControl {
         [datetime]$AdStartedAt = ([datetime]::MinValue)
     )
 
+    # Kontrola prije ulaska je vec potrosena klikom ili odbacena. Nikada je
+    # nemoj vratiti u pre-click tok ako se nova analiza ne uspije izvrsiti.
+    $script:DetectedAdCloseX = $null
+    $script:DetectedAdCloseY = $null
+    $script:DetectedAdCloseKind = $null
+    $script:DetectedAdCloseLocallyVerified = $false
+    $script:AiTopElevenReturned = $false
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     $returnedStableCount = 0
     $nextAiProbeAt = (Get-Date).AddMilliseconds(800)
     $expectedState = "ad_control_ai_only_followup_$((Get-Date).Ticks)"
     while ((Get-Date) -lt $deadline) {
         Test-Cancelled
-        if (Test-TopElevenReturnedAfterAd $Handle $AdStartedAt) {
-            $returnedStableCount++
-            if ($returnedStableCount -eq 1) {
-                Add-Log 'Top Eleven MainPlayerNativeActivity je pronadjena; potvrdjujem povratak...'
-            }
-            if ($returnedStableCount -ge 2) {
-                Add-Log 'Povratak u Top Eleven potvrden je Android aktivnoscu, bez OpenCV trake.'
-                return 'exited'
-            }
-            Start-Sleep -Milliseconds 150
-            continue
-        }
-        else {
-            $returnedStableCount = 0
-        }
 
+        # Externalna aplikacija ima apsolutni prioritet. Dok je Store/Chrome
+        # foreground, nijedan header ili AI kandidat ne smije zavrsiti reklamu.
         $playRestoreTriggered = $false
         if ($AdStartedAt -ne ([datetime]::MinValue)) {
             $playRestoreTriggered = Restore-AdFromGooglePlay $Handle $AdStartedAt
@@ -1568,6 +1954,25 @@ function Wait-ForAdExitOrControl {
             Start-Sleep -Milliseconds 100
             continue
         }
+
+        if (Test-TopElevenReturnedAfterAd $Handle $AdStartedAt -ForceRefresh) {
+            $returnedStableCount++
+            if ($returnedStableCount -eq 1) {
+                Add-Log 'Top Eleven ekran je prepoznat; potvrdjujem povratak...'
+            }
+            if ($returnedStableCount -ge 2) {
+                Add-Log 'Povratak u Top Eleven potvrden je lokalnim prepoznavanjem ekrana na dva svjeza framea.'
+                return 'exited'
+            }
+            # Cache zaglavlja traje 250 ms; sljedeca potvrda mora doci sa
+            # stvarno novog framea, a ne dvaput brojati isti screenshot.
+            Wait-Agent 300
+            continue
+        }
+        else {
+            $returnedStableCount = 0
+        }
+
         if ((Get-Date) -ge $nextAiProbeAt) {
             $nextAiProbeAt = (Get-Date).AddSeconds($script:VisionAiProbeIntervalSeconds)
             $aiControlReady = Test-AiOnlyAdControlReady $Handle $expectedState
@@ -1633,6 +2038,8 @@ function Dismiss-GamePopups {
 
 function Open-Store {
     param([IntPtr]$Handle)
+
+    Restore-ExternalNavigationBeforeGameAction $Handle 'Otvaranje prodavnice' 1.5 75 | Out-Null
 
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         Set-Status "Otvaram prodavnicu preko zelenog + dugmeta (pokusaj $attempt/3)..."
@@ -1722,11 +2129,11 @@ function Wait-TeamRestAdLaunchEvidence {
     $deadline = (Get-Date).AddSeconds(12)
     $buttonCheckStartsAt = (Get-Date).AddMilliseconds(700)
     $nextButtonCheckAt = $buttonCheckStartsAt
-    $nextAiProbeAt = (Get-Date).AddSeconds(2)
     $retryAllowedAt = $ClickedAt.AddSeconds(8)
-    $launchState = "ad_control_ai_only_launch_$($ClickedAt.Ticks)"
     $readyStableCount = 0
     $readyStableSince = $null
+    $missingStableCount = 0
+    $missingStableSince = $null
     $lastReadyX = $null
     $lastReadyY = $null
     $lastButtonSnapshot = $null
@@ -1734,27 +2141,16 @@ function Wait-TeamRestAdLaunchEvidence {
     $script:DetectedFreeButtonY = $null
     $script:FreeButtonStableCount = 0
     $script:FreeButtonStableSince = $null
+    $script:TopResourceSnapshotCheckedAt = [datetime]::MinValue
+    $script:TopResourceSnapshotCache = $null
     while ((Get-Date) -lt $deadline) {
         Test-Cancelled
-        $foreground = Get-BlueStacksForegroundState
-        if ($null -ne $foreground -and $foreground.EventTime -ge $ClickedAt.AddMilliseconds(-500)) {
-            $isAdActivity = $foreground.Package -eq 'eu.nordeus.topeleven.android' -and
-                $foreground.Activity -like '*AdActivity*'
-            $isExternalDestination = $foreground.Package -in @(
-                'com.android.vending',
-                'com.google.android.gms',
-                'com.android.chrome'
-            )
-            if ($isAdActivity -or $isExternalDestination) {
-                Add-Log "Pokretanje reklame za $PlayerLabel potvrdeno je Android aktivnoscu."
-                return [PSCustomObject]@{ Proceed = $true; Observed = $true }
-            }
-        }
-
         if ((Get-Date) -ge $nextButtonCheckAt) {
             $nextButtonCheckAt = (Get-Date).AddMilliseconds(250)
             $lastButtonSnapshot = Get-TeamRestFreeButtonSnapshot $Handle
             if ([bool]$lastButtonSnapshot.ready) {
+                $missingStableCount = 0
+                $missingStableSince = $null
                 $readyX = [double]$lastButtonSnapshot.x
                 $readyY = [double]$lastButtonSnapshot.y
                 $sameReadyButton = $null -ne $lastReadyX -and
@@ -1775,6 +2171,14 @@ function Wait-TeamRestAdLaunchEvidence {
                 $readyStableSince = $null
                 $lastReadyX = $null
                 $lastReadyY = $null
+                if (-not [bool]$lastButtonSnapshot.buttonVisible) {
+                    if ($missingStableCount -eq 0) { $missingStableSince = Get-Date }
+                    $missingStableCount++
+                }
+                else {
+                    $missingStableCount = 0
+                    $missingStableSince = $null
+                }
             }
             $readyStableMilliseconds = if ($null -ne $readyStableSince) {
                 ((Get-Date) - $readyStableSince).TotalMilliseconds
@@ -1786,13 +2190,16 @@ function Wait-TeamRestAdLaunchEvidence {
                 Add-Log "Tekst BESPLATNO za $PlayerLabel je jos uvijek vidljiv nakon klika; reklama nije pokrenuta."
                 return [PSCustomObject]@{ Proceed = $false; Observed = $false }
             }
-        }
-
-        if ($script:VisionEnabled -and (Get-Date) -ge $nextAiProbeAt) {
-            $nextAiProbeAt = (Get-Date).AddSeconds(4)
-            Test-AiOnlyAdControlReady $Handle $launchState -ForceRefresh | Out-Null
-            if ($script:AiAdVisible) {
-                Add-Log "Pokretanje reklame za $PlayerLabel potvrdeno je AI analizom."
+            $missingStableMilliseconds = if ($null -ne $missingStableSince) {
+                ((Get-Date) - $missingStableSince).TotalMilliseconds
+            }
+            else { 0 }
+            if ($missingStableCount -ge 2 -and $missingStableMilliseconds -ge 350) {
+                # Dugme je bilo svjeze potvrdeno neposredno prije klika. Njegov
+                # stabilan nestanak na dva nova framea je dovoljan launch dokaz;
+                # Gemini se ovdje namjerno ne poziva jer spor API ne smije
+                # blokirati prelazak u reklamni nadzor.
+                Add-Log "BESPLATNO za $PlayerLabel je stabilno nestalo nakon svjezeg klika; reklamni tok je pokrenut."
                 return [PSCustomObject]@{ Proceed = $true; Observed = $true }
             }
         }
@@ -1804,8 +2211,8 @@ function Wait-TeamRestAdLaunchEvidence {
         Add-Log "Dugme za $PlayerLabel je i dalje u stanju '$buttonState' bez reklame; vracam se na sigurno cekanje."
         return [PSCustomObject]@{ Proceed = $false; Observed = $false }
     }
-    Add-Log "BESPLATNO za $PlayerLabel je nestalo, ali reklama jos nije potvrdena; nastavljam sigurno cekanje bez dodatnog klika."
-    return [PSCustomObject]@{ Proceed = $true; Observed = $false }
+    Add-Log "BESPLATNO za $PlayerLabel je nestalo nakon svjezeg klika; ulazim u reklamni nadzor bez ponovnog klika."
+    return [PSCustomObject]@{ Proceed = $true; Observed = $true }
 }
 
 function Wait-ManualTeamRestAd {
@@ -1876,6 +2283,7 @@ function Wait-ManualTeamRestAd {
 
     while ((Get-Date) -lt $adCloseDeadline) {
         Test-Cancelled
+        $reuseWakeAnalysis = $false
         if (Restore-AdFromGooglePlay $Handle $adStartedAt) {
             $googlePlayBadgeClicked = $true
             $adObserved = $true
@@ -1883,14 +2291,21 @@ function Wait-ManualTeamRestAd {
             continue
         }
         if ((Get-Date) -ge $nextAdWakeTapAt -and $adWakeTapCount -lt $script:AdWakeTapMaximum) {
-            $adWakeTapCount++
-            Set-Status "Reklama za $PlayerLabel dugo traje - dodirujem ekran da ponovo prikazem kratku kontrolu..." ([System.Drawing.Color]::FromArgb(255, 210, 100))
-            Click-Relative $Handle 0.500 0.620 "reklama za $PlayerLabel - probudi skrivenu kontrolu"
-            $adWakeBurstUntil = (Get-Date).AddSeconds($script:AdWakeBurstSeconds)
-            $nextAdWakeTapAt = (Get-Date).AddSeconds($script:AdWakeTapIntervalSeconds)
-            $script:VisionCacheByState.Remove($aiOnlyExpectedState)
-            $nextAiProbeAt = Get-Date
-            Add-Log "Wake provjera za $PlayerLabel`: AI provjera krece odmah."
+            if (-not (Test-AdWakeTapAllowed $Handle $adStartedAt "Reklama za $PlayerLabel")) {
+                $nextAdWakeTapAt = (Get-Date).AddSeconds($script:AdWakeTapIntervalSeconds)
+                $nextAiProbeAt = Get-Date
+                $reuseWakeAnalysis = $true
+            }
+            else {
+                $adWakeTapCount++
+                Set-Status "Reklama za $PlayerLabel dugo traje - dodirujem ekran da ponovo prikazem kratku kontrolu..." ([System.Drawing.Color]::FromArgb(255, 210, 100))
+                Click-Relative $Handle 0.500 0.620 "reklama za $PlayerLabel - probudi skrivenu kontrolu"
+                $adWakeBurstUntil = (Get-Date).AddSeconds($script:AdWakeBurstSeconds)
+                $nextAdWakeTapAt = (Get-Date).AddSeconds($script:AdWakeTapIntervalSeconds)
+                $script:VisionCacheByState.Remove($aiOnlyExpectedState)
+                $nextAiProbeAt = Get-Date
+                Add-Log "Wake provjera za $PlayerLabel`: AI provjera krece odmah."
+            }
         }
         $wakeBurstActive = $null -ne $adWakeBurstUntil -and (Get-Date) -lt $adWakeBurstUntil
         $aiOnlyFallbackActive = $false
@@ -1903,7 +2318,9 @@ function Wait-ManualTeamRestAd {
         if ($script:VisionEnabled -and (Get-Date) -ge $nextAiProbeAt) {
             $nextAiProbeAt = (Get-Date).AddSeconds($script:VisionAiProbeIntervalSeconds)
             Add-Log "AI periodicna provjera kontrole za $PlayerLabel..."
-            $aiControlReady = Test-AiOnlyAdControlReady $Handle $aiOnlyExpectedState
+            $aiControlReady = if ($reuseWakeAnalysis) {
+                $null -ne $script:DetectedAdCloseX -and $null -ne $script:DetectedAdCloseY
+            } else { Test-AiOnlyAdControlReady $Handle $aiOnlyExpectedState }
             if ($script:AiAdVisible) { $adObserved = $true }
             if ($script:AiTopElevenReturned -and $adObserved) {
                 Add-Log "AI je potvrdio da je reklama za $PlayerLabel vec zatvorena."
@@ -1999,7 +2416,10 @@ function Wait-ManualTeamRestAd {
     }
 
     if (-not $adCloseReady) {
-        throw "X za $PlayerLabel nije prepoznat u roku od 5 minuta."
+        if (-not $adObserved) {
+            throw "Reklamni ekran za $PlayerLabel nije nikada potvrden; ostajem bez force-stop recoveryja."
+        }
+        throw (New-AgentFailure 'AdTimeout' "X za $PlayerLabel nije prepoznat u roku od 5 minuta.")
     }
 
     [Win32Agent]::SetForegroundWindow($Handle) | Out-Null
@@ -2008,14 +2428,16 @@ function Wait-ManualTeamRestAd {
     $adClosed = $false
     while ((Get-Date) -lt $adCloseDeadline -and -not $adClosed) {
         Test-Cancelled
-        $preClickState = Confirm-AiAdCloseImmediatelyBeforeClick $Handle "Reklama za $PlayerLabel"
+        $preClickState = Confirm-AiAdCloseImmediatelyBeforeClick $Handle "Reklama za $PlayerLabel" $adStartedAt
         if ($preClickState -eq 'returned') {
             $adClosed = $true
             break
         }
         if ($preClickState -ne 'close') {
             Set-Status "Reklama za $PlayerLabel je jos pod nadzorom - cekam novu svjezu AI potvrdu X-a ili povratka..." ([System.Drawing.Color]::FromArgb(255, 210, 100))
-            Wait-Agent 1000
+            $preClickRetrySeconds = Get-AiPreClickRetryIntervalSeconds
+            Add-Log ("Sljedeca pre-click AI provjera za {0} je za {1:N1}s." -f $PlayerLabel, $preClickRetrySeconds)
+            Wait-Agent ([int][Math]::Ceiling($preClickRetrySeconds * 1000.0))
             continue
         }
         if ($null -eq $script:DetectedAdCloseX -or $null -eq $script:DetectedAdCloseY) {
@@ -2032,16 +2454,16 @@ function Wait-ManualTeamRestAd {
                 break
             }
             if (-not $xAfterStore) {
-                throw "Nakon povratka iz Google Play Storea X za $PlayerLabel nije pronadjen."
+                throw (New-AgentFailure 'ExternalReturnTimeout' "Nakon povratka iz Google Play Storea X za $PlayerLabel nije pronadjen.")
             }
             continue
         }
-        # Povratak je siguran read-only AI/Android korak. Daj mu dovoljno vremena
+        # Povratak je siguran vizuelni read-only korak. Daj mu dovoljno vremena
         # za jos jednu provjeru ako Gemini jednom vrati prekinut JSON.
         $exitState = Wait-ForAdExitOrControl $Handle 35 $adStartedAt
         if ($exitState -eq 'exited') {
             $adClosed = $true
-            Add-Log "Top Eleven je potvrden Android aktivnoscu ili AI analizom nakon reklame za $PlayerLabel."
+            Add-Log "Top Eleven je potvrden vizuelnom provjerom nakon reklame za $PlayerLabel."
             break
         }
         if ($exitState -eq 'control') {
@@ -2053,7 +2475,7 @@ function Wait-ManualTeamRestAd {
     }
 
     if (-not $adClosed) {
-        throw "X je kliknut, ali reklama za $PlayerLabel nije zatvorena."
+        throw (New-AgentFailure 'AdCloseFailed' "X je kliknut, ali reklama za $PlayerLabel nije zatvorena.")
     }
 
     Wait-Agent $script:TransitionBufferMs
@@ -2087,6 +2509,10 @@ function Run-TeamRestManualQueue {
     for ($index = $startIndex; $index -lt $script:TeamRestQueue.Count; $index++) {
         Test-Cancelled
         $player = $script:TeamRestQueue[$index]
+        if ($null -ne $script:Checkpoint -and $player.Key -in @($script:Checkpoint.CompletedPlayers)) {
+            Add-Log "Preskacem ranije potvrden odmor: $($player.Label)."
+            continue
+        }
         if ([string]$player.View -ne $currentView) {
             $scrollDirection = if ([string]$player.View -eq 'Bottom') { 'Down' } else { 'Up' }
             Scroll-PlayerList $Handle $scrollDirection
@@ -2095,6 +2521,11 @@ function Run-TeamRestManualQueue {
         Click-GameRelative $Handle 0.976 $player.Y ("plus za {0}" -f $player.Label)
         Wait-Agent 1200
         Wait-ManualTeamRestAd $Handle $player.Label
+        Restore-ExternalNavigationBeforeGameAction $Handle ("Naredni klik nakon odmora za {0}" -f $player.Label) 2.5 75 | Out-Null
+        if ($null -ne $script:Checkpoint) {
+            $script:Checkpoint.CompletedPlayers = @($script:Checkpoint.CompletedPlayers) + @([string]$player.Key)
+            Set-AgentCheckpointStep "rest_confirmed:$($player.Key)"
+        }
     }
 
     [System.Media.SystemSounds]::Exclamation.Play()
@@ -2112,7 +2543,7 @@ function Get-TVFlowSnapshot {
     } | ConvertTo-Json -Compress
     $script:XDetectorProcess.StandardInput.WriteLine($request)
     $script:XDetectorProcess.StandardInput.Flush()
-    return ($script:XDetectorProcess.StandardOutput.ReadLine() | ConvertFrom-Json)
+    return (Read-AgentProcessLine $script:XDetectorProcess 'TV flow recognizer' $script:XDetectorResponseTimeoutSeconds | ConvertFrom-Json)
 }
 
 function Wait-TVFlowState {
@@ -2140,7 +2571,7 @@ function Watch-TVAdvertisement {
     param(
         [IntPtr]$Handle,
         [bool]$ManualReward,
-        [ValidateSet('tv', 'mourinho', 'campus', 'put_saveza', 'training_player')]
+        [ValidateSet('tv', 'mourinho', 'campus', 'put_saveza', 'training_player', 'recovery')]
         [string]$ReturnFlow = 'tv'
     )
 
@@ -2152,66 +2583,196 @@ function Watch-TVAdvertisement {
     $nextAiProbeAt = $adStartedAt.AddSeconds($script:VisionAiProbeIntervalSeconds)
     $aiExpectedState = "ad_control_ai_only_$($ReturnFlow)_$($adStartedAt.Ticks)"
     $aiOnlyLogged = $false
-    $adObserved = $false
+    $adObserved = $ReturnFlow -eq 'recovery'
+    $aiAdVisuallyObserved = $false
     $appReturnStableCount = 0
+    $trainingPlayerReturnStableCount = 0
+    $tvManualReturnStableCount = 0
+    $tvReturnStableCount = 0
+    $campusReturnStableCount = 0
+    $externalDepartureObserved = $false
+    $putSavezaReturnStableCount = 0
+    $putSavezaReturnLastX = $null
+    $putSavezaReturnLastY = $null
     $nextAdWakeTapAt = $adStartedAt.AddSeconds($script:AdWakeTapAfterSeconds)
     $adWakeBurstUntil = $null
     $adWakeTapCount = 0
+    $nextPreClickAiAllowedAt = [datetime]::MinValue
     $flowLabel = switch ($ReturnFlow) {
         'mourinho' { 'Mourinho' }
         'campus' { 'Kampus' }
         'put_saveza' { 'Put saveza' }
         'training_player' { 'Trening igraca' }
+        'recovery' { 'Zatecena' }
         default { 'TV' }
     }
 
-    Set-Status "$flowLabel reklama je pokrenuta; nadgledam X, skip i Google Play..."
+    if ($ReturnFlow -eq 'recovery') {
+        Set-Status 'Zatecena reklama je potvrdena; nadgledam X, skip i Google Play...'
+    }
+    else {
+        Set-Status "$flowLabel reklama je pokrenuta; nadgledam X, skip i Google Play..."
+    }
     while ((Get-Date) -lt $deadline) {
         Test-Cancelled
 
         # Store/Chrome mora imati prioritet nad bilo kakvim vizuelnim stanjem.
+        $reuseWakeAnalysis = $false
         # Time TV recognizer ne moze pogresno proglasiti Store povratkom u igru.
         if (Restore-AdFromGooglePlay $Handle $adStartedAt) {
             $adObserved = $true
+            # Restore returns true only after current Store/Chrome evidence.
+            # That is also a real departure from Campus, even if the AI never
+            # sampled the ad itself before the external destination opened.
+            $externalDepartureObserved = $true
+            $campusReturnStableCount = 0
+            $trainingPlayerReturnStableCount = 0
+            $tvManualReturnStableCount = 0
+            $tvReturnStableCount = 0
+            $putSavezaReturnStableCount = 0
+            $putSavezaReturnLastX = $null
+            $putSavezaReturnLastY = $null
             Start-Sleep -Milliseconds 100
             continue
         }
 
-        $topElevenMainActive = Test-TopElevenReturnedAfterAd $Handle $adStartedAt
-        $currentForeground = Get-BlueStacksForegroundState
-        $currentIsMainActivity = $null -ne $currentForeground -and
-            $currentForeground.Package -eq 'eu.nordeus.topeleven.android' -and
-            $currentForeground.Activity -eq 'eu.nordeus.common.MainPlayerNativeActivity'
-        $currentForegroundIsFresh = $null -ne $currentForeground -and
-            $null -ne $currentForeground.EventTime -and
-            $currentForeground.EventTime -ge $adStartedAt.AddSeconds(-1)
-        $currentShowsAdOrExternal = $currentForegroundIsFresh -and (
-            $currentForeground.Package -eq 'com.android.vending' -or
-            $currentForeground.Package -eq 'com.android.chrome' -or
-            ($currentForeground.Package -eq 'eu.nordeus.topeleven.android' -and
-                $currentForeground.Activity -ne 'eu.nordeus.common.MainPlayerNativeActivity')
-        )
+        # Dva odvojena lokalna manual_3 framea predaju tok obradi prirucnika.
+        if ($ReturnFlow -eq 'tv' -and
+            $ManualReward -and
+            $adObserved -and
+            ($aiAdVisuallyObserved -or $externalDepartureObserved) -and
+            ((Get-Date) - $adStartedAt).TotalSeconds -ge 3) {
+            $manualReturn = Get-TVFlowSnapshot $Handle
+            if ([string]$manualReturn.state -eq 'manual_3') {
+                $tvManualReturnStableCount++
+                if ($tvManualReturnStableCount -eq 1) {
+                    Add-Log 'Ekran novog prirucnika je pronadjen nakon reklame; potvrdjujem na novom frameu...'
+                }
+                if ($tvManualReturnStableCount -ge 2) {
+                    Add-Log 'Povratak iz PRIRUCNIK reklame potvrdjen je preko stabilnog ekrana novog prirucnika.'
+                    return 'manual_3'
+                }
+                Wait-Agent 300
+                continue
+            }
+            $tvManualReturnStableCount = 0
+        }
+
+        # Dva TV framea potvrdjuju obicnu nagradu; PRIRUCNIK trazi manual_3.
+        if ($ReturnFlow -eq 'tv' -and
+            -not $ManualReward -and
+            $adObserved -and
+            ($aiAdVisuallyObserved -or $externalDepartureObserved) -and
+            ((Get-Date) - $adStartedAt).TotalSeconds -ge 3) {
+            $tvReturn = Get-TVFlowSnapshot $Handle
+            if ([string]$tvReturn.state -eq 'tv') {
+                $tvReturnStableCount++
+                if ($tvReturnStableCount -eq 1) {
+                    Add-Log 'Top Eleven TV ekran je pronadjen nakon reklame; potvrdjujem na novom frameu...'
+                }
+                if ($tvReturnStableCount -ge 2) {
+                    Add-Log 'Povratak iz TV reklame potvrdjen je preko dva stabilna lokalna TV framea.'
+                    return 'tv'
+                }
+                Wait-Agent 300
+                continue
+            }
+            $tvReturnStableCount = 0
+        }
+
+        if ($ReturnFlow -eq 'campus' -and $adObserved -and
+            ($aiAdVisuallyObserved -or $externalDepartureObserved) -and
+            ((Get-Date) - $adStartedAt).TotalSeconds -ge 3) {
+            $campusReturn = Get-CampusFlowSnapshot $Handle
+            if ($campusReturn.state -eq 'campus_detail' -and $campusReturn.objectStrip.verified) {
+                $campusReturnStableCount++
+                if ($campusReturnStableCount -ge 2) {
+                    Add-Log 'Kampus detalj i traka objekata potvrdjeni su na dva svjeza framea.'
+                    return 'top_eleven'
+                }
+                Wait-Agent 300
+                continue
+            }
+            $campusReturnStableCount = 0
+        }
+
+        # Put saveza zahtijeva dva framea istog path modala nakon reklame.
+        if ($ReturnFlow -eq 'put_saveza' -and
+            $adObserved -and
+            ($aiAdVisuallyObserved -or $externalDepartureObserved) -and
+            ((Get-Date) - $adStartedAt).TotalSeconds -ge 3) {
+            $putSavezaReturn = Get-PutSavezaFlowSnapshot $Handle
+            if ([string]$putSavezaReturn.state -eq 'path' -and
+                $null -ne $putSavezaReturn.closeButton) {
+                $returnX = [double]$putSavezaReturn.closeButton.x
+                $returnY = [double]$putSavezaReturn.closeButton.y
+                $sameReturnX = $null -ne $putSavezaReturnLastX -and
+                    [Math]::Abs($returnX - [double]$putSavezaReturnLastX) -le 0.012 -and
+                    [Math]::Abs($returnY - [double]$putSavezaReturnLastY) -le 0.012
+                $putSavezaReturnStableCount = if ($sameReturnX) { $putSavezaReturnStableCount + 1 } else { 1 }
+                $putSavezaReturnLastX = $returnX
+                $putSavezaReturnLastY = $returnY
+                if ($putSavezaReturnStableCount -eq 1) {
+                    Add-Log 'Put saveza modal je pronadjen nakon reklame; potvrdjujem njegov X na novom frameu...'
+                }
+                if ($putSavezaReturnStableCount -ge 2) {
+                    Add-Log 'Povratak iz Put saveza reklame potvrdjen je preko dva stabilna path modala.'
+                    return 'top_eleven'
+                }
+                Wait-Agent 300
+                continue
+            }
+            $putSavezaReturnStableCount = 0
+            $putSavezaReturnLastX = $null
+            $putSavezaReturnLastY = $null
+        }
+
+        # Profil igraca potvrdi s dva lokalna framea nakon opazene reklame.
+        if ($ReturnFlow -eq 'training_player' -and
+            $adObserved -and
+            ($aiAdVisuallyObserved -or $externalDepartureObserved) -and
+            ((Get-Date) - $adStartedAt).TotalSeconds -ge 3) {
+            $trainingReturn = Get-TrainingPlayerFlowSnapshot $Handle
+            if ([string]$trainingReturn.state -eq 'player_detail' -and
+                [bool]$trainingReturn.profileVerified) {
+                $trainingPlayerReturnStableCount++
+                if ($trainingPlayerReturnStableCount -eq 1) {
+                    Add-Log 'Profil igraca je pronadjen nakon reklame; potvrdjujem na novom frameu...'
+                }
+                if ($trainingPlayerReturnStableCount -ge 2) {
+                    Add-Log 'Povratak iz Trening igraca reklame potvrdjen je preko stabilnog profila igraca.'
+                    return 'top_eleven'
+                }
+                Wait-Agent 300
+                continue
+            }
+            $trainingPlayerReturnStableCount = 0
+        }
+
+        $topElevenMainActive = Test-TopElevenReturnedAfterAd $Handle $adStartedAt -ForceRefresh
         if ($ReturnFlow -ne 'tv') {
             if ($topElevenMainActive) {
                 if ($adObserved -and ((Get-Date) - $adStartedAt).TotalSeconds -ge 3) {
                     $appReturnStableCount++
                     if ($appReturnStableCount -eq 1) {
-                        Add-Log 'Top Eleven glavna Android aktivnost je pronadjena; potvrdjujem povratak...'
+                        Add-Log 'Top Eleven ekran je vizuelno prepoznat; potvrdjujem povratak...'
                     }
                     if ($appReturnStableCount -ge 3) {
-                        Add-Log 'Povratak u Top Eleven potvrdjen je preko MainPlayerNativeActivity.'
+                        Add-Log 'Povratak u Top Eleven potvrdjen je preko vizuelnog ekrana igre.'
                         return 'top_eleven'
                     }
+                    # Ne padaj do wake klika dok je povratak kandidat. Sljedeca
+                    # potvrda mora biti novi frame udaljen najmanje 300 ms.
+                    Wait-Agent 300
+                    continue
                 }
             }
             else {
                 $appReturnStableCount = 0
-                if ($currentShowsAdOrExternal) { $adObserved = $true }
             }
         }
         else {
             if (-not $topElevenMainActive) {
-                if ($currentShowsAdOrExternal) { $adObserved = $true }
             }
             elseif ($adObserved) {
                 # OpenCV se ovdje koristi samo za razlikovanje internih TV/prirucnik
@@ -2226,18 +2787,29 @@ function Watch-TVAdvertisement {
                     Add-Log 'Povratak iz reklame na Top Eleven TV je potvrdjen.'
                     return 'tv'
                 }
+                Wait-Agent 300
+                continue
             }
         }
 
-        if ((Get-Date) -ge $nextAdWakeTapAt -and $adWakeTapCount -lt $script:AdWakeTapMaximum) {
-            $adWakeTapCount++
-            Set-Status "$flowLabel reklama dugo traje - dodirujem ekran da ponovo prikazem kratku kontrolu..." ([System.Drawing.Color]::FromArgb(255, 210, 100))
-            Click-Relative $Handle 0.500 0.620 "$flowLabel reklama - probudi skrivenu kontrolu"
-            $adWakeBurstUntil = (Get-Date).AddSeconds($script:AdWakeBurstSeconds)
-            $nextAdWakeTapAt = (Get-Date).AddSeconds($script:AdWakeTapIntervalSeconds)
-            $script:VisionCacheByState.Remove($aiExpectedState)
-            $nextAiProbeAt = Get-Date
-            Add-Log "Wake provjera $adWakeTapCount/$script:AdWakeTapMaximum`: AI provjera krece odmah."
+        if ((Get-Date) -ge $nextAdWakeTapAt -and
+            (Get-Date) -ge $nextPreClickAiAllowedAt -and
+            $adWakeTapCount -lt $script:AdWakeTapMaximum) {
+            if (-not (Test-AdWakeTapAllowed $Handle $adStartedAt "$flowLabel reklama")) {
+                $nextAdWakeTapAt = (Get-Date).AddSeconds($script:AdWakeTapIntervalSeconds)
+                $nextAiProbeAt = Get-Date
+                $reuseWakeAnalysis = $true
+            }
+            else {
+                $adWakeTapCount++
+                Set-Status "$flowLabel reklama dugo traje - dodirujem ekran da ponovo prikazem kratku kontrolu..." ([System.Drawing.Color]::FromArgb(255, 210, 100))
+                Click-Relative $Handle 0.500 0.620 "$flowLabel reklama - probudi skrivenu kontrolu"
+                $adWakeBurstUntil = (Get-Date).AddSeconds($script:AdWakeBurstSeconds)
+                $nextAdWakeTapAt = (Get-Date).AddSeconds($script:AdWakeTapIntervalSeconds)
+                $script:VisionCacheByState.Remove($aiExpectedState)
+                $nextAiProbeAt = Get-Date
+                Add-Log "Wake provjera $adWakeTapCount/$script:AdWakeTapMaximum`: AI provjera krece odmah."
+            }
         }
         $wakeBurstActive = $null -ne $adWakeBurstUntil -and (Get-Date) -lt $adWakeBurstUntil
         $aiOnlyFallbackActive = $false
@@ -2249,8 +2821,13 @@ function Watch-TVAdvertisement {
         if ($script:VisionEnabled -and (Get-Date) -ge $nextAiProbeAt) {
             $nextAiProbeAt = (Get-Date).AddSeconds($script:VisionAiProbeIntervalSeconds)
             Add-Log "AI periodicna provjera $flowLabel reklame..."
-            $aiControlReady = Test-AiOnlyAdControlReady $Handle $aiExpectedState
-            if ($script:AiAdVisible) { $adObserved = $true }
+            $aiControlReady = if ($reuseWakeAnalysis) {
+                $null -ne $script:DetectedAdCloseX -and $null -ne $script:DetectedAdCloseY
+            } else { Test-AiOnlyAdControlReady $Handle $aiExpectedState }
+            if ($script:AiAdVisible) {
+                $adObserved = $true
+                $aiAdVisuallyObserved = $true
+            }
             if ($script:AiTopElevenReturned -and $adObserved) {
                 if ($ReturnFlow -ne 'tv') {
                     Add-Log "Povratak iz $flowLabel reklame potvrden je AI analizom Top Eleven zaglavlja."
@@ -2277,7 +2854,7 @@ function Watch-TVAdvertisement {
             if ($aiControlReady) {
                 $kind = $script:DetectedAdCloseKind
                 if ($kind -eq 'close') {
-                    $preClickState = Confirm-AiAdCloseImmediatelyBeforeClick $Handle "$flowLabel reklama"
+                    $preClickState = Confirm-AiAdCloseImmediatelyBeforeClick $Handle "$flowLabel reklama" $adStartedAt
                     if ($preClickState -eq 'returned') {
                         if ($ReturnFlow -ne 'tv') { return 'top_eleven' }
                         $returnedFlow = Get-TVFlowSnapshot $Handle
@@ -2286,7 +2863,10 @@ function Watch-TVAdvertisement {
                         continue
                     }
                     if ($preClickState -ne 'close') {
-                        $nextAiProbeAt = Get-Date
+                        $preClickRetrySeconds = Get-AiPreClickRetryIntervalSeconds
+                        $nextPreClickAiAllowedAt = (Get-Date).AddSeconds($preClickRetrySeconds)
+                        $nextAiProbeAt = $nextPreClickAiAllowedAt
+                        Add-Log ("Sljedeca $flowLabel AI provjera nakon nestabilnog X-a je za {0:N1}s." -f $preClickRetrySeconds)
                         continue
                     }
                 }
@@ -2344,7 +2924,10 @@ function Watch-TVAdvertisement {
         Start-Sleep -Milliseconds 100
     }
 
-    throw "$flowLabel reklama nije zavrsena u roku od 5 minuta."
+    if (-not $adObserved) {
+        throw "$flowLabel reklamni ekran nije nikada potvrden; ostajem bez force-stop recoveryja."
+    }
+    throw (New-AgentFailure 'AdTimeout' "$flowLabel reklama nije zavrsena u roku od 5 minuta.")
 }
 
 function Complete-TVManualReward {
@@ -2438,6 +3021,7 @@ function Run-TVAutomation {
         else {
             Wait-TVFlowState $Handle @('tv') 20 | Out-Null
         }
+        Set-AgentCheckpointStep 'tv_reward_return_confirmed'
         Wait-Agent $script:TVClickBufferMs
     }
 
@@ -2455,7 +3039,7 @@ function Get-MourinhoFlowSnapshot {
     } | ConvertTo-Json -Compress
     $script:XDetectorProcess.StandardInput.WriteLine($request)
     $script:XDetectorProcess.StandardInput.Flush()
-    return ($script:XDetectorProcess.StandardOutput.ReadLine() | ConvertFrom-Json)
+    return (Read-AgentProcessLine $script:XDetectorProcess 'Mourinho flow recognizer' $script:XDetectorResponseTimeoutSeconds | ConvertFrom-Json)
 }
 
 function Wait-MourinhoFlowState {
@@ -2484,12 +3068,19 @@ function Run-MourinhoAutomation {
 
     Set-Status 'AI trazi kvadratno dugme desno od readiness progress bara...'
     $warningTarget = $null
-    for ($attempt = 1; $attempt -le 3 -and $null -eq $warningTarget; $attempt++) {
+    $warningDeadline = (Get-Date).AddSeconds($script:AiSoftRetryTimeoutSeconds)
+    $attempt = 0
+    while ($null -eq $warningTarget -and (Get-Date) -lt $warningDeadline) {
         Test-Cancelled
-        Add-Log "Saljem AI-u sliku za Mourinho dugme (pokusaj $attempt/3)..."
+        $attempt++
+        Add-Log "Saljem AI-u svjezu sliku za Mourinho dugme (soft provjera $attempt)..."
         $warningTarget = Get-AiMourinhoWarning $Handle
-        if ($null -eq $warningTarget -and $attempt -lt 3) {
-            Wait-Agent 3000
+        if ($null -eq $warningTarget) {
+            if (Try-RecoverConnectionInterruptedPopup $Handle) {
+                Add-Log 'Popup je uklonjen tokom trazenja Mourinho dugmeta; ostajem na istom koraku.'
+            }
+            Set-Status "AI jos nije potvrdio Mourinho dugme; igra ostaje otvorena i provjera se ponavlja za $script:AiSoftRetryIntervalSeconds s..." ([System.Drawing.Color]::FromArgb(255, 210, 100))
+            Wait-Agent ($script:AiSoftRetryIntervalSeconds * 1000)
         }
     }
     if ($null -eq $warningTarget) {
@@ -2539,7 +3130,7 @@ function Get-PutSavezaFlowSnapshot {
     } | ConvertTo-Json -Compress
     $script:XDetectorProcess.StandardInput.WriteLine($request)
     $script:XDetectorProcess.StandardInput.Flush()
-    return ($script:XDetectorProcess.StandardOutput.ReadLine() | ConvertFrom-Json)
+    return (Read-AgentProcessLine $script:XDetectorProcess 'Put saveza flow recognizer' $script:XDetectorResponseTimeoutSeconds | ConvertFrom-Json)
 }
 
 function Wait-PutSavezaFlowState {
@@ -2638,6 +3229,21 @@ function Find-SideMenuTarget {
         }
         if ($attempt -lt $MaximumScrollActions) {
             Scroll-SideMenu $Handle $Direction $ScrollStepsPerAction
+
+            # Jedan wheel korak je dovoljan za Savezi, ali red i OCR maska ne
+            # nastanu u istom frameu. Poslije skrola citaj nekoliko svjezih
+            # frameova bez dodatnog skrolanja i bez klika na staru koordinatu.
+            $settleDeadline = (Get-Date).AddSeconds(8)
+            while ((Get-Date) -lt $settleDeadline) {
+                Test-Cancelled
+                Wait-Agent 350
+                $settled = Get-PutSavezaFlowSnapshot $Handle
+                $settledTarget = $settled.$TargetProperty
+                if ([string]$settled.state -eq 'side_menu' -and $null -ne $settledTarget) {
+                    Add-Log "$Label je pronadjen nakon jednog skrola i osvjezavanja bocnog menija."
+                    return $settledTarget
+                }
+            }
         }
     }
     throw "$Label nije pronadjen u bocnom meniju nakon $MaximumScrollActions scroll akcija."
@@ -2843,8 +3449,10 @@ function Run-PutSavezaAutomation {
         Set-Status 'Plavo video dugme IDI je stabilno potvrdeno - pokrecem reklamu.' ([System.Drawing.Color]::FromArgb(120, 240, 150))
         Click-Relative $Handle ([double]$fresh.goButton.x) ([double]$fresh.goButton.y) 'Put saveza - plavi video IDI'
         Wait-Agent $script:TVClickBufferMs
-        Watch-TVAdvertisement $Handle $false 'put_saveza' | Out-Null
-
+        $putSavezaAdExit = Watch-TVAdvertisement $Handle $false 'put_saveza'
+        if ($putSavezaAdExit -ne 'top_eleven') {
+            throw "Put saveza reklama nije vratila potvrden path modal: $putSavezaAdExit"
+        }
         Set-Status 'Put saveza reklama je zavrsena - cekam modal i zatvaram ga tacnim X dugmetom.'
         Close-PutSavezaModal $Handle
         [System.Media.SystemSounds]::Exclamation.Play()
@@ -2880,7 +3488,20 @@ function Get-TrainingPlayerFlowSnapshot {
     } | ConvertTo-Json -Compress
     $script:XDetectorProcess.StandardInput.WriteLine($request)
     $script:XDetectorProcess.StandardInput.Flush()
-    return ($script:XDetectorProcess.StandardOutput.ReadLine() | ConvertFrom-Json)
+    return (Read-AgentProcessLine $script:XDetectorProcess 'Trening igraca flow recognizer' $script:XDetectorResponseTimeoutSeconds | ConvertFrom-Json)
+}
+
+function Test-TrainingPlayerPhaseStartReady {
+    param([IntPtr]$Handle)
+
+    $first = Get-TrainingPlayerFlowSnapshot $Handle
+    if ([string]$first.state -notin @('home', 'training_home')) { return $false }
+    Wait-Agent 300
+    $second = Get-TrainingPlayerFlowSnapshot $Handle
+    if ([string]$second.state -ne [string]$first.state) { return $false }
+
+    Add-Log ("Pocetak faze Trening igraca lokalno je potvrden s dva stabilna framea: {0}." -f [string]$second.state)
+    return $true
 }
 
 function Click-TrainingPlayerRelative {
@@ -2925,177 +3546,227 @@ function Wait-TrainingPlayerState {
     )
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $nextPopupCheckAt = (Get-Date).AddSeconds(5)
     while ((Get-Date) -lt $deadline) {
         Test-Cancelled
         $snapshot = Get-TrainingPlayerFlowSnapshot $Handle
         if ([string]$snapshot.state -in $ExpectedStates) { return $snapshot }
-        if (Try-RecoverConnectionInterruptedPopup $Handle) {
-            $deadline = (Get-Date).AddSeconds([Math]::Max($TimeoutSeconds, 45))
-            continue
+        if ((Get-Date) -ge $nextPopupCheckAt) {
+            $nextPopupCheckAt = (Get-Date).AddSeconds(12)
+            if (Try-RecoverConnectionInterruptedPopup $Handle) {
+                $deadline = (Get-Date).AddSeconds([Math]::Max($TimeoutSeconds, 45))
+                continue
+            }
         }
         Wait-Agent 300
     }
     throw "Trening igraca ekran nije prepoznat: $($ExpectedStates -join ', ')."
 }
 
+function Get-RewardOfferState {
+    param([IntPtr]$Handle, [ValidateSet('green_store', 'training_condition')][string]$Target)
+    Test-Cancelled
+    $expected = "reward_offer_$Target"
+    $script:VisionCacheByState.Remove($expected)
+    $vision = Invoke-VisionAnalysis $Handle $expected
+    Test-Cancelled
+    if ($null -eq $vision -or -not $vision.accepted) { return 'unknown' }
+    $text = [string]$vision.decision.visibleText
+    if ($text -cmatch "^TARGET:$Target; STATE:(ready|grey|limit|unknown); LABEL:") {
+        return [string]$Matches[1]
+    }
+    return 'unknown'
+}
+
+function Wait-RewardOfferState {
+    param([IntPtr]$Handle, [ValidateSet('green_store', 'training_condition')][string]$Target, [int]$TimeoutSeconds = 180, [scriptblock]$ReadyCheck = $null)
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $previous = 'unknown'
+    while ((Get-Date) -lt $deadline) {
+        Test-Cancelled
+        $state = Get-RewardOfferState $Handle $Target
+        if ($state -eq 'ready' -and ($null -eq $ReadyCheck -or (& $ReadyCheck))) { return 'ready' }
+        # Restart and successful completion require two independent fresh reads.
+        if ($state -in @('grey', 'limit') -and $state -eq $previous) {
+            Add-Log "Ponuda $Target je potvrdjena na dvije svjeze slike: $state."
+            return $state
+        }
+        $previous = $state
+        Add-Log "Ponuda $Target`: $state; cekam potvrdu teksta i boje (nestalo dugme nije dostignuto ogranicenje)."
+        Wait-Agent ([int]([Math]::Max(12, $script:VisionAiProbeIntervalSeconds) * 1000))
+    }
+    throw "Stanje ponude $Target nije pouzdano procitano; ogranicenje nije potvrdjeno i faza nije zavrsena."
+}
+
+function Wait-GreenRewardOffer {
+    param([IntPtr]$Handle)
+    while ($true) {
+        $state = Wait-RewardOfferState $Handle 'green_store' -ReadyCheck {
+            $null = Test-FreeButtonReady $Handle
+            Wait-Agent 300
+            return (Test-FreeButtonReady $Handle)
+        }
+        if ($state -eq 'limit') {
+            return [PSCustomObject]@{ State = 'limit'; Handle = $Handle }
+        }
+        if ($state -eq 'grey') {
+            Set-Status 'Sivo BESPLATNO za zelene: restartujem igru i ponovo otvaram prodavnicu.'
+            Wait-Agent 10000
+            $Handle = [IntPtr](Restart-TopElevenForStageRetry 'Sivo BESPLATNO - zeleni')
+            Open-Store $Handle
+            continue
+        }
+        # ReadyCheck already confirmed the current GREEN-resource click target.
+        return [PSCustomObject]@{ State = 'ready'; Handle = $Handle }
+    }
+}
+
 function Wait-TrainingFreeButton {
     param([IntPtr]$Handle, [int]$TimeoutSeconds = 120)
 
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    $stableCount = 0
-    $lastX = $null
-    $lastY = $null
-    while ((Get-Date) -lt $deadline) {
-        Test-Cancelled
-        $snapshot = Get-TrainingPlayerFlowSnapshot $Handle
-        if ([string]$snapshot.state -ne 'condition_modal') {
-            $stableCount = 0
-            Wait-Agent 300
-            continue
-        }
-        $button = $snapshot.freeButton
-        $same = $null -ne $button -and [bool]$button.ready -and
-            ($null -eq $lastX -or ([Math]::Abs(([double]$button.x) - $lastX) -le 0.015 -and
-            [Math]::Abs(([double]$button.y) - $lastY) -le 0.015))
-        if ($same) {
-            $stableCount++
-            $lastX = [double]$button.x
-            $lastY = [double]$button.y
-            if ($stableCount -ge 2) { return $button }
-        }
-        else {
-            $stableCount = 0
-            $lastX = $null
-            $lastY = $null
-        }
+    $buttonBox = @{ Value = $null }
+    $offerState = Wait-RewardOfferState $Handle 'training_condition' $TimeoutSeconds -ReadyCheck {
+        $buttonBox.Value = $null
+        $first = Get-TrainingPlayerFlowSnapshot $Handle
         Wait-Agent 400
+        $second = Get-TrainingPlayerFlowSnapshot $Handle
+        if ($first.state -ne 'condition_modal' -or $second.state -ne 'condition_modal' -or
+            -not $first.freeButton.ready -or -not $second.freeButton.ready) { return $false }
+        if ([Math]::Abs([double]$first.freeButton.x - [double]$second.freeButton.x) -gt .015 -or
+            [Math]::Abs([double]$first.freeButton.y - [double]$second.freeButton.y) -gt .015) { return $false }
+        $buttonBox.Value = $second.freeButton
+        return $true
     }
-    throw 'BESPLATNO za kondiciju nije postalo dostupno sa punim tekstom.'
+    if ($offerState -ne 'ready') {
+        return [PSCustomObject]@{ OfferState = $offerState; ready = $false }
+    }
+    return $buttonBox.Value
 }
 
 function Get-AiTrainingSetupCondition {
-    param([IntPtr]$Handle, [int]$RecoveryAttempt = 0)
+    param([IntPtr]$Handle)
 
+    $deadline = (Get-Date).AddSeconds($script:AiSoftRetryTimeoutSeconds)
+    $attempt = 0
     $expectedState = "training_setup_condition_$((Get-Date).Ticks)"
-    Set-Status 'AI cita stvarni FIT procenat sa ekrana pripreme treninga...'
-    [Win32Agent]::SetForegroundWindow($Handle) | Out-Null
-    Wait-Agent 150
-    $vision = Invoke-VisionAnalysis $Handle $expectedState
-    if ($null -eq $vision -or -not [bool]$vision.accepted -or
-        [string]$vision.decision.screenType -ne 'top_eleven') {
-        if ($RecoveryAttempt -lt 3 -and (Try-RecoverConnectionInterruptedPopup $Handle)) {
-            Add-Log 'Popup je uklonjen tokom FIT provjere; ponavljam citanje procenata.'
-            return Get-AiTrainingSetupCondition $Handle ($RecoveryAttempt + 1)
+    $script:VisionCacheByState.Remove($expectedState)
+    while ((Get-Date) -lt $deadline) {
+        Test-Cancelled
+        $attempt++
+        Set-Status 'AI cita stvarni FIT procenat sa ekrana pripreme treninga...'
+        [Win32Agent]::SetForegroundWindow($Handle) | Out-Null
+        Wait-Agent 150
+        $vision = Invoke-VisionAnalysis $Handle $expectedState
+        if ($null -ne $vision -and [bool]$vision.accepted -and
+            [string]$vision.decision.screenType -eq 'top_eleven') {
+            $action = [string]$vision.decision.recommendedAction
+            $visibleText = [string]$vision.decision.visibleText
+            if ($action -eq 'click_training_player' -and
+                $visibleText -match '^\s*CONDITION\s*:\s*(\d{1,3})\s*%\s*$') {
+                $condition = [int]$Matches[1]
+                if ($condition -lt 30 -and $null -ne $vision.decision.control.x -and
+                    $null -ne $vision.decision.control.y) {
+                    return [PSCustomObject]@{
+                        HasLow = $true
+                        Condition = $condition
+                        X = [double]$vision.decision.control.x
+                        Y = [double]$vision.decision.control.y
+                    }
+                }
+            }
+            elseif ($action -eq 'none' -and
+                $visibleText -match '^\s*LOWEST_CONDITION\s*:\s*(\d{1,3})\s*%\s*$') {
+                $condition = [int]$Matches[1]
+                if ($condition -ge 30 -and $condition -le 100) {
+                    return [PSCustomObject]@{ HasLow = $false; Condition = $condition; X = $null; Y = $null }
+                }
+            }
         }
-        throw 'AI nije pouzdano procitao FIT procente; trening nece biti pokrenut.'
+        if (Try-RecoverConnectionInterruptedPopup $Handle) {
+            Add-Log 'Popup je uklonjen tokom FIT provjere; ostajem na istom koraku.'
+        }
+        Add-Log "AI jos nije pouzdano procitao FIT procenat (soft provjera $attempt); ponavljam bez gasenja Top Elevena."
+        Set-Status "FIT jos nije potvrden; nova AI provjera za $script:AiSoftRetryIntervalSeconds s..." ([System.Drawing.Color]::FromArgb(255, 210, 100))
+        Wait-Agent ($script:AiSoftRetryIntervalSeconds * 1000)
     }
-
-    $action = [string]$vision.decision.recommendedAction
-    $visibleText = [string]$vision.decision.visibleText
-    if ($action -eq 'click_training_player' -and
-        $visibleText -match '^\s*CONDITION\s*:\s*(\d{1,3})\s*%\s*$') {
-        $condition = [int]$Matches[1]
-        if ($condition -ge 30 -or $null -eq $vision.decision.control.x -or
-            $null -eq $vision.decision.control.y) {
-            throw 'AI rezultat za igraca ispod 30% nije prosao sigurnosnu provjeru.'
-        }
-        return [PSCustomObject]@{
-            HasLow = $true
-            Condition = $condition
-            X = [double]$vision.decision.control.x
-            Y = [double]$vision.decision.control.y
-        }
-    }
-    if ($action -eq 'none' -and
-        $visibleText -match '^\s*LOWEST_CONDITION\s*:\s*(\d{1,3})\s*%\s*$') {
-        $condition = [int]$Matches[1]
-        if ($condition -lt 30 -or $condition -gt 100) {
-            throw 'AI procenat nije dovoljan za siguran pocetak treninga.'
-        }
-        return [PSCustomObject]@{ HasLow = $false; Condition = $condition; X = $null; Y = $null }
-    }
-    throw "AI nije vratio strogo citljiv FIT procenat: '$visibleText'."
+    throw "AI nije pouzdano procitao FIT procente tokom $script:AiSoftRetryTimeoutSeconds sekundi."
 }
 
 function Get-AiTrainingProfileCondition {
-    param([IntPtr]$Handle, [int]$RecoveryAttempt = 0)
+    param([IntPtr]$Handle)
 
+    $deadline = (Get-Date).AddSeconds($script:AiSoftRetryTimeoutSeconds)
+    $attempt = 0
     $expectedState = "training_profile_condition_$((Get-Date).Ticks)"
-    Set-Status 'AI cita stvarni procenat KONDICIJE igraca...'
-    [Win32Agent]::SetForegroundWindow($Handle) | Out-Null
-    Wait-Agent 150
-    $vision = Invoke-VisionAnalysis $Handle $expectedState
-    $visibleText = if ($null -ne $vision) { [string]$vision.decision.visibleText } else { '' }
-    if ($null -eq $vision -or -not [bool]$vision.accepted -or
-        [string]$vision.decision.screenType -ne 'top_eleven' -or
-        $visibleText -notmatch '^\s*CONDITION\s*:\s*(\d{1,3})\s*%\s*$') {
-        if ($RecoveryAttempt -lt 3 -and (Try-RecoverConnectionInterruptedPopup $Handle)) {
-            Add-Log 'Popup je uklonjen tokom provjere KONDICIJE; ponavljam citanje procenta.'
-            return Get-AiTrainingProfileCondition $Handle ($RecoveryAttempt + 1)
+    $script:VisionCacheByState.Remove($expectedState)
+    while ((Get-Date) -lt $deadline) {
+        Test-Cancelled
+        $attempt++
+        Set-Status 'AI cita stvarni procenat KONDICIJE igraca...'
+        [Win32Agent]::SetForegroundWindow($Handle) | Out-Null
+        Wait-Agent 150
+        $vision = Invoke-VisionAnalysis $Handle $expectedState
+        $visibleText = if ($null -ne $vision) { [string]$vision.decision.visibleText } else { '' }
+        if ($null -ne $vision -and [bool]$vision.accepted -and
+            [string]$vision.decision.screenType -eq 'top_eleven' -and
+            $visibleText -match '^\s*CONDITION\s*:\s*(\d{1,3})\s*%\s*$') {
+            $condition = [int]$Matches[1]
+            $action = [string]$vision.decision.recommendedAction
+            if ($condition -ge 0 -and $condition -lt 85 -and
+                $action -eq 'click_training_condition_plus' -and
+                $null -ne $vision.decision.control.x -and $null -ne $vision.decision.control.y) {
+                return [PSCustomObject]@{
+                    Condition = $condition
+                    HasPlus = $true
+                    X = [double]$vision.decision.control.x
+                    Y = [double]$vision.decision.control.y
+                }
+            }
+            if ($condition -ge 85 -and $condition -le 100 -and
+                $action -eq 'click_training_player_close' -and
+                $null -ne $vision.decision.control.x -and $null -ne $vision.decision.control.y) {
+                return [PSCustomObject]@{
+                    Condition = $condition
+                    HasPlus = $false
+                    X = [double]$vision.decision.control.x
+                    Y = [double]$vision.decision.control.y
+                }
+            }
         }
-        throw 'AI nije pouzdano procitao procenat KONDICIJE; ne klikcem naslijepo.'
-    }
-    $condition = [int]$Matches[1]
-    if ($condition -lt 0 -or $condition -gt 100) {
-        throw 'AI je vratio neispravan procenat KONDICIJE.'
-    }
-    $action = [string]$vision.decision.recommendedAction
-    if ($condition -lt 85) {
-        if ($action -ne 'click_training_condition_plus' -or
-            $null -eq $vision.decision.control.x -or $null -eq $vision.decision.control.y) {
-            throw 'AI nije locirao zeleni + u KONDICIJA panelu.'
+        if (Try-RecoverConnectionInterruptedPopup $Handle) {
+            Add-Log 'Popup je uklonjen tokom provjere KONDICIJE; ostajem na istom koraku.'
         }
-        return [PSCustomObject]@{
-            Condition = $condition
-            HasPlus = $true
-            X = [double]$vision.decision.control.x
-            Y = [double]$vision.decision.control.y
-        }
+        Add-Log "AI jos nije pouzdano procitao KONDICIJU ili odgovarajuce dugme (soft provjera $attempt); ponavljam bez gasenja igre."
+        Set-Status "KONDICIJA jos nije potvrdena; nova AI provjera za $script:AiSoftRetryIntervalSeconds s..." ([System.Drawing.Color]::FromArgb(255, 210, 100))
+        Wait-Agent ($script:AiSoftRetryIntervalSeconds * 1000)
     }
-    if ($action -ne 'click_training_player_close' -or
-        $null -eq $vision.decision.control.x -or $null -eq $vision.decision.control.y) {
-        throw 'AI je procitao najmanje 85%, ali nije locirao X profila igraca.'
-    }
-    return [PSCustomObject]@{
-        Condition = $condition
-        HasPlus = $false
-        X = [double]$vision.decision.control.x
-        Y = [double]$vision.decision.control.y
-    }
+    throw "AI nije pouzdano procitao KONDICIJU tokom $script:AiSoftRetryTimeoutSeconds sekundi."
 }
 
 function Restore-TrainingPlayerCondition {
     param([IntPtr]$Handle)
 
-    for ($reward = 1; $reward -le 20; $reward++) {
+    # Igrac se bira samo kada je AI na setup ekranu procitao manje od 30%.
+    # Svaki video oporavak dodaje 15%, zato su prva cetiri oporavka obavezna
+    # i nema smisla trositi AI poziv izmedju njih. Profil i stvarni zeleni
+    # KONDICIJA + ipak se lokalno pronalaze na svakom svjezem frameu; nema
+    # fiksne koordinate koja bi zavisila od profila ili rezolucije.
+
+    for ($reward = 1; $reward -le 4; $reward++) {
         Test-Cancelled
         $detail = Wait-TrainingPlayerState $Handle @('player_detail', 'condition_modal') 30
-        $profileDecision = Get-AiTrainingProfileCondition $Handle
-        $condition = [int]$profileDecision.Condition
-        Add-Log ("AI je procitao kondiciju igraca: {0}%." -f $condition)
-        if ($condition -ge 85) {
-            Add-Log ("Kondicija igraca je dostigla {0}% - zatvaram profil." -f $condition)
-            if ([string]$detail.state -eq 'condition_modal') {
-                Click-TrainingPlayerClose $Handle ([double]$detail.modalClose.x) ([double]$detail.modalClose.y) 'zatvori BESPLATNO modal'
-                $detail = Wait-TrainingPlayerState $Handle @('player_detail') 15
-            }
-            Click-TrainingPlayerClose $Handle ([double]$profileDecision.X) ([double]$profileDecision.Y) 'X - profil igraca nakon najmanje 85% kondicije - AI'
-            Wait-TrainingPlayerState $Handle @('setup') 25 | Out-Null
-            return
-        }
-
         if ([string]$detail.state -eq 'condition_modal') {
             Click-TrainingPlayerClose $Handle ([double]$detail.modalClose.x) ([double]$detail.modalClose.y) 'zatvori stari modal kondicije'
-            Wait-TrainingPlayerState $Handle @('player_detail') 15 | Out-Null
-            $detail = Get-TrainingPlayerFlowSnapshot $Handle
+            $detail = Wait-TrainingPlayerState $Handle @('player_detail') 15
         }
-        Set-Status ("AI je procitao {0}% kondicije - otvaram besplatni oporavak #{1}." -f $condition, $reward)
-        if (-not [bool]$profileDecision.HasPlus) {
-            throw 'AI nije potvrdio zeleni + za kondiciju.'
+        if ($null -eq $detail.conditionPlus) {
+            throw 'Lokalni verifier nije pronasao zeleni + za KONDICIJU na svjezem profilu; fiksna koordinata se nece kliknuti.'
         }
-        Click-TrainingPlayerRelative $Handle ([double]$profileDecision.X) ([double]$profileDecision.Y) 'zeleni + za kondiciju - AI'
-        Wait-TrainingPlayerState $Handle @('condition_modal') 20 | Out-Null
+        Set-Status ("Obavezni oporavak kondicije #{0}/4 bez AI provjere procenta." -f $reward)
+        Click-TrainingPlayerRelative $Handle ([double]$detail.conditionPlus.x) ([double]$detail.conditionPlus.y) 'zeleni + za kondiciju - lokalno pronadjen'
         $freeButton = Wait-TrainingFreeButton $Handle 120
+        if ($freeButton.OfferState -eq 'limit') { return 'limit_reached' }
+        if ($freeButton.OfferState -eq 'grey') { return 'restart_required' }
 
         # Posljednja svjeza provjera neposredno prije klika.
         $fresh = Get-TrainingPlayerFlowSnapshot $Handle
@@ -3104,10 +3775,55 @@ function Restore-TrainingPlayerCondition {
             continue
         }
         Click-TrainingPlayerRelative $Handle ([double]$fresh.freeButton.x) ([double]$fresh.freeButton.y) 'BESPLATNO - kondicija igraca'
-        Watch-TVAdvertisement $Handle $false 'training_player' | Out-Null
+        # Watch-TVAdvertisement za ovaj tok vraca rezultat tek nakon dva
+        # stabilna lokalna framea player_detail (ili pune opste potvrde igre).
+        # Vec potvrden profil ne prolazi kroz redundantnu drugu kapiju.
+        $trainingAdExit = Watch-TVAdvertisement $Handle $false 'training_player'
+        if ($trainingAdExit -ne 'top_eleven') {
+            throw "Trening igraca reklama nije vratila potvrden profil: $trainingAdExit"
+        }
         Wait-Agent $script:TransitionBufferMs
     }
-    throw 'Kondicija igraca nije dostigla 85% nakon 20 besplatnih oporavaka.'
+
+    # Tek poslije cetiri garantovana dizanja AI jednom cita stvarni procenat.
+    $detail = Wait-TrainingPlayerState $Handle @('player_detail', 'condition_modal') 30
+    if ([string]$detail.state -eq 'condition_modal') {
+        Click-TrainingPlayerClose $Handle ([double]$detail.modalClose.x) ([double]$detail.modalClose.y) 'zatvori BESPLATNO modal prije zavrsne AI provjere'
+        Wait-TrainingPlayerState $Handle @('player_detail') 15 | Out-Null
+    }
+    $profileDecision = Get-AiTrainingProfileCondition $Handle
+    $condition = [int]$profileDecision.Condition
+    Add-Log ("AI je nakon cetiri oporavka procitao kondiciju igraca: {0}%." -f $condition)
+    if ($condition -ge 85) {
+        Add-Log ("Kondicija igraca je dostigla {0}% - zatvaram profil." -f $condition)
+        Click-TrainingPlayerClose $Handle ([double]$profileDecision.X) ([double]$profileDecision.Y) 'X - profil igraca nakon najmanje 85% kondicije - AI'
+        Wait-TrainingPlayerState $Handle @('setup') 25 | Out-Null
+        return
+    }
+
+    if (-not [bool]$profileDecision.HasPlus) {
+        throw 'AI je procitao manje od 85%, ali nije potvrdio zeleni + za peti oporavak.'
+    }
+    Set-Status ("AI je nakon cetiri oporavka procitao {0}% - radim jos jedno dizanje kondicije." -f $condition)
+    Click-TrainingPlayerRelative $Handle ([double]$profileDecision.X) ([double]$profileDecision.Y) 'zeleni + za peti oporavak kondicije - AI'
+    $freeButton = Wait-TrainingFreeButton $Handle 120
+    if ($freeButton.OfferState -eq 'limit') { return 'limit_reached' }
+    if ($freeButton.OfferState -eq 'grey') { return 'restart_required' }
+    $fresh = Get-TrainingPlayerFlowSnapshot $Handle
+    if ([string]$fresh.state -ne 'condition_modal' -or $null -eq $fresh.freeButton -or -not [bool]$fresh.freeButton.ready) {
+        throw 'BESPLATNO za peti oporavak promijenilo se neposredno prije klika.'
+    }
+    Click-TrainingPlayerRelative $Handle ([double]$fresh.freeButton.x) ([double]$fresh.freeButton.y) 'BESPLATNO - peti oporavak kondicije igraca'
+    $trainingAdExit = Watch-TVAdvertisement $Handle $false 'training_player'
+    if ($trainingAdExit -ne 'top_eleven') {
+        throw "Peti Trening igraca oporavak nije vratio potvrden profil: $trainingAdExit"
+    }
+    Wait-Agent $script:TransitionBufferMs
+
+    # Poslije dodatnog petog oporavka zatvori profil bez jos jednog AI poziva.
+    Wait-TrainingPlayerState $Handle @('player_detail') 30 | Out-Null
+    Send-Escape $Handle
+    Wait-TrainingPlayerState $Handle @('setup') 25 | Out-Null
 }
 
 function Run-TrainingPlayerAutomation {
@@ -3115,60 +3831,90 @@ function Run-TrainingPlayerAutomation {
 
     $formWasTopMost = $form.TopMost
     $form.TopMost = $false
+    $resumeConditionRecovery = $false
     try {
-        Set-Status 'Otvaram bocni meni za Trening igraca...'
-        [Win32Agent]::SetForegroundWindow($Handle) | Out-Null
-        Click-TrainingPlayerGameRelative $Handle 0.014 0.068 'bocni meni - Trening igraca'
-        Click-TrainingPlayerGameRelative $Handle 0.087 0.189 'Trening - bocni meni'
-        Wait-TrainingPlayerState $Handle @('training_home') 35 | Out-Null
-
-        for ($cycle = 1; $cycle -le 100; $cycle++) {
-            Test-Cancelled
-            Set-Status "Trening igraca - ciklus $cycle`: otvaram IZVJESTAJI."
-            $trainingHomeSnapshot = Get-TrainingPlayerFlowSnapshot $Handle
-            if ([string]$trainingHomeSnapshot.state -ne 'training_home' -or $null -eq $trainingHomeSnapshot.reportsButton) {
-                throw 'Dugme IZVJESTAJI nije dostupno na Trening ekranu.'
+        :trainingResume while ($true) {
+            [Win32Agent]::SetForegroundWindow($Handle) | Out-Null
+            $initialTrainingState = Get-TrainingPlayerFlowSnapshot $Handle
+            if ([string]$initialTrainingState.state -eq 'training_home') {
+                Set-Status 'Trening ekran je vec otvoren; nastavljam bez ponovnog klika na bocni meni.'
             }
-            Click-TrainingPlayerRelative $Handle ([double]$trainingHomeSnapshot.reportsButton.x) ([double]$trainingHomeSnapshot.reportsButton.y) 'IZVJESTAJI'
-            $reports = Wait-TrainingPlayerState $Handle @('reports') 25
-            Click-TrainingPlayerRelative $Handle ([double]$reports.repeatButton.x) ([double]$reports.repeatButton.y) 'PONOVI - najnoviji trening'
-            $setup = Wait-TrainingPlayerState $Handle @('setup') 25
+            else {
+                Set-Status 'Otvaram bocni meni za Trening igraca...'
+                Click-TrainingPlayerGameRelative $Handle 0.014 0.068 'bocni meni - Trening igraca'
+                Click-TrainingPlayerGameRelative $Handle 0.087 0.189 'Trening - bocni meni'
+                Wait-TrainingPlayerState $Handle @('training_home') 35 | Out-Null
+            }
 
-            for ($conditionPass = 1; $conditionPass -le 30; $conditionPass++) {
-                $conditionDecision = Get-AiTrainingSetupCondition $Handle
-                if (-not [bool]$conditionDecision.HasLow) {
-                    Add-Log ("AI je potvrdio da je najniza FIT kondicija {0}% i nijedan igrac nije ispod 30%." -f $conditionDecision.Condition)
-                    break
+            for ($cycle = (1 + [int]$script:Checkpoint.TrainingCycles); $cycle -le 100; $cycle++) {
+                Test-Cancelled
+                Set-Status "Trening igraca - ciklus $cycle`: otvaram IZVJESTAJI."
+                $trainingHomeSnapshot = Get-TrainingPlayerFlowSnapshot $Handle
+                if ([string]$trainingHomeSnapshot.state -ne 'training_home' -or $null -eq $trainingHomeSnapshot.reportsButton) {
+                    throw 'Dugme IZVJESTAJI nije dostupno na Trening ekranu.'
                 }
-                Add-Log ("AI je procitao igraca ispod 30% kondicije: {0}%." -f $conditionDecision.Condition)
-                Click-TrainingPlayerRelative $Handle ([double]$conditionDecision.X) ([double]$conditionDecision.Y) 'igrac ispod 30% kondicije - AI'
-                Wait-TrainingPlayerState $Handle @('player_detail') 20 | Out-Null
-                Restore-TrainingPlayerCondition $Handle
-                $setup = Wait-TrainingPlayerState $Handle @('setup') 20
-            }
+                Click-TrainingPlayerRelative $Handle ([double]$trainingHomeSnapshot.reportsButton.x) ([double]$trainingHomeSnapshot.reportsButton.y) 'IZVJESTAJI'
+                $reports = Wait-TrainingPlayerState $Handle @('reports') 25
+                Click-TrainingPlayerRelative $Handle ([double]$reports.repeatButton.x) ([double]$reports.repeatButton.y) 'PONOVI - najnoviji trening'
+                $setup = Wait-TrainingPlayerState $Handle @('setup') 25
 
-            # Obavezna svjeza provjera neposredno prije nepovratnog klika.
-            $setup = Get-TrainingPlayerFlowSnapshot $Handle
-            if ([string]$setup.state -ne 'setup') {
-                throw 'Ekran pripreme treninga se promijenio prije pokretanja.'
-            }
-            $freshConditionDecision = Get-AiTrainingSetupCondition $Handle
-            if ([bool]$freshConditionDecision.HasLow) {
-                throw ("Sigurnosna blokada: AI jos vidi igraca na {0}% kondicije." -f $freshConditionDecision.Condition)
-            }
+                $result = $null
+                for ($conditionPass = 1; $conditionPass -le 30; $conditionPass++) {
+                    $setup = Wait-TrainingPlayerState $Handle @('setup') 25
+                    if (-not $resumeConditionRecovery) {
+                        Set-Status "Pokrecem trening #$cycle; igra provjerava iscrpljenost."
+                        Click-Relative $Handle ([double]$setup.startButton.x) ([double]$setup.startButton.y) 'ZAPOCNI TRENING'
+                        Wait-Agent 1000
+                        $afterStart = Get-TrainingPlayerFlowSnapshot $Handle
+                        if ([string]$afterStart.state -notin @('exhausted_players', 'training_result')) {
+                            # Dodir u centru za preskakanje animacije treninga.
+                            Click-TrainingPlayerRelative $Handle 0.500 0.500 'Trening - jedan dodir nakon 1 sekunde'
+                            $afterStart = Wait-TrainingPlayerState $Handle @('training_result', 'exhausted_players') 180
+                        }
+                        if ([string]$afterStart.state -eq 'training_result') {
+                            $result = $afterStart
+                            break
+                        }
+                        Set-Status 'UMORNI IGRACI - zatvaram poruku i otvaram igraca za oporavak.'
+                        Click-TrainingPlayerClose $Handle ([double]$afterStart.closeButton.x) ([double]$afterStart.closeButton.y) 'X - UMORNI IGRACI'
+                        $setup = Wait-TrainingPlayerState $Handle @('setup') 25
+                    }
+                    # Nakon poruke UMORNI IGRACI setup sadrzi samo tog jednog
+                    # igraca u uvijek istoj prvoj traci. Lokalni setup verifier
+                    # je vec potvrdio ekran, pa nema potrebe trositi AI poziv
+                    # na citanje FIT procenta i ponovno trazenje istog reda.
+                    Add-Log 'UMORNI IGRACI je potvrdjen; otvaram jedini red igraca bez AI provjere FIT procenta.'
+                    Click-TrainingPlayerRelative $Handle 0.500 0.575 'umorni igrac - jedini red na setup ekranu'
+                    Wait-TrainingPlayerState $Handle @('player_detail') 20 | Out-Null
+                    $recoveryOutcome = Restore-TrainingPlayerCondition $Handle
+                    if ($recoveryOutcome -eq 'limit_reached') {
+                        Set-Status 'OGRAN. DOSTIGNUTO za besplatni oporavak: Trening igraca je zavrsen.' ([System.Drawing.Color]::FromArgb(120, 240, 150))
+                        return
+                    }
+                    if ($recoveryOutcome -eq 'restart_required') {
+                        Set-Status 'Sivo BESPLATNO za kondiciju: restart i povratak kroz IZVJESTAJI / PONOVI do igraca za oporavak.'
+                        Wait-Agent 10000
+                        $Handle = [IntPtr](Restart-TopElevenForStageRetry 'Sivo BESPLATNO - Trening igraca')
+                        $resumeConditionRecovery = $true
+                        continue trainingResume
+                    }
+                    $resumeConditionRecovery = $false
+                    $setup = Wait-TrainingPlayerState $Handle @('setup') 20
+                }
 
-            Set-Status "Kondicija je spremna - pokrecem trening #$cycle."
-            # Ovaj klik namjerno nema automatski 1.8s wrapper: nakon njega se
-            # ceka jednu sekundu pa se trening jednom neutralno dodirne.
-            Click-Relative $Handle ([double]$setup.startButton.x) ([double]$setup.startButton.y) 'ZAPOCNI TRENING'
-            Wait-Agent 1000
-            Click-TrainingPlayerRelative $Handle 0.500 0.720 'Trening - jedan dodir nakon 1 sekunde'
-            $result = Wait-TrainingPlayerState $Handle @('training_result') 180
-            Click-TrainingPlayerClose $Handle ([double]$result.closeButton.x) ([double]$result.closeButton.y) 'X - izvjestaj o treningu'
-            Wait-TrainingPlayerState $Handle @('training_home') 35 | Out-Null
-            Add-Log "Trening igraca #$cycle je zavrsen; pokrecem novi ciklus."
+                if ($null -eq $result) {
+                    throw 'Trening nije pokrenut nakon 30 pokusaja oporavka igraca.'
+                }
+                Click-TrainingPlayerClose $Handle ([double]$result.closeButton.x) ([double]$result.closeButton.y) 'X - izvjestaj o treningu'
+                Wait-TrainingPlayerState $Handle @('training_home') 35 | Out-Null
+                if ($null -ne $script:Checkpoint) {
+                    $script:Checkpoint.TrainingCycles = $cycle
+                    Set-AgentCheckpointStep "training_cycle_confirmed:$cycle"
+                }
+                Add-Log "Trening igraca #$cycle je zavrsen; pokrecem novi ciklus."
+            }
+            throw 'Dostignut je sigurnosni limit od 100 trening ciklusa.'
         }
-        throw 'Dostignut je sigurnosni limit od 100 trening ciklusa.'
     }
     finally {
         $form.TopMost = $formWasTopMost
@@ -3186,7 +3932,7 @@ function Get-CampusFlowSnapshot {
     } | ConvertTo-Json -Compress
     $script:XDetectorProcess.StandardInput.WriteLine($request)
     $script:XDetectorProcess.StandardInput.Flush()
-    return ($script:XDetectorProcess.StandardOutput.ReadLine() | ConvertFrom-Json)
+    return (Read-AgentProcessLine $script:XDetectorProcess 'Kampus flow recognizer' $script:XDetectorResponseTimeoutSeconds | ConvertFrom-Json)
 }
 
 function Wait-CampusFlowState {
@@ -3268,28 +4014,41 @@ function Get-AiCampusBuilding {
 function Get-AiCampusToolButton {
     param([IntPtr]$Handle)
 
-    $expectedState = "campus_tool_icon_$((Get-Date).Ticks)"
     $formWasTopMost = $form.TopMost
     $form.TopMost = $false
     try {
-        [Win32Agent]::SetForegroundWindow($Handle) | Out-Null
-        Wait-Agent 150
-        $vision = Invoke-VisionAnalysis $Handle $expectedState
-        if ($null -eq $vision -or -not [bool]$vision.accepted -or
-            [string]$vision.decision.screenType -ne 'top_eleven' -or
-            [string]$vision.decision.recommendedAction -ne 'click_campus_tool' -or
-            [string]$vision.decision.control.type -ne 'campus_tool' -or
-            $null -eq $vision.decision.control.x -or $null -eq $vision.decision.control.y) {
-            throw 'AI nije pouzdano pronasao lijevu Kampus ikonu alata.'
+        $deadline = (Get-Date).AddSeconds($script:AiSoftRetryTimeoutSeconds)
+        $attempt = 0
+        $expectedState = "campus_tool_icon_$((Get-Date).Ticks)"
+        $script:VisionCacheByState.Remove($expectedState)
+        while ((Get-Date) -lt $deadline) {
+            Test-Cancelled
+            $attempt++
+            [Win32Agent]::SetForegroundWindow($Handle) | Out-Null
+            Wait-Agent 150
+            $vision = Invoke-VisionAnalysis $Handle $expectedState
+            if ($null -ne $vision -and [bool]$vision.accepted -and
+                [string]$vision.decision.screenType -eq 'top_eleven' -and
+                [string]$vision.decision.recommendedAction -eq 'click_campus_tool' -and
+                [string]$vision.decision.control.type -eq 'campus_tool' -and
+                $null -ne $vision.decision.control.x -and $null -ne $vision.decision.control.y) {
+                $button = [PSCustomObject]@{
+                    x = [double]$vision.decision.control.x
+                    y = [double]$vision.decision.control.y
+                    confidence = [double]$vision.decision.control.confidence
+                }
+                Add-Log ("AI je pronasao Kampus ikonu alata: confidence={0:N2}, centar={1:N3},{2:N3}" -f
+                    $button.confidence, $button.x, $button.y)
+                return $button
+            }
+            if (Try-RecoverConnectionInterruptedPopup $Handle) {
+                Add-Log 'Popup je uklonjen tokom trazenja Kampus alata; ostajem na istom koraku.'
+            }
+            Add-Log "Kampus alat jos nije AI-potvrdjen (soft provjera $attempt); ponavljam bez gasenja igre."
+            Set-Status "AI jos trazi Kampus alat; nova provjera za $script:AiSoftRetryIntervalSeconds s..." ([System.Drawing.Color]::FromArgb(255, 210, 100))
+            Wait-Agent ($script:AiSoftRetryIntervalSeconds * 1000)
         }
-        $button = [PSCustomObject]@{
-            x = [double]$vision.decision.control.x
-            y = [double]$vision.decision.control.y
-            confidence = [double]$vision.decision.control.confidence
-        }
-        Add-Log ("AI je pronasao Kampus ikonu alata: confidence={0:N2}, centar={1:N3},{2:N3}" -f
-            $button.confidence, $button.x, $button.y)
-        return $button
+        throw "AI nije pronasao Kampus ikonu alata tokom $script:AiSoftRetryTimeoutSeconds sekundi."
     }
     finally {
         $form.TopMost = $formWasTopMost
@@ -3302,12 +4061,24 @@ function Resolve-AiCampusBuilding {
         [string]$ScanState
     )
 
-    $script:VisionCacheByState.Remove($ScanState)
-    for ($attempt = 1; $attempt -le 4; $attempt++) {
-        Add-Log "AI provjerava Kampus objekte ispod 100% (potvrda $attempt/4)..."
-        $candidate = Get-AiCampusBuilding $Handle $ScanState
+    $deadline = (Get-Date).AddSeconds($script:AiSoftRetryTimeoutSeconds)
+    $attempt = 0
+    # Zadrzi isti kljuc kroz soft retry petlju. Odluka da vise nema objekata
+    # ispod 100% namjerno trazi dvije uzastopne AI potvrde; novi kljuc pri
+    # svakom pozivu bi je zauvijek ostavio na 1/2.
+    $softScanState = "${ScanState}_soft"
+    $script:VisionCacheByState.Remove($softScanState)
+    while ((Get-Date) -lt $deadline) {
+        Test-Cancelled
+        $attempt++
+        Add-Log "AI provjerava Kampus objekte ispod 100% (soft provjera $attempt)..."
+        $candidate = Get-AiCampusBuilding $Handle $softScanState
         if ($candidate.Resolved) { return $candidate }
-        if ($attempt -lt 4) { Wait-Agent 2200 }
+        if (Try-RecoverConnectionInterruptedPopup $Handle) {
+            Add-Log 'Popup je uklonjen tokom Kampus skeniranja; ostajem na istom koraku.'
+        }
+        Set-Status "Kampus kandidat jos nije sigurno potvrden; nova AI provjera za $script:AiSoftRetryIntervalSeconds s bez restarta..." ([System.Drawing.Color]::FromArgb(255, 210, 100))
+        Wait-Agent ($script:AiSoftRetryIntervalSeconds * 1000)
     }
     return $null
 }
@@ -3483,6 +4254,129 @@ function Wait-CampusHundredButton {
     throw "Kampus dugme sa tekstom 100% nije postalo dostupno tokom $script:CampusHundredButtonWaitSeconds sekundi."
 }
 
+function Move-CampusObjectStrip {
+    param([IntPtr]$Handle, [bool]$TowardsRight = $true, [switch]$Alternative)
+
+    $before = Get-CampusFlowSnapshot $Handle
+    if (-not [bool]$before.objectStrip.verified) { throw 'Kampus traka nije potvrdena; povlacenje je odbijeno.' }
+    $rect = Get-WindowRectangle $Handle
+    $from = if ($TowardsRight) { 0.455 } else { 0.065 }
+    $to = if ($TowardsRight) { 0.065 } else { 0.455 }
+    $dragY = if ($Alternative) { .90 } else { .87 }
+    if ($Alternative) {
+        $from = if ($TowardsRight) { .43 } else { .08 }
+        $to = if ($TowardsRight) { .08 } else { .43 }
+    }
+    if (-not $script:DryRun) {
+        if (-not (Set-BlueStacksWindowForeground $Handle)) { throw (New-AgentFailure 'FocusLost' 'Kampus prozor nema potvrden fokus; povlacenje je odbijeno.') }
+        [Win32Agent]::SetCursorPos([int]($rect.Left + ($rect.Right - $rect.Left) * $from), [int]($rect.Top + ($rect.Bottom - $rect.Top) * $dragY)) | Out-Null
+        [Win32Agent]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
+        try {
+            for ($step = 1; $step -le 20; $step++) {
+                Test-Cancelled
+                $x = $from + ($to - $from) * $step / 20.0
+                [Win32Agent]::SetCursorPos([int]($rect.Left + ($rect.Right - $rect.Left) * $x), [int]($rect.Top + ($rect.Bottom - $rect.Top) * $dragY)) | Out-Null
+                Start-Sleep -Milliseconds $(if ($Alternative) { 60 } else { 30 })
+            }
+        }
+        finally { [Win32Agent]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero) }
+    }
+    Add-Log "Kampus: povlacim samo donju lijevu traku objekata (prema desnim objektima: $TowardsRight)."
+    Wait-Agent 1200
+    $after = Get-CampusFlowSnapshot $Handle
+    if (-not [bool]$after.objectStrip.verified) { throw 'Kampus traka je prekrivena ili nestala nakon povlacenja.' }
+    $difference = 0.0
+    for ($i = 0; $i -lt 256; $i++) {
+        $difference += [Math]::Abs([double]$before.objectStrip.fingerprint[$i] - [double]$after.objectStrip.fingerprint[$i])
+    }
+    return ($difference / 256.0 -gt 3.0)
+}
+
+function Move-CampusObjectStripChecked {
+    param([IntPtr]$Handle, [bool]$TowardsRight)
+    if (Move-CampusObjectStrip $Handle $TowardsRight) { return $true }
+    Add-Log 'Kampus povlacenje nije pomjerilo traku; probam drugi polozaj i sporiji potez.'
+    return (Move-CampusObjectStrip $Handle $TowardsRight -Alternative)
+}
+
+function Confirm-CampusStripBoundary {
+    param([IntPtr]$Handle, [bool]$TowardsRight)
+    $endpoint = Get-CampusFlowSnapshot $Handle
+    if (-not $endpoint.objectStrip.verified) { return $false }
+    # A stuck/unfocused drag cannot prove an edge. Require a reversible movement.
+    if (-not (Move-CampusObjectStripChecked $Handle (-not $TowardsRight))) { return $false }
+    if (-not (Move-CampusObjectStripChecked $Handle $TowardsRight)) { return $false }
+    $returned = Get-CampusFlowSnapshot $Handle
+    if (-not $returned.objectStrip.verified) { return $false }
+    $beforeCards = @($endpoint.objectStrip.cards)
+    $afterCards = @($returned.objectStrip.cards)
+    if ($beforeCards.Count -ne $afterCards.Count -or $beforeCards.Count -lt 2) { return $false }
+    for ($card = 0; $card -lt $beforeCards.Count; $card++) {
+        if ([Math]::Abs([double]$beforeCards[$card].x - [double]$afterCards[$card].x) -gt .012) { return $false }
+        $a = @($beforeCards[$card].identity); $b = @($afterCards[$card].identity)
+        if ($a.Count -ne 128 -or $b.Count -ne 128) { return $false }
+        $difference = 0.0
+        for ($pixel = 0; $pixel -lt 128; $pixel++) { $difference += [Math]::Abs([double]$a[$pixel] - [double]$b[$pixel]) }
+        if ($difference / 128 -gt 5) { return $false }
+    }
+    return $true
+}
+
+function Invoke-CampusStripMaintenance {
+    param([IntPtr]$Handle)
+
+    # Prvo dodji do lijevog kraja da pocetni AI izbor ne preskoci objekte.
+    $atStart = $false
+    for ($page = 0; $page -lt 8; $page++) {
+        if (-not (Move-CampusObjectStripChecked $Handle $false)) {
+            $atStart = Confirm-CampusStripBoundary $Handle $false
+            break
+        }
+    }
+    if (-not $atStart) { throw 'Lijevi kraj Kampus trake nije potvrden.' }
+    $watched = 0
+    $endChecks = 0
+    for ($scan = 0; $scan -lt 40; $scan++) {
+        Test-Cancelled
+        $snapshot = Get-CampusFlowSnapshot $Handle
+        if (-not [bool]$snapshot.objectStrip.verified) { throw 'Kampus traka nije jasno vidljiva; ne biram objekat.' }
+        $candidate = @($snapshot.objectStrip.cards | Where-Object { $_.incomplete } | Select-Object -First 1)
+        if ($candidate.Count -gt 0) {
+            if ($watched -ge 12) { throw 'Kampus sigurnosni limit od 12 reklama je dostignut.' }
+            $target = $candidate[0]
+            Wait-Agent 300
+            $fresh = Get-CampusFlowSnapshot $Handle
+            $confirmed = @($fresh.objectStrip.cards | Where-Object {
+                $_.incomplete -and [Math]::Abs([double]$_.x - [double]$target.x) -lt .012
+            })
+            if (-not $fresh.objectStrip.verified -or $confirmed.Count -ne 1) { continue }
+            Click-Relative $Handle ([double]$confirmed[0].x) ([double]$confirmed[0].y) 'Kampus - sljedeci objekat iz donje trake'
+            Wait-Agent $script:TVNavigationBufferMs
+            $hundredButton = Wait-CampusHundredButton $Handle
+            Click-Relative $Handle ([double]$hundredButton.x) ([double]$hundredButton.y) 'Kampus 100%'
+            Wait-Agent $script:TVClickBufferMs
+            Watch-TVAdvertisement $Handle $false 'campus' | Out-Null
+            Set-Status 'Kampus je vracen: cekam 5 sekundi da obavijest nestane i otkrije procente.'
+            Wait-Agent 5000
+            Wait-CampusFlowState $Handle @('campus_detail') 25 | Out-Null
+            Set-AgentCheckpointStep 'campus_return_confirmed'
+            $watched++
+            $endChecks = 0
+            continue
+        }
+        if (Move-CampusObjectStripChecked $Handle $true) { $endChecks = 0 }
+        else { $endChecks++ }
+        if ($endChecks -ge 2) {
+            if (-not (Confirm-CampusStripBoundary $Handle $true)) {
+                throw (New-AgentFailure 'CampusBoundaryUnknown' 'Kraj Kampus trake nije dokazan povratkom na iste kartice; ne proglasavam fazu zavrsenom.')
+            }
+            Set-Status "Kampus je zavrsen: $watched reklama; desni kraj trake potvrden, nema vidljivih objekata ispod 100%."
+            return
+        }
+    }
+    throw 'Kampus traka nije zavrsena u sigurnosnom broju provjera.'
+}
+
 function Run-CampusAutomation {
     param([IntPtr]$Handle)
 
@@ -3500,7 +4394,7 @@ function Run-CampusAutomation {
     Wait-Agent $script:TVNavigationBufferMs
     Wait-CampusFlowState $Handle @('campus_maintenance') 25 | Out-Null
 
-    for ($objectNumber = 1; $objectNumber -le 12; $objectNumber++) {
+    for ($objectNumber = 1; $objectNumber -le 1; $objectNumber++) {
         Test-Cancelled
         $formWasTopMost = $form.TopMost
         $form.TopMost = $false
@@ -3527,16 +4421,8 @@ function Run-CampusAutomation {
             $form.TopMost = $formWasTopMost
         }
 
-        $hundredButton = Wait-CampusHundredButton $Handle
-        Set-Status 'Dugme sa tekstom 100% je dostupno - pokrecem reklamu.' ([System.Drawing.Color]::FromArgb(120, 240, 150))
-        Click-Relative $Handle ([double]$hundredButton.x) ([double]$hundredButton.y) 'Kampus 100%'
-        Wait-Agent $script:TVClickBufferMs
-        Watch-TVAdvertisement $Handle $false 'campus' | Out-Null
-
-        Wait-Agent $script:TVClickBufferMs
-        Click-Relative $Handle 0.720 0.125 'Kampus crna zona ispod bustera - zatvori detalj'
-        Wait-Agent $script:TVNavigationBufferMs
-        Wait-CampusFlowState $Handle @('campus_maintenance') 25 | Out-Null
+        Invoke-CampusStripMaintenance $Handle
+        return
     }
 
     throw 'Kampus sigurnosni limit od 12 objekata je dostignut.'
@@ -3604,22 +4490,24 @@ function Restart-TopElevenForStageRetry {
     Stop-VisionAgent
     Stop-XDetector
     $script:VisionCacheByState.Clear()
-    $script:ForegroundStateCheckedAt = $null
-    $script:ForegroundStateCache = $null
     $script:VisionUnavailableUntil = [datetime]::MinValue
     $script:AiTopElevenReturned = $false
     $script:AiAdVisible = $false
     $script:DetectedAdCloseX = $null
     $script:DetectedAdCloseY = $null
     $script:DetectedAdCloseKind = $null
+    $script:DetectedAdCloseLocallyVerified = $false
     $script:DetectedPlayDestinationCloseX = $null
     $script:DetectedPlayDestinationCloseY = $null
     $script:DetectedFreeButtonX = $null
     $script:DetectedFreeButtonY = $null
     $script:FreeButtonStableCount = 0
     $script:FreeButtonStableSince = $null
+    $script:TopResourceSnapshotCheckedAt = [datetime]::MinValue
+    $script:TopResourceSnapshotCache = $null
+    $script:BlueStacksAdbSerial = $null
+    $script:BlueStacksAdbSerialCheckedAt = [datetime]::MinValue
     $script:LastGooglePlayClickAt = $null
-    $script:LastHandledGooglePlayEvent = $null
     $script:LastGooglePlayBackAt = $null
     $script:GooglePlayRestoreKey = $null
     $script:GooglePlayBackAttemptCount = 0
@@ -3667,15 +4555,16 @@ function Restart-TopElevenForStageRetry {
     $nextAiCheck = (Get-Date).AddSeconds(8)
     $nextPopupCheck = (Get-Date).AddSeconds(12)
     $stableHomeFrames = 0
-    $stableAiHomeFrames = 0
+    # Isti state kljuc mora prezivjeti sve recovery frameove. Tako i konfiguracije
+    # koje traze vise AI potvrda mogu napredovati umjesto da stalno krecu od 1/N.
+    $recoveryState = "stage_recovery_top_eleven_ai_only_$($launchedAt.Ticks)"
     while ((Get-Date) -lt $deadline) {
         Test-Cancelled
-        $activityReady = Test-TopElevenReturnedAfterAd $handle $launchedAt
-        $visualHomeReady = (Test-GameHomeLoaded $handle) -and (Test-ResourcePlusReady $handle)
-        if ($activityReady -and $visualHomeReady) {
+        $topElevenReady = Test-TopElevenReturnedAfterAd $handle $launchedAt -ForceRefresh
+        if ($topElevenReady) {
             $stableHomeFrames++
             if ($stableHomeFrames -ge 2) {
-                Add-Log 'Top Eleven je ponovo ucitan; Android aktivnost i dva stabilna pocetna framea su potvrdeni.'
+                Add-Log 'Top Eleven je ponovo ucitan; zaglavlje s resursima je potvrdeno na dva svjeza framea.'
                 Wait-Agent 1000
                 return $handle
             }
@@ -3683,27 +4572,21 @@ function Restart-TopElevenForStageRetry {
         else {
             $stableHomeFrames = 0
         }
-        if ($activityReady -and -not $visualHomeReady -and
-            $script:VisionEnabled -and (Get-Date) -ge $nextPopupCheck) {
+        if (-not $topElevenReady -and $script:VisionEnabled -and
+            (Get-Date) -ge $nextPopupCheck) {
             $popupHandled = Try-RecoverConnectionInterruptedPopup $handle
-            $stableHomeFrames = 0
-            $stableAiHomeFrames = 0
             $nextPopupCheck = (Get-Date).AddSeconds(15)
-            $nextAiCheck = (Get-Date).AddSeconds(10)
-            if ($popupHandled) { continue }
+            if ($popupHandled) {
+                $stableHomeFrames = 0
+                $nextAiCheck = Get-Date
+                continue
+            }
         }
         if ($script:VisionEnabled -and (Get-Date) -ge $nextAiCheck) {
-            $recoveryState = "stage_recovery_top_eleven_ai_only_$((Get-Date).Ticks)"
             Test-AiOnlyAdControlReady $handle $recoveryState -ForceRefresh | Out-Null
-            if ($activityReady -and $script:AiTopElevenReturned) {
-                $stableAiHomeFrames++
-                Add-Log "AI potvrda ponovo ucitanog Top Elevena: $stableAiHomeFrames/2."
-                if ($stableAiHomeFrames -ge 2) {
-                    return $handle
-                }
-            }
-            else {
-                $stableAiHomeFrames = 0
+            if ($script:AiTopElevenReturned) {
+                Add-Log 'Top Eleven je ponovo ucitan; AI je direktno potvrdio stvarno zaglavlje s resursima.'
+                return $handle
             }
             $nextAiCheck = (Get-Date).AddSeconds(10)
         }
@@ -3733,6 +4616,25 @@ function Invoke-VerifiedStageRecovery {
     throw $recoveryError
 }
 
+function New-AgentFailure {
+    param([string]$Kind, [string]$Message)
+    $failure = [System.InvalidOperationException]::new($Message)
+    $failure.Data['AgentFailureKind'] = $Kind
+    return $failure
+}
+
+function Test-StageFailureRequiresHardRecovery {
+    param([System.Exception]$Exception)
+    $current = $Exception
+    while ($null -ne $current) {
+        if ($current.Data.Contains('AgentFailureKind')) {
+            return [string]$current.Data['AgentFailureKind'] -in @('AdTimeout', 'AdCloseFailed', 'ExternalReturnTimeout')
+        }
+        $current = $current.InnerException
+    }
+    return $false
+}
+
 function Invoke-StageWithRecovery {
     param(
         [string]$Name,
@@ -3740,6 +4642,14 @@ function Invoke-StageWithRecovery {
         [scriptblock]$Action
     )
 
+    if ($null -ne $script:Checkpoint -and $Name -in @($script:Checkpoint.CompletedStages)) {
+        Add-Log "Nastavak: preskacem ranije zavrsenu fazu $Name."
+        return [PSCustomObject]@{ Success=$true; Handle=$Handle; Error=$null; Attempts=0; HardRecoveryRequired=$false }
+    }
+    if ($null -ne $script:Checkpoint) {
+        $script:Checkpoint.Stage = $Name
+        Set-AgentCheckpointStep 'phase_entered'
+    }
     $lastError = $null
     $attemptHandle = $Handle
     if ($script:StagePreflightRecoveryRequired) {
@@ -3752,7 +4662,7 @@ function Invoke-StageWithRecovery {
         catch {
             $lastError = $_.Exception
             Add-Log "Faza $Name nije pokrenuta jer verificirani pocetni ekran nije vracen: $($lastError.Message)"
-            return [PSCustomObject]@{ Success = $false; Handle = [IntPtr]::Zero; Error = $lastError; Attempts = 0 }
+            return [PSCustomObject]@{ Success = $false; Handle = [IntPtr]::Zero; Error = $lastError; Attempts = 0; HardRecoveryRequired = $true }
         }
     }
     for ($attempt = 1; $attempt -le $script:StageRetryAttempts; $attempt++) {
@@ -3761,18 +4671,34 @@ function Invoke-StageWithRecovery {
         try {
             $attemptHandle = Get-BlueStacksWindow -RequireConfiguredInstance
             if ($attemptHandle -eq [IntPtr]::Zero) { throw 'BlueStacks prozor nije pronadjen.' }
+            if ($script:ResumeNeedsPreparation) { $attemptHandle = Prepare-AgentResume $attemptHandle }
+            $phaseStartReady = $Name -eq 'Trening igraca' -and
+                (Test-TrainingPlayerPhaseStartReady $attemptHandle)
+            if (-not $phaseStartReady) {
+                Restore-ExternalNavigationBeforeGameAction $attemptHandle ("Pocetak faze {0}" -f $Name) 1.5 90 | Out-Null
+            }
             $null = & $Action $attemptHandle
+            if ($null -ne $script:Checkpoint) {
+                $script:Checkpoint.CompletedStages = @($script:Checkpoint.CompletedStages) + @($Name)
+                Set-AgentCheckpointStep 'phase_complete'
+            }
             Add-Log "===== FAZA ZAVRSENA: $Name ====="
-            return [PSCustomObject]@{ Success = $true; Handle = $attemptHandle; Error = $null; Attempts = $attempt }
+            return [PSCustomObject]@{ Success = $true; Handle = $attemptHandle; Error = $null; Attempts = $attempt; HardRecoveryRequired = $false }
         }
         catch [System.OperationCanceledException] {
             throw
         }
         catch {
             $lastError = $_.Exception
+            Save-AgentFailureEvidence $Name $lastError
             Add-Log "Faza $Name nije uspjela u pokusaju $attempt/$script:StageRetryAttempts: $($lastError.Message)"
+            $hardRecoveryRequired = Test-StageFailureRequiresHardRecovery $lastError
+            if (-not $hardRecoveryRequired) {
+                Add-Log "Ovo nije timeout zaglavljene reklame; Top Eleven ostaje otvoren i force-stop se nece raditi."
+                return [PSCustomObject]@{ Success = $false; Handle = $attemptHandle; Error = $lastError; Attempts = $attempt; HardRecoveryRequired = $false }
+            }
             if ($attempt -lt $script:StageRetryAttempts) {
-                Set-Status "Faza $Name nije uspjela - force-stop i ponovni pokusaj..." ([System.Drawing.Color]::FromArgb(255, 210, 100))
+                Set-Status "Reklama u fazi $Name je stvarno zaglavljena - force-stop i ponovni pokusaj..." ([System.Drawing.Color]::FromArgb(255, 210, 100))
                 try {
                     $attemptHandle = Invoke-VerifiedStageRecovery $Name
                 }
@@ -3780,12 +4706,12 @@ function Invoke-StageWithRecovery {
                 catch {
                     $lastError = $_.Exception
                     Add-Log "Faza $Name se nece pokretati na loading ili popup ekranu; sva tri recovery pokusaja su iscrpljena."
-                    return [PSCustomObject]@{ Success = $false; Handle = [IntPtr]::Zero; Error = $lastError; Attempts = $attempt }
+                    return [PSCustomObject]@{ Success = $false; Handle = [IntPtr]::Zero; Error = $lastError; Attempts = $attempt; HardRecoveryRequired = $true }
                 }
             }
         }
     }
-    return [PSCustomObject]@{ Success = $false; Handle = $attemptHandle; Error = $lastError; Attempts = $script:StageRetryAttempts }
+    return [PSCustomObject]@{ Success = $false; Handle = $attemptHandle; Error = $lastError; Attempts = $script:StageRetryAttempts; HardRecoveryRequired = $true }
 }
 
 function Invoke-CombinedStage {
@@ -3800,25 +4726,33 @@ function Invoke-CombinedStage {
     if ($result.Success) { return $true }
     $message = if ($null -ne $result.Error) { $result.Error.Message } else { 'nepoznata greska' }
     $script:HadStageFailures = $true
-    Add-Log "Faza $Name nije uspjela ni nakon $script:StageRetryAttempts pokusaja: $message"
-    Set-Status "Faza $Name nije uspjela nakon tri pokusaja - nastavljam na sljedecu fazu..." ([System.Drawing.Color]::FromArgb(255, 210, 100))
-    try {
-        # Posljednji neuspjeli pokusaj moze ostaviti proizvoljan ekran. Ocisti
-        # stanje prije sljedece kombinovane faze, ali ne pokreci opet ovu fazu.
-        Invoke-VerifiedStageRecovery "$Name - priprema sljedece faze" | Out-Null
-        $script:StagePreflightRecoveryRequired = $false
-    }
-    catch [System.OperationCanceledException] { throw }
-    catch {
-        $script:StagePreflightRecoveryRequired = $true
-        Add-Log "Zavrsni recovery prije sljedece faze nije uspio nakon tri pokusaja: $($_.Exception.Message)"
+    Add-Log "Faza $Name nije uspjela nakon $($result.Attempts) pokusaja: $message"
+    Set-Status "Faza $Name nije zavrsena - nastavljam na sljedecu fazu bez nepotrebnog gasenja igre..." ([System.Drawing.Color]::FromArgb(255, 210, 100))
+    if ([bool]$result.HardRecoveryRequired) {
+        try {
+            # Samo stvarno zaglavljena reklama opravdava potpuno ciscenje
+            # prije sljedece kombinovane faze.
+            Invoke-VerifiedStageRecovery "$Name - priprema sljedece faze" | Out-Null
+            $script:StagePreflightRecoveryRequired = $false
+        }
+        catch [System.OperationCanceledException] { throw }
+        catch {
+            $script:StagePreflightRecoveryRequired = $true
+            Add-Log "Zavrsni recovery prije sljedece faze nije uspio nakon tri pokusaja: $($_.Exception.Message)"
+        }
     }
     Wait-Agent 2000
     return $false
 }
 
+
 if ($SelfTest) {
+    $resolvedPython = try { Resolve-PythonRuntime } catch { $null }
+    $selfTestAdbSerial = Resolve-BlueStacksAdbSerial
     "BlueStacks executable: $(Test-Path -LiteralPath $script:BlueStacksExe)"
+    "BlueStacks ADB executable: $(Test-Path -LiteralPath $script:BlueStacksAdbExe)"
+    "BlueStacks ADB serial: $selfTestAdbSerial"
+    "Python runtime: $(-not [string]::IsNullOrWhiteSpace([string]$resolvedPython))"
     "Configured instance: $script:BlueStacksInstance"
     "Configured display name: $(Get-BlueStacksInstanceDisplayName)"
     "Top Eleven shortcut: $(Test-Path -LiteralPath $script:TopElevenShortcut)"
@@ -3844,12 +4778,57 @@ function Start-Automation {
     }
 
     try {
+        Enter-AgentInstanceMutex
+        $script:ErrorCaptureCount = 0
+        $script:LastEvidenceMessage = $null
+        Initialize-AgentCheckpoint ([bool]$Resume)
         Set-Status 'Koristim vec otvoreni Top Eleven i odmah pokrecem glavni dio...'
         $handle = Get-BlueStacksWindow -RequireConfiguredInstance
-        if ($handle -eq [IntPtr]::Zero) {
+        if ($handle -eq [IntPtr]::Zero -and $script:Mode -notin @('Start', 'Restart')) {
             throw 'Otvoreni BlueStacks prozor nije pronadjen.'
         }
-        [Win32Agent]::SetForegroundWindow($handle) | Out-Null
+        if ($script:Mode -eq 'Start') {
+            if ($handle -ne [IntPtr]::Zero) {
+                Set-BlueStacksWindowForeground $handle | Out-Null
+                Add-Log 'Top Eleven je vec otvoren; postojeca instanca nije restartovana.'
+                Set-Status 'Top Eleven je vec pokrenut.' ([System.Drawing.Color]::FromArgb(120, 240, 150))
+                return
+            }
+            Set-Status 'Pokrecem Top Eleven...'
+            $visionWasEnabled = $script:VisionEnabled
+            $script:VisionEnabled = $false
+            try {
+                $handle = [IntPtr](Restart-TopElevenForStageRetry 'Discord start')
+                Set-BlueStacksWindowForeground $handle | Out-Null
+                Add-Log 'Discord start je zavrsen: Top Eleven je otvoren i pocetni ekran je potvrden.'
+                Set-Status 'Top Eleven je uspjesno pokrenut.' ([System.Drawing.Color]::FromArgb(120, 240, 150))
+                return
+            }
+            finally {
+                $script:VisionEnabled = $visionWasEnabled
+            }
+        }
+        if ($script:Mode -eq 'Restart') {
+            Set-Status 'Potpuno gasim Top Eleven i ponovo ga pokrecem...'
+            $visionWasEnabled = $script:VisionEnabled
+            $script:VisionEnabled = $false
+            try {
+                $handle = [IntPtr](Restart-TopElevenForStageRetry 'Discord restart')
+                Set-BlueStacksWindowForeground $handle | Out-Null
+                Add-Log 'Discord restart je zavrsen: Top Eleven je ponovo otvoren i pocetni ekran je potvrden.'
+                Set-Status 'Top Eleven je uspjesno restartovan.' ([System.Drawing.Color]::FromArgb(120, 240, 150))
+                return
+            }
+            finally {
+                $script:VisionEnabled = $visionWasEnabled
+            }
+        }
+        if (Set-BlueStacksWindowForeground $handle) {
+            Add-Log 'BlueStacks prozor je prebacen u prvi plan.'
+        }
+        else {
+            Add-Log 'Windows nije potvrdio fokus BlueStacks prozora; automatizacija nastavlja uz direktnu kontrolu prozora.'
+        }
         if ($script:VisionEnabled) { Start-VisionAgent | Out-Null }
         Wait-Agent $script:ShortTransitionBufferMs
 
@@ -3891,27 +4870,27 @@ function Start-Automation {
         }
         elseif ($script:Mode -eq 'Mourinho') {
             $stageResult = Invoke-StageWithRecovery 'Mourinho' $handle { param($stageHandle) Run-MourinhoAutomation $stageHandle }
-            if (-not $stageResult.Success) { throw "Mourinho nije uspio nakon $script:StageRetryAttempts pokusaja: $($stageResult.Error.Message)" }
+            if (-not $stageResult.Success) { throw "Mourinho nije uspio nakon $($stageResult.Attempts) pokusaja: $($stageResult.Error.Message)" }
             return
         }
         elseif ($script:Mode -eq 'Kampus') {
             $stageResult = Invoke-StageWithRecovery 'Kampus' $handle { param($stageHandle) Run-CampusAutomation $stageHandle }
-            if (-not $stageResult.Success) { throw "Kampus nije uspio nakon $script:StageRetryAttempts pokusaja: $($stageResult.Error.Message)" }
+            if (-not $stageResult.Success) { throw "Kampus nije uspio nakon $($stageResult.Attempts) pokusaja: $($stageResult.Error.Message)" }
             return
         }
         elseif ($script:Mode -eq 'PutSaveza') {
             $stageResult = Invoke-StageWithRecovery 'Put saveza' $handle { param($stageHandle) Run-PutSavezaAutomation $stageHandle }
-            if (-not $stageResult.Success) { throw "Put saveza nije uspio nakon $script:StageRetryAttempts pokusaja: $($stageResult.Error.Message)" }
+            if (-not $stageResult.Success) { throw "Put saveza nije uspio nakon $($stageResult.Attempts) pokusaja: $($stageResult.Error.Message)" }
             return
         }
         elseif ($script:Mode -eq 'TreningIgraca') {
             $stageResult = Invoke-StageWithRecovery 'Trening igraca' $handle { param($stageHandle) Run-TrainingPlayerAutomation $stageHandle }
-            if (-not $stageResult.Success) { throw "Trening igraca nije uspio nakon $script:StageRetryAttempts pokusaja: $($stageResult.Error.Message)" }
+            if (-not $stageResult.Success) { throw "Trening igraca nije uspio nakon $($stageResult.Attempts) pokusaja: $($stageResult.Error.Message)" }
             return
         }
         elseif ($script:Mode -eq 'TV') {
             $stageResult = Invoke-StageWithRecovery 'Top Eleven TV' $handle { param($stageHandle) Run-TVAutomation $stageHandle }
-            if (-not $stageResult.Success) { throw "Top Eleven TV nije uspio nakon $script:StageRetryAttempts pokusaja: $($stageResult.Error.Message)" }
+            if (-not $stageResult.Success) { throw "Top Eleven TV nije uspio nakon $($stageResult.Attempts) pokusaja: $($stageResult.Error.Message)" }
             return
         }
         elseif ($script:Mode -eq 'OdmoriEkipu') {
@@ -3921,7 +4900,7 @@ function Start-Automation {
                 Open-TeamRest $handle
                 Run-TeamRestManualQueue $handle $script:TeamRestStartKey
             }
-            if (-not $stageResult.Success) { throw "Odmor igraca nije uspio nakon $script:StageRetryAttempts pokusaja: $($stageResult.Error.Message)" }
+            if (-not $stageResult.Success) { throw "Odmor igraca nije uspio nakon $($stageResult.Attempts) pokusaja: $($stageResult.Error.Message)" }
             return
         }
 
@@ -3931,26 +4910,53 @@ function Start-Automation {
             $handle = $stageHandle
             Open-Store $handle
 
-            # === GLAVNA PETLJA - ponavlja dok dugme BESPLATNO ne postane sivo ===
+            # Samo procitano ogranicenje zavrsava fazu; sivo BESPLATNO restartuje.
             $freeButtonDisabled = $false
             $totalAdsWatched = 0
 
         while (-not $freeButtonDisabled -and -not $script:Cancelled) {
-            Set-Status 'Cekam da dugme BESPLATNO postane dostupno...'
-            Wait-ForCondition 'aktivno dugme BESPLATNO' 90 {
-                Test-FreeButtonReady $handle
-            } | Out-Null
+            $offer = Wait-GreenRewardOffer $handle
+            $handle = [IntPtr]$offer.Handle
+            if ($offer.State -eq 'limit') {
+                $freeButtonDisabled = $true
+                Set-Status "OGRAN. DOSTIGNUTO za zelene: zavrseno. Pogledano u ovom pokretanju: $totalAdsWatched." ([System.Drawing.Color]::FromArgb(120, 240, 150))
+                break
+            }
 
             [Win32Agent]::SetForegroundWindow($handle) | Out-Null
-            Set-Status ("BESPLATNO je spremno - kliknem automatski. (reklama #{0})" -f ($totalAdsWatched + 1)) ([System.Drawing.Color]::FromArgb(120, 240, 150))
+            if ($null -eq $script:DetectedFreeButtonX -or $null -eq $script:DetectedFreeButtonY) {
+                throw 'BESPLATNO je bilo spremno, ali dinamicni centar dugmeta nije sacuvan.'
+            }
+            $stableFreeX = [double]$script:DetectedFreeButtonX
+            $stableFreeY = [double]$script:DetectedFreeButtonY
+            $freshFree = Get-TeamRestFreeButtonSnapshot $handle
+            $freshMatches = [bool]$freshFree.ready -and
+                [Math]::Abs(([double]$freshFree.x) - $stableFreeX) -le 0.01 -and
+                [Math]::Abs(([double]$freshFree.y) - $stableFreeY) -le 0.01
+            if (-not $freshMatches) {
+                Add-Log 'BESPLATNO se promijenilo neposredno prije klika; koordinata je odbacena i vracam se na cekanje.'
+                $script:DetectedFreeButtonX = $null
+                $script:DetectedFreeButtonY = $null
+                $script:FreeButtonStableCount = 0
+                $script:FreeButtonStableSince = $null
+                Wait-Agent 300
+                continue
+            }
 
-            if ($script:Mode -eq 'OdmoriEkipu') {
-                Click-GameRelative $handle 0.778 0.880 'BESPLATNO - odmor GK'
-            }
-            else {
-                Click-Relative $handle 0.890 0.245 'BESPLATNO'
-            }
+            Set-Status ("BESPLATNO je svjeze potvrdjeno - kliknem automatski. (reklama #{0})" -f ($totalAdsWatched + 1)) ([System.Drawing.Color]::FromArgb(120, 240, 150))
             $adStartedAt = Get-Date
+            Click-Relative $handle ([double]$freshFree.x) ([double]$freshFree.y) 'BESPLATNO - dinamicki centar'
+            $script:DetectedFreeButtonX = $null
+            $script:DetectedFreeButtonY = $null
+            $script:FreeButtonStableCount = 0
+            $script:FreeButtonStableSince = $null
+
+            $launchEvidence = Wait-TeamRestAdLaunchEvidence $handle $adStartedAt '25 zelenih'
+            if (-not [bool]$launchEvidence.Observed) {
+                Set-Status 'Pokretanje reklame nije svjeze potvrdjeno; ne ulazim u reklamni tok i vracam se cekanju BESPLATNO.' ([System.Drawing.Color]::FromArgb(255, 210, 100))
+                Wait-Agent 300
+                continue
+            }
 
             Set-Status ("Reklama je pokrenuta. Prva AI provjera dugmadi pocinje za {0:N1} sekundi..." -f $script:VisionAiProbeIntervalSeconds)
             $adCloseDeadline = (Get-Date).AddMinutes(5)
@@ -3968,13 +4974,14 @@ function Start-Automation {
             $xDetectionStarted = $false
             $adCloseReady = $false
             $adAlreadyExited = $false
-            $adObserved = $false
+            $adObserved = $true
             $nextAdWakeTapAt = $adStartedAt.AddSeconds($script:AdWakeTapAfterSeconds)
             $adWakeBurstUntil = $null
             $adWakeTapCount = 0
 
             while ((Get-Date) -lt $adCloseDeadline) {
                 Test-Cancelled
+                $reuseWakeAnalysis = $false
                 if (Restore-AdFromGooglePlay $handle $adStartedAt) {
                     $googlePlayBadgeClicked = $true
                     $adObserved = $true
@@ -3982,14 +4989,38 @@ function Start-Automation {
                     continue
                 }
                 if ((Get-Date) -ge $nextAdWakeTapAt -and $adWakeTapCount -lt $script:AdWakeTapMaximum) {
-                    $adWakeTapCount++
-                    Set-Status 'Reklama dugo traje - dodirujem ekran da ponovo prikazem kratku kontrolu...' ([System.Drawing.Color]::FromArgb(255, 210, 100))
-                    Click-Relative $handle 0.500 0.620 'reklama - probudi skrivenu kontrolu'
-                    $adWakeBurstUntil = (Get-Date).AddSeconds($script:AdWakeBurstSeconds)
-                    $nextAdWakeTapAt = (Get-Date).AddSeconds($script:AdWakeTapIntervalSeconds)
-                    $script:VisionCacheByState.Remove($aiOnlyExpectedState)
-                    $nextAiProbeAt = Get-Date
-                    Add-Log 'Wake provjera: AI provjera krece odmah.'
+                    if (-not (Test-AdWakeTapAllowed $handle $adStartedAt 'Reklama za 25 zelenih')) {
+                        if ($script:AiTopElevenReturned) {
+                            $adAlreadyExited = $true
+                            Add-Log 'Wake AI provjera je potvrdila povratak u Top Eleven; zavrsavam nadzor reklame.'
+                            break
+                        }
+                        # Wake provjera koristi isti AI + lokalni verifier kao
+                        # redovna provjera. Ako je upravo pronasla pravi X, ne
+                        # odbacuj taj svjezi rezultat kroz `continue`: predaj ga
+                        # postojecem sigurnom pre-click toku ispod petlje.
+                        if ($script:DetectedAdCloseKind -eq 'close' -and
+                            $null -ne $script:DetectedAdCloseX -and
+                            $null -ne $script:DetectedAdCloseY -and
+                            $script:DetectedAdCloseLocallyVerified) {
+                            Add-Log 'Wake provjera je pronasla i lokalno potvrdila X; odmah ga predajem sigurnom toku za zatvaranje reklame.'
+                            $adCloseReady = $true
+                            break
+                        }
+                        $nextAdWakeTapAt = (Get-Date).AddSeconds($script:AdWakeTapIntervalSeconds)
+                        $nextAiProbeAt = Get-Date
+                        $reuseWakeAnalysis = $true
+                    }
+                    else {
+                        $adWakeTapCount++
+                        Set-Status 'Reklama dugo traje - dodirujem ekran da ponovo prikazem kratku kontrolu...' ([System.Drawing.Color]::FromArgb(255, 210, 100))
+                        Click-Relative $handle 0.500 0.620 'reklama - probudi skrivenu kontrolu'
+                        $adWakeBurstUntil = (Get-Date).AddSeconds($script:AdWakeBurstSeconds)
+                        $nextAdWakeTapAt = (Get-Date).AddSeconds($script:AdWakeTapIntervalSeconds)
+                        $script:VisionCacheByState.Remove($aiOnlyExpectedState)
+                        $nextAiProbeAt = Get-Date
+                        Add-Log 'Wake provjera: AI provjera krece odmah.'
+                    }
                 }
                 $wakeBurstActive = $null -ne $adWakeBurstUntil -and (Get-Date) -lt $adWakeBurstUntil
                 $aiOnlyFallbackActive = $false
@@ -4002,7 +5033,9 @@ function Start-Automation {
                 if ($script:VisionEnabled -and (Get-Date) -ge $nextAiProbeAt) {
                     $nextAiProbeAt = (Get-Date).AddSeconds($script:VisionAiProbeIntervalSeconds)
                     Add-Log 'AI periodicna provjera kontrole...'
-                    $aiControlReady = Test-AiOnlyAdControlReady $handle $aiOnlyExpectedState
+                    $aiControlReady = if ($reuseWakeAnalysis) {
+                        $null -ne $script:DetectedAdCloseX -and $null -ne $script:DetectedAdCloseY
+                    } else { Test-AiOnlyAdControlReady $handle $aiOnlyExpectedState }
                     if ($script:AiAdVisible) { $adObserved = $true }
                     if ($script:AiTopElevenReturned -and $adObserved) {
                         $adAlreadyExited = $true
@@ -4098,7 +5131,10 @@ function Start-Automation {
             }
 
             if (-not $adCloseReady -and -not $adAlreadyExited) {
-                throw 'X nije prepoznat u roku od 5 minuta.'
+                if (-not $adObserved) {
+                    throw 'Reklamni ekran za 25 zelenih nije nikada potvrden; ostajem bez force-stop recoveryja.'
+                }
+                throw (New-AgentFailure 'AdTimeout' 'X nije prepoznat u roku od 5 minuta.')
             }
 
             $adClosed = $adAlreadyExited
@@ -4108,14 +5144,16 @@ function Start-Automation {
 
                 while ((Get-Date) -lt $adCloseDeadline -and -not $adClosed) {
                     Test-Cancelled
-                    $preClickState = Confirm-AiAdCloseImmediatelyBeforeClick $handle 'Reklama'
+                    $preClickState = Confirm-AiAdCloseImmediatelyBeforeClick $handle 'Reklama' $adStartedAt
                     if ($preClickState -eq 'returned') {
                         $adClosed = $true
                         break
                     }
                     if ($preClickState -ne 'close') {
                         Set-Status 'Reklama je jos pod nadzorom - cekam novu svjezu AI potvrdu X-a ili povratka...' ([System.Drawing.Color]::FromArgb(255, 210, 100))
-                        Wait-Agent 1000
+                        $preClickRetrySeconds = Get-AiPreClickRetryIntervalSeconds
+                        Add-Log ("Sljedeca pre-click AI provjera je za {0:N1}s." -f $preClickRetrySeconds)
+                        Wait-Agent ([int][Math]::Ceiling($preClickRetrySeconds * 1000.0))
                         continue
                     }
                     if ($null -eq $script:DetectedAdCloseX -or $null -eq $script:DetectedAdCloseY) {
@@ -4132,14 +5170,14 @@ function Start-Automation {
                             break
                         }
                         if (-not $xAfterStore) {
-                            throw 'Nakon povratka iz Google Play Storea X nije pronadjen.'
+                            throw (New-AgentFailure 'ExternalReturnTimeout' 'Nakon povratka iz Google Play Storea X nije pronadjen.')
                         }
                         continue
                     }
                     $exitState = Wait-ForAdExitOrControl $handle 10 $adStartedAt
                     if ($exitState -eq 'exited') {
                         $adClosed = $true
-                        Add-Log 'Top Eleven je potvrden Android aktivnoscu ili AI analizom nakon reklame.'
+                        Add-Log 'Top Eleven je potvrden vizuelnom provjerom nakon reklame.'
                         break
                     }
                     if ($exitState -eq 'control') {
@@ -4152,12 +5190,13 @@ function Start-Automation {
             }
 
             if ($adClosed) {
+                Restore-ExternalNavigationBeforeGameAction $handle 'Nastavak skripte 25 zelenih nakon reklame' 3 75 | Out-Null
                 $totalAdsWatched++
+                Set-AgentCheckpointStep 'green_ad_return_confirmed'
                 Add-Log "Reklama #$totalAdsWatched uspjesno zatvorena."
                 Wait-Agent $script:ShortTransitionBufferMs
 
-                # Provjeri je li dugme BESPLATNO postalo sivo (nedostupno)
-                # Nakon zatvaranja reklame, vrati se na ekran prodavnice
+                # Nakon reklame vrati prodavnicu; sljedeca iteracija cita tekst ponude.
                 Set-Status 'Provjeravam je li dugme BESPLATNO jos uvijek dostupno...'
                 
                 # Ponekad treba malo vremena da se prodavnica osvjezi
@@ -4175,31 +5214,12 @@ function Start-Automation {
                     }
                 }
 
-                # Provjeri je li dugme BESPLATNO jos uvijek aktivno
-                $stillAvailable = Test-FreeButtonReady $handle
-                
-                if (-not $stillAvailable) {
-                    $freeButtonDisabled = $true
-                    [System.Media.SystemSounds]::Exclamation.Play()
-                    Set-Status "Sve reklame su pogledane! Ukupno: $totalAdsWatched reklama." ([System.Drawing.Color]::FromArgb(120, 240, 150))
-                    if (-not $script:ExitAfterRun) {
-                        [System.Windows.Forms.MessageBox]::Show(
-                            $form,
-                            "Sve dostupne reklame su pogledane!`r`n`r`nUkupno pogledanih reklama: $totalAdsWatched",
-                            'Top Eleven Agent - zavrseno',
-                            [System.Windows.Forms.MessageBoxButtons]::OK,
-                            [System.Windows.Forms.MessageBoxIcon]::Information
-                        ) | Out-Null
-                    }
-                }
-                else {
-                    Set-Status "Reklama #$totalAdsWatched zatvorena. Cekam sljedecu..." ([System.Drawing.Color]::FromArgb(220, 235, 255))
-                    Wait-Agent $script:TransitionBufferMs
-                    # Nastavi petlju za sljedecu reklamu
-                }
+                # Na vrhu petlje razlikuj ready/grey/limit/unknown, nikad kraj zbog odsustva dugmeta.
+                Set-Status "Reklama #$totalAdsWatched zatvorena. Provjeravam sljedecu ponudu..." ([System.Drawing.Color]::FromArgb(220, 235, 255))
+                Wait-Agent $script:TransitionBufferMs
             }
             else {
-                throw 'Reklama nije automatski zavrsena niti je povratak u Top Eleven potvrdjen u roku od 5 minuta.'
+                throw (New-AgentFailure 'AdTimeout' 'Reklama nije automatski zavrsena niti je povratak u Top Eleven potvrdjen u roku od 5 minuta.')
             }
         }
 
@@ -4208,7 +5228,7 @@ function Start-Automation {
             }
         }
         if (-not $greenResult.Success) {
-            throw "Uzmi 25 zelenih nije uspio nakon $script:StageRetryAttempts pokusaja: $($greenResult.Error.Message)"
+            throw "Uzmi 25 zelenih nije uspio nakon $($greenResult.Attempts) pokusaja: $($greenResult.Error.Message)"
         }
     }
     catch [System.OperationCanceledException] {
@@ -4216,6 +5236,7 @@ function Start-Automation {
     }
     catch {
         $script:RunFailed = $true
+        if ($script:ErrorCaptureCount -eq 0) { Save-AgentFailureEvidence $script:Mode $_.Exception }
         Set-Status "Greska: $($_.Exception.Message)" ([System.Drawing.Color]::FromArgb(255, 120, 120))
         if (-not $script:ExitAfterRun) {
             [System.Windows.Forms.MessageBox]::Show($form, $_.Exception.Message, 'Top Eleven Agent - greska', 'OK', 'Error') | Out-Null
@@ -4224,6 +5245,7 @@ function Start-Automation {
     finally {
         Stop-VisionAgent
         Stop-XDetector
+        Exit-AgentInstanceMutex
         $script:Running = $false
         $startButton.Enabled = $true
         $stopButton.Enabled = $false
@@ -4249,6 +5271,8 @@ $form.Text = switch ($script:Mode) {
     'PutSaveza' { 'Top Eleven Put saveza AI Agent' }
     'TreningIgraca' { 'Top Eleven Trening igraca AI Agent' }
     'Sve' { 'Top Eleven Kompletni AI Agent' }
+    'Start' { 'Pokreni Top Eleven' }
+    'Restart' { 'Top Eleven Restart' }
     default { 'Top Eleven AI Vision Agent' }
 }
 $form.Size = New-Object System.Drawing.Size(470, $formHeight)
@@ -4276,6 +5300,8 @@ $title.Text = switch ($script:Mode) {
     'PutSaveza' { 'TOP ELEVEN PUT SAVEZA AI AGENT' }
     'TreningIgraca' { 'TOP ELEVEN TRENING IGRACA' }
     'Sve' { 'TOP ELEVEN KOMPLETNI AI AGENT' }
+    'Start' { 'POKRENI TOP ELEVEN' }
+    'Restart' { 'TOP ELEVEN RESTART' }
     default { 'TOP ELEVEN AI VISION AGENT' }
 }
 $title.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 16)

@@ -9,12 +9,16 @@ from __future__ import annotations
 
 import argparse
 import base64
+from collections import deque
+from contextlib import contextmanager
 import copy
 import io
 import json
 import math
 import os
+import queue
 import re
+import socket
 import sys
 import threading
 import time
@@ -33,6 +37,203 @@ for dependency_dir in (ROOT / "pydeps", ROOT.parent / "pydeps"):
         sys.path.insert(0, str(dependency_dir))
 
 from PIL import Image, ImageDraw, ImageGrab
+
+
+_ORIGINAL_SOCKET_GETADDRINFO = socket.getaddrinfo
+
+
+def gemini_ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    """Avoid Windows waiting on unreachable IPv6 routes for the Gemini host."""
+    normalized_host = host.decode("ascii", errors="ignore") if isinstance(host, bytes) else str(host)
+    if normalized_host.lower() == "generativelanguage.googleapis.com":
+        return _ORIGINAL_SOCKET_GETADDRINFO(
+            host, port, socket.AF_INET, type, proto, flags
+        )
+    return _ORIGINAL_SOCKET_GETADDRINFO(host, port, family, type, proto, flags)
+
+
+# VisionAgent is a dedicated child process. Filtering only the Gemini hostname
+# cannot affect Discord, BlueStacks, or other applications on the computer.
+socket.getaddrinfo = gemini_ipv4_getaddrinfo
+
+
+_GEMINI_REQUEST_TIMES: deque[float] = deque()
+_GEMINI_RATE_LOCK = threading.Lock()
+_GEMINI_ACTIVE_MODEL: str | None = None
+_GEMINI_ACTIVE_KEY_INDEX = 0
+_GEMINI_RATE_FILE = (
+    Path(os.environ.get("LOCALAPPDATA", str(ROOT)))
+    / "TopElevenAgent"
+    / "gemini-request-times.json"
+)
+_GEMINI_DIAGNOSTIC_FILE = _GEMINI_RATE_FILE.with_name("gemini-diagnostics.log")
+
+
+def log_gemini_event(config: dict[str, Any], message: str) -> None:
+    """Append operational metadata only; never keys, prompts, or image data."""
+    if not bool(config.get("diagnosticEvents", False)):
+        return
+    try:
+        _GEMINI_DIAGNOSTIC_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with _GEMINI_DIAGNOSTIC_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}\n")
+    except OSError:
+        pass
+
+
+@contextmanager
+def _gemini_interprocess_rate_lock():
+    """Serialize the shared sliding-window file across Manager/agent processes."""
+    lock_handle = None
+    locked = False
+    try:
+        _GEMINI_RATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        lock_handle = _GEMINI_RATE_FILE.with_suffix(".lock").open("a+b")
+        lock_handle.seek(0, os.SEEK_END)
+        if lock_handle.tell() == 0:
+            lock_handle.write(b"0")
+            lock_handle.flush()
+        lock_handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            while True:
+                try:
+                    msvcrt.locking(lock_handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    locked = True
+                    break
+                except OSError:
+                    time.sleep(0.05)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            locked = True
+    except OSError:
+        # The in-process lock remains a useful fail-safe if the lock directory
+        # is temporarily unavailable.
+        if lock_handle is not None:
+            lock_handle.close()
+        yield
+        return
+    try:
+        yield
+    finally:
+        if lock_handle is not None:
+            try:
+                lock_handle.seek(0)
+                if locked and os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
+                elif locked:
+                    import fcntl
+
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            lock_handle.close()
+
+
+def gemini_rate_limit(config: dict[str, Any]) -> int:
+    """Return the effective per-minute cap, never exceeding the free-tier ceiling."""
+    return min(15, max(1, int(config.get("maximumRequestsPerMinute", 15))))
+
+
+def wait_for_gemini_rate_slot(config: dict[str, Any]) -> None:
+    """Enforce a restart-safe sliding-window Gemini request limit."""
+    # Fifteen requests/minute is a safety invariant, not merely a default.
+    # A hand-edited config must not accidentally exceed the free-tier budget.
+    limit = gemini_rate_limit(config)
+    window = 60.0
+    while True:
+        with _GEMINI_RATE_LOCK:
+            with _gemini_interprocess_rate_lock():
+                now = time.time()
+                try:
+                    stored = json.loads(_GEMINI_RATE_FILE.read_text(encoding="utf-8"))
+                    _GEMINI_REQUEST_TIMES.clear()
+                    _GEMINI_REQUEST_TIMES.extend(float(value) for value in stored)
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    pass
+                while _GEMINI_REQUEST_TIMES and now - _GEMINI_REQUEST_TIMES[0] >= window:
+                    _GEMINI_REQUEST_TIMES.popleft()
+                if len(_GEMINI_REQUEST_TIMES) < limit:
+                    _GEMINI_REQUEST_TIMES.append(now)
+                    try:
+                        temporary = _GEMINI_RATE_FILE.with_name(
+                            f"{_GEMINI_RATE_FILE.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+                        )
+                        temporary.write_text(
+                            json.dumps(list(_GEMINI_REQUEST_TIMES)), encoding="utf-8"
+                        )
+                        temporary.replace(_GEMINI_RATE_FILE)
+                    except OSError:
+                        # In-memory limiter still protects the current process.
+                        pass
+                    return
+                wait_seconds = max(0.05, window - (now - _GEMINI_REQUEST_TIMES[0]))
+        time.sleep(wait_seconds)
+
+
+class GeminiHttpError(RuntimeError):
+    def __init__(self, status: int, detail: str):
+        self.status = status
+        self.detail = detail
+        super().__init__(f"Gemini HTTP {status}: {detail}")
+
+
+def gemini_error_allows_model_fallback(error: GeminiHttpError) -> bool:
+    if error.status in {404, 429, 500, 502, 503, 504}:
+        return True
+    detail = error.detail.lower()
+    return (
+        error.status == 403
+        and "project has been denied access" not in detail
+        and "api key" not in detail
+        and "model" in detail
+        and any(term in detail for term in ("access", "permission", "not available"))
+    )
+
+
+def is_timeout_error(error: BaseException) -> bool:
+    if isinstance(error, (TimeoutError, socket.timeout)):
+        return True
+    return isinstance(error, urllib.error.URLError) and isinstance(
+        error.reason, (TimeoutError, socket.timeout)
+    )
+
+
+def urlopen_read_with_hard_timeout(
+    request: urllib.request.Request, timeout_seconds: float
+) -> bytes:
+    """Read one HTTP response with a real wall-clock deadline.
+
+    urllib's socket timeout does not cover every Windows DNS/TLS blocking path.
+    A daemon worker lets the control loop rotate keys after the promised time
+    even when the underlying OS call remains stuck.
+    """
+    result_queue: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+    def worker() -> None:
+        try:
+            with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+                result_queue.put((True, response.read()))
+        except BaseException as exc:
+            result_queue.put((False, exc))
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(timeout_seconds)
+    if thread.is_alive():
+        raise TimeoutError(f"Gemini hard timeout after {timeout_seconds:g} seconds")
+    try:
+        succeeded, value = result_queue.get_nowait()
+    except queue.Empty as exc:
+        raise RuntimeError("Gemini HTTP worker ended without a result") from exc
+    if not succeeded:
+        raise value
+    return value
 
 
 CAMPUS_REFERENCE_PATH = ROOT / "Kampus" / "4.png"
@@ -65,6 +266,16 @@ CAMPUS_SAFE_POINTS: dict[str, dict[str, Any]] = {
     "prodaja_hrane": {
         "aliases": ("prodaja hrane", "food sales", "food stall"),
         "point": (0.275, 0.745),
+    },
+    "laboratorija_vezbi": {
+        "aliases": (
+            "laboratorija vezbi", "laboratorija vjezbi", "exercise laboratory",
+            "exercise lab", "training laboratory", "training lab",
+        ),
+        # Chapter 2 adds this facility on the solid complex immediately
+        # north-west of the stadium. The underlying Campus scene is shared
+        # with the Chapter-1 reference, so the same homography safely tracks it.
+        "point": (0.385, 0.515),
     },
 }
 
@@ -146,7 +357,13 @@ Safety is more important than closing an ad:
   badge/pill, never an Install/Get/Open/Buy button inside a store page.
 - Control priority on an ad is: genuine close X first, then genuine >>/Skip,
   then an ad Google Play/Play Store badge only when no close or skip control is visible.
-- Use send_back only on Google Play Store or play.google.com/Chrome destination screens.
+- Use send_back only on Google Play Store or a standalone Chrome destination opened by
+  the ad. Chrome destinations include play.google.com, googleadservices.com/pagead/aclk,
+  a blank redirect tab, or the advertiser page when Chrome's own tabs/address bar is visible.
+- A full app-detail destination with a visible back arrow, the literal header "Google Play",
+  an app title, and an Install button IS a Google Play Store screen even when it appears inside
+  the BlueStacks content area, an ad webview, or without the usual standalone Play Store chrome.
+  Return send_back for that destination; never click its Install button.
 - Use click_target only when expected state is exactly mourinho_warning. In that
   state it means the small square !/information button immediately to the right
   of the Nivo spremnosti/readiness progress bar and left of PREGLED UTAKMICE.
@@ -179,6 +396,31 @@ AI_ONLY_SYSTEM_PROMPT = SYSTEM_PROMPT.replace(
 )
 
 
+def expected_state_uses_original_image(expected_state: str) -> bool:
+    """Return whether a state sends Gemini the unmodified full screenshot."""
+    return (
+        "ai_only" in expected_state
+        or expected_state.startswith("external_navigation")
+        or expected_state == "mourinho_warning"
+        or expected_state.startswith("campus_incomplete_building")
+        or expected_state.startswith("campus_tool_icon")
+        or expected_state.startswith("connection_interrupted_popup")
+        or expected_state.startswith("incidental_top_eleven_popup")
+        or expected_state.startswith("training_setup_condition")
+        or expected_state.startswith("training_profile_condition")
+        or expected_state.startswith("reward_offer_")
+    )
+
+
+def system_prompt_for_expected_state(expected_state: str) -> str:
+    """Keep the coordinate instructions consistent with the supplied image."""
+    return (
+        AI_ONLY_SYSTEM_PROMPT
+        if expected_state_uses_original_image(expected_state)
+        else SYSTEM_PROMPT
+    )
+
+
 def load_config(path: Path) -> dict[str, Any]:
     defaults = {
         "enabled": True,
@@ -193,6 +435,7 @@ def load_config(path: Path) -> dict[str, Any]:
         "campusCoordinateTolerance": 0.06,
         "debugDirectory": "debug",
         "saveUnknownScreenshots": True,
+        "maximumDebugCaptures": 200,
     }
     if path.exists():
         with path.open("r", encoding="utf-8") as handle:
@@ -420,6 +663,46 @@ def ground_campus_click_on_fresh_frame(
                 "target": target_key,
             }
 
+        # Status sa vremenom gradnje (npr. "2d 0c" + zuta ikona) nije
+        # maintenance procenat. Gemini ga je u stvarnom toku pogresno opisao
+        # kao "STADION 90%". Vezi odabrani objekat s najblizim zelenim
+        # badgeom i lokalno zabrani klik kada je uz badge kalendar/gradnja.
+        badges = list(fresh_state.get("maintenanceBadges") or [])
+        if badges:
+            nearest_badge = min(
+                badges,
+                key=lambda badge: (
+                    (float(badge["x"]) - grounded_x) ** 2
+                    + 0.55 * (float(badge["y"]) - grounded_y) ** 2
+                ),
+            )
+            bx = float(nearest_badge["x"])
+            by = float(nearest_badge["y"])
+            bw = float(nearest_badge["width"])
+            bh = float(nearest_badge["height"])
+            x1 = max(0, int((bx + bw * 0.35) * fresh_width))
+            x2 = min(fresh_width, int((bx + bw * 1.35) * fresh_width))
+            y1 = max(0, int((by - bh * 1.20) * fresh_height))
+            y2 = min(fresh_height, int((by + bh * 1.20) * fresh_height))
+            status_side = fresh_bgr[y1:y2, x1:x2]
+            if status_side.size:
+                status_hsv = cv2.cvtColor(status_side, cv2.COLOR_BGR2HSV)
+                yellow = cv2.inRange(
+                    status_hsv,
+                    np.array([14, 105, 105]),
+                    np.array([42, 255, 255]),
+                )
+                yellow_ratio = float(np.mean(yellow > 0))
+                if yellow_ratio >= 0.025:
+                    return {
+                        "ok": False,
+                        "error": "selected Campus facility has a construction timer, not a percentage",
+                        "target": target_key,
+                        "statusBadgeX": round(bx, 3),
+                        "statusBadgeY": round(by, 3),
+                        "yellowStatusRatio": round(yellow_ratio, 4),
+                    }
+
         ai_control = decision.get("control") or {}
         return {
             "ok": True,
@@ -539,7 +822,7 @@ def request_ollama(image: Image.Image, expected_state: str, config: dict[str, An
             f"kind={candidate.get('kind', 'close')}, original x={float(candidate['x']):.4f}, "
             f"original y={float(candidate['y']):.4f}. Visually verify the pixels inside the circle."
         )
-        if expected_state == "external_navigation":
+        if expected_state.startswith("external_navigation"):
             candidate_prompt = candidate_description + (
                 " If the full screen is Google Play Store or a play.google.com/Chrome destination, "
                 "return send_back with control type back; otherwise return none."
@@ -613,6 +896,24 @@ def request_ollama(image: Image.Image, expected_state: str, config: dict[str, An
 def build_user_prompt(
     image: Image.Image, expected_state: str
 ) -> tuple[str, Image.Image]:
+    if expected_state.startswith("reward_offer_"):
+        target = "green_store" if expected_state.startswith("reward_offer_green_store") else "training_condition"
+        return (
+            "Inspect ONLY the current Top Eleven free green-rest reward offer. "
+            + ("Target: the Odmori row in PRODAVNICA, with the GREEN rest icon at the RIGHT of the video button. Ignore blue MORAL rewards and the BESPLATNI navigation tab. "
+               if target == "green_store" else
+               "Target: the video reward button in the open KONDICIJA recovery panel of a player profile. Ignore POVREDE, MORAL, the paid Unajmi button and all plus buttons. A gold rare-player profile is valid. The top resource header may be obscured. ")
+            + "Read the ACTUAL label and background of this target, not other text or previous frames. "
+            "Classify limit ONLY when its label visibly reads OGRAN. DOSTIGNUTO (limit reached); "
+            "grey ONLY when the full word BESPLATNO is visible on a grey/dark disabled background; "
+            "ready ONLY for full BESPLATNO on an active BLUE background. "
+            "Missing/covered target, loading dots, uncertain text, ads and other screens are unknown, never limit or grey. "
+            "Never click anything. recommendedAction=none, control.type=none, x=null, y=null. "
+            "Set control.confidence to confidence in this classification. For known states screenType=top_eleven and topElevenReturned=true. "
+            f"visibleText must be exactly TARGET:{target}; STATE:ready; LABEL:BESPLATNO "
+            "or the same format with STATE:grey; LABEL:BESPLATNO, STATE:limit; LABEL:OGRAN. DOSTIGNUTO, "
+            "or STATE:unknown; LABEL:UNKNOWN. Return the standard JSON schema.", image
+        )
     ai_only = "ai_only" in expected_state
     external_navigation = expected_state.startswith("external_navigation")
     mourinho_warning = expected_state == "mourinho_warning"
@@ -631,7 +932,8 @@ def build_user_prompt(
         else []
     )
     candidate = (
-        None if ai_only or external_navigation or mourinho_warning or campus_building or campus_tool or connection_popup or incidental_popup or training_setup or training_profile
+        None
+        if expected_state_uses_original_image(expected_state)
         else detect_guarded_candidate(image)
     )
     candidate_prompt = ""
@@ -641,7 +943,7 @@ def build_user_prompt(
             f"kind={candidate.get('kind', 'close')}, original x={float(candidate['x']):.4f}, "
             f"original y={float(candidate['y']):.4f}. Visually verify the pixels inside the circle."
         )
-        if expected_state == "external_navigation":
+        if expected_state.startswith("external_navigation"):
             candidate_prompt = candidate_description + (
                 " If the full screen is Google Play Store or a play.google.com/Chrome destination, "
                 "return send_back with control type back; otherwise return none."
@@ -716,6 +1018,8 @@ def build_user_prompt(
             "The screenshot is expected to show the Top Eleven Campus maintenance overview. "
             "Several campus buildings have percentage labels such as 60%, 90% or 100%. Find "
             "one building whose OWN displayed maintenance percentage is strictly below 100%. "
+            "A badge containing a duration such as '2d', '10c 39m', a clock, calendar, or yellow "
+            "construction icon is NOT a percentage and that facility must never be selected. "
             + tie_instruction
             + "First associate the selected "
             "percentage with its facility, then return a point WELL INSIDE the broad, opaque, "
@@ -817,11 +1121,22 @@ def build_user_prompt(
     if external_navigation:
         prompt = (
             "Inspect the original full screenshot and decide only whether Google Play Store or "
-            "a play.google.com/Chrome destination is CURRENTLY visible. If it is visible, return "
+            "a standalone Android Chrome destination opened by the ad is CURRENTLY visible. "
+            "Chrome includes play.google.com, googleadservices.com/pagead/aclk, a blank redirect "
+            "tab, or the advertiser page when Chrome's own tab strip/address bar is visible. "
+            "If either external destination is visible, return "
             "screenType=google_play_store for the Store or screenType=play_google_chrome for "
             "a Chrome destination, control.type=back, recommendedAction=send_back, "
-            "x=null and y=null. If the ad or Top Eleven is visible instead, return control.type=none "
-            "and recommendedAction=none. Do not use a remembered previous screen and do not return "
+            "x=null and y=null. Treat an app-detail page with a visible back arrow, the literal "
+            "'Google Play' header, an app name and an Install button as Google Play Store even when "
+            "it is rendered inside an ad webview or fills only the BlueStacks content viewport. "
+            "The Install button is evidence of the destination but must never be clicked. "
+            "If the ad or Top Eleven is visible instead, return control.type=none "
+            "and recommendedAction=none. Campus buildings, maintenance percentages and the "
+            "Top Eleven resource bar belong to the game, not to Google Play. Never recommend "
+            "click_campus_building or any game action in this external-navigation check. "
+            "A Google Play logo or Install button inside an ordinary ad alone is not a Store page. "
+            "Do not use a remembered previous screen and do not return "
             "coordinates for Back. Return only the schema-conforming object."
         )
         return prompt, image
@@ -848,7 +1163,10 @@ def build_user_prompt(
             "for the ad's Google Play, Play Store, or Visit Google Play badge, including a "
             "very small Google Play disclosure badge at the ad's TOP-LEFT edge, and return "
             "click_google_play. Never choose Install, Get, Open, Buy, Learn More, or a store-page "
-            "button. Do not require or expect a yellow marker."
+            "button. If the entire current content is already a Google Play app-detail destination "
+            "with a back arrow, literal Google Play header, app name and Install button, return "
+            "screenType=google_play_store, control.type=back and recommendedAction=send_back instead "
+            "of treating Install as an ad control. Do not require or expect a yellow marker."
         )
     return prompt, image if ai_only else build_diagnostic_image(image, candidate)
 
@@ -859,10 +1177,8 @@ def get_secret_environment_variable(name: str) -> str | None:
     User environment changes are stored in the registry immediately, while an
     already-running Explorer/Codex process can retain an older environment.
     """
-    value = os.environ.get(name)
-    if value:
-        return value.strip()
-
+    # The project-local .env is the user's explicit current selection. It must
+    # override an older value inherited by a long-running Manager/Codex process.
     env_path = ROOT / ".env"
     if env_path.is_file():
         try:
@@ -884,6 +1200,21 @@ def get_secret_environment_variable(name: str) -> str | None:
                     return supplied_value
         except OSError:
             pass
+
+    value = os.environ.get(name)
+    if value:
+        return value.strip()
+
+
+def get_gemini_api_keys(base_name: str) -> list[str]:
+    """Load the primary key and up to nine local fallback keys without logging them."""
+    names = [base_name, *(f"{base_name}_{index}" for index in range(2, 11))]
+    keys: list[str] = []
+    for name in names:
+        value = get_secret_environment_variable(name)
+        if value and value not in keys:
+            keys.append(value)
+    return keys
 
     if os.name == "nt":
         try:
@@ -930,10 +1261,27 @@ def gemini_response_schema() -> dict[str, Any]:
     }
 
 
+def parse_gemini_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
+    """Extract one schema response before marking its model as usable."""
+    candidates = envelope.get("candidates") or []
+    if not candidates:
+        block_reason = (envelope.get("promptFeedback") or {}).get("blockReason", "unknown")
+        raise ValueError(f"Gemini response has no candidate (blockReason={block_reason})")
+    parts = ((candidates[0].get("content") or {}).get("parts") or [])
+    content = "".join(part.get("text", "") for part in parts if isinstance(part, dict))
+    if not content.strip():
+        raise ValueError(
+            "Gemini response has no text "
+            f"(finishReason={candidates[0].get('finishReason', 'unknown')})"
+        )
+    return json.loads(content)
+
+
 def request_gemini(image: Image.Image, expected_state: str, config: dict[str, Any]) -> dict[str, Any]:
+    global _GEMINI_ACTIVE_MODEL, _GEMINI_ACTIVE_KEY_INDEX
     key_name = str(config.get("apiKeyEnvironmentVariable", "GEMINI_API_KEY"))
-    api_key = get_secret_environment_variable(key_name)
-    if not api_key:
+    api_keys = get_gemini_api_keys(key_name)
+    if not api_keys:
         raise RuntimeError(
             f"Gemini API key is missing. Add {key_name}=... to AI-Agent/.env."
         )
@@ -945,33 +1293,12 @@ def request_gemini(image: Image.Image, expected_state: str, config: dict[str, An
             "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
         )
     )
-    endpoint = endpoint_template.replace("{model}", str(config["model"]))
-    generation_config: dict[str, Any] = {
-        "maxOutputTokens": int(config.get("maximumOutputTokens", 256)),
-        "responseMimeType": "application/json",
-        "responseSchema": gemini_response_schema(),
-    }
-    model_name = str(config["model"])
-    if model_name.startswith("gemini-3"):
-        generation_config["thinkingConfig"] = {
-            "thinkingLevel": str(config.get("thinkingLevel", "minimal"))
-        }
-    else:
-        generation_config["temperature"] = 0
-        generation_config["thinkingConfig"] = {
-            "thinkingBudget": int(config.get("thinkingBudget", 0))
-        }
-    payload = {
+    base_payload = {
         "systemInstruction": {
             "parts": [
                 {
                     "text": (
-                        AI_ONLY_SYSTEM_PROMPT
-                        if "ai_only" in expected_state
-                        or expected_state.startswith("external_navigation")
-                        or expected_state == "mourinho_warning"
-                        or expected_state.startswith("campus_incomplete_building")
-                        else SYSTEM_PROMPT
+                        system_prompt_for_expected_state(expected_state)
                     )
                 }
             ]
@@ -985,38 +1312,137 @@ def request_gemini(image: Image.Image, expected_state: str, config: dict[str, An
                 ],
             }
         ],
-        "generationConfig": generation_config,
     }
-    request = urllib.request.Request(
-        endpoint,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=float(config["timeoutSeconds"])) as response:
-            envelope = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        response_text = exc.read().decode("utf-8", errors="replace")
-        try:
-            error = json.loads(response_text).get("error", {})
-            detail = error.get("message", error) if isinstance(error, dict) else error
-        except json.JSONDecodeError:
-            detail = response_text
-        raise RuntimeError(f"Gemini HTTP {exc.code}: {detail or exc.reason}") from exc
+    models = []
+    if _GEMINI_ACTIVE_MODEL:
+        models.append(_GEMINI_ACTIVE_MODEL)
+    models.append(str(config["model"]))
+    models.extend(str(item) for item in config.get("fallbackModels", []) if str(item).strip())
+    models = list(dict.fromkeys(models))
+    last_error: GeminiHttpError | None = None
+    last_response_error: ValueError | None = None
+    last_timeout_error: BaseException | None = None
+    key_order = list(range(len(api_keys)))
+    if 0 <= _GEMINI_ACTIVE_KEY_INDEX < len(api_keys):
+        key_order.remove(_GEMINI_ACTIVE_KEY_INDEX)
+        key_order.insert(0, _GEMINI_ACTIVE_KEY_INDEX)
 
-    candidates = envelope.get("candidates") or []
-    if not candidates:
-        block_reason = (envelope.get("promptFeedback") or {}).get("blockReason", "unknown")
-        raise ValueError(f"Gemini response has no candidate (blockReason={block_reason})")
-    parts = ((candidates[0].get("content") or {}).get("parts") or [])
-    content = "".join(part.get("text", "") for part in parts if isinstance(part, dict))
-    if not content.strip():
-        raise ValueError(
-            "Gemini response has no text "
-            f"(finishReason={candidates[0].get('finishReason', 'unknown')})"
-        )
-    return json.loads(content)
+    for model_index, model_name in enumerate(models):
+        generation_config: dict[str, Any] = {
+            "maxOutputTokens": int(config.get("maximumOutputTokens", 256)),
+            "responseMimeType": "application/json",
+            "responseSchema": gemini_response_schema(),
+        }
+        if model_name.startswith("gemini-3"):
+            generation_config["thinkingConfig"] = {
+                "thinkingLevel": str(config.get("thinkingLevel", "minimal"))
+            }
+        else:
+            generation_config["temperature"] = 0
+            generation_config["thinkingConfig"] = {
+                "thinkingBudget": int(config.get("thinkingBudget", 0))
+            }
+        payload = copy.deepcopy(base_payload)
+        payload["generationConfig"] = generation_config
+        endpoint = endpoint_template.replace("{model}", model_name)
+        model_failed = False
+        timed_out_keys = 0
+        quota_exhausted_keys = 0
+        for key_index in key_order:
+            api_key = api_keys[key_index]
+            timeout_attempts = 0
+            request = urllib.request.Request(
+                endpoint,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+                method="POST",
+            )
+            attempt_timeouts = (
+                float(config.get("initialRequestTimeoutSeconds", 15)),
+                float(config.get("retryRequestTimeoutSeconds", 10)),
+            )
+            for attempt_index, attempt_timeout in enumerate(attempt_timeouts, start=1):
+                wait_for_gemini_rate_slot(config)
+                log_gemini_event(
+                    config,
+                    f"model={model_name} key_slot={key_index + 1} attempt={attempt_index} timeout={attempt_timeout:g}s sent",
+                )
+                try:
+                    response_bytes = urlopen_read_with_hard_timeout(request, attempt_timeout)
+                    envelope = json.loads(response_bytes.decode("utf-8"))
+                    decision = parse_gemini_envelope(envelope)
+                    _GEMINI_ACTIVE_MODEL = model_name
+                    _GEMINI_ACTIVE_KEY_INDEX = key_index
+                    log_gemini_event(
+                        config,
+                        f"model={model_name} key_slot={key_index + 1} attempt={attempt_index} success",
+                    )
+                    return decision
+                except urllib.error.HTTPError as exc:
+                    response_text = exc.read().decode("utf-8", errors="replace")
+                    try:
+                        error = json.loads(response_text).get("error", {})
+                        detail = error.get("message", error) if isinstance(error, dict) else error
+                    except json.JSONDecodeError:
+                        detail = response_text
+                    last_error = GeminiHttpError(exc.code, str(detail or exc.reason))
+                    log_gemini_event(
+                        config,
+                        f"model={model_name} key_slot={key_index + 1} attempt={attempt_index} http={last_error.status}",
+                    )
+                    if last_error.status == 429:
+                        # Quota is known to be exhausted: do not waste the
+                        # second attempt, move to the next configured key.
+                        quota_exhausted_keys += 1
+                        break
+                    if not gemini_error_allows_model_fallback(last_error):
+                        raise last_error from exc
+                    model_failed = True
+                    break
+                except (TimeoutError, urllib.error.URLError) as exc:
+                    if not is_timeout_error(exc):
+                        raise
+                    last_timeout_error = exc
+                    timeout_attempts += 1
+                    log_gemini_event(
+                        config,
+                        f"model={model_name} key_slot={key_index + 1} attempt={attempt_index} timeout",
+                    )
+                    # First silence retries after 15 s. Second silence after
+                    # another 10 s leaves this key and moves to the next one.
+                    continue
+                except (json.JSONDecodeError, ValueError) as exc:
+                    last_response_error = exc
+                    model_failed = True
+                    break
+            if model_failed:
+                break
+            # Reaching this point with a timeout as the latest transport result
+            # means both attempts for this key were silent. Count the key so
+            # complete silence across all configured keys stops here instead
+            # of multiplying 25-second waits across every fallback model.
+            if timeout_attempts == len(attempt_timeouts):
+                timed_out_keys += 1
+        if timed_out_keys == len(key_order) and timed_out_keys > 0:
+            raise last_timeout_error
+        if quota_exhausted_keys == len(key_order) and quota_exhausted_keys > 0:
+            # Quota belongs to the project/key, so cycling through fallback
+            # models only hides the real error until the parent timeout.
+            raise last_error
+        if timed_out_keys + quota_exhausted_keys == len(key_order):
+            # Mixed failure is equally terminal for this request: for example,
+            # primary key silent twice and backup key returning quota 429.
+            # Do not hide that combination by cycling through fallback models.
+            raise last_error or last_timeout_error or RuntimeError(
+                "All configured Gemini keys are unavailable"
+            )
+        if model_failed and model_index + 1 >= len(models):
+            raise last_response_error or last_error or RuntimeError(
+                "Gemini model fallbacks did not return a usable response"
+            )
+    raise last_response_error or last_error or last_timeout_error or RuntimeError(
+        "Gemini request failed without a usable response"
+    )
 
 
 def request_vision_model(
@@ -1059,6 +1485,14 @@ def validate_decision(
     screen_type = raw.get("screenType")
     action = raw.get("recommendedAction")
     control = raw.get("control")
+    # Malformed JSON field types must produce a rejected decision, never crash
+    # membership checks or action.startswith below.
+    if not isinstance(screen_type, str):
+        screen_type = ""
+    if not isinstance(action, str):
+        action = ""
+    if not isinstance(raw.get("topElevenReturned", False), bool):
+        errors.append("topElevenReturned must be boolean")
     # In an ad-only check, a positively identified Top Eleven return always wins.
     # Profile/game controls must never be clicked by the ad watcher. Some models
     # correctly identify the resource header but still suggest the visible profile X;
@@ -1075,6 +1509,8 @@ def validate_decision(
         control = {}
 
     control_type = control.get("type")
+    if not isinstance(control_type, str):
+        control_type = ""
     if control_type not in CONTROL_TYPES:
         errors.append("invalid control type")
     if action in ACTION_CONTROL and control_type != ACTION_CONTROL[action]:
@@ -1111,20 +1547,28 @@ def validate_decision(
         except (TypeError, ValueError):
             errors.append("click action has no numeric coordinates")
             x = y = None
-        if (
-            (ai_only or mourinho_warning or campus_building or campus_tool or connection_popup or incidental_popup or training_setup or training_profile)
-            and x is not None
-            and (x > 1 or y > 1)
-        ):
-            if 0 <= x <= 1000 and 0 <= y <= 1000:
-                # Gemini spatial grounding commonly uses a normalized 0..1000
-                # coordinate scale even when the response schema requests 0..1.
+        if x is not None and (x > 1 or y > 1):
+            # Gemini spatial grounding frequently returns a 0..1000 scale even
+            # though the response schema asks for 0..1. This happens for normal
+            # ad_control requests too, so normalization must precede every guard
+            # zone check rather than being limited to a few expected states.
+            # Values above 1000 can only be literal pixels; values up to 1000
+            # follow Gemini's documented/common grounding convention.
+            if (
+                image_size is not None
+                and (x > 1000 or y > 1000)
+                and 0 <= x <= image_size[0]
+                and 0 <= y <= image_size[1]
+            ):
+                image_width, image_height = image_size
+                x = x / image_width
+                y = y / image_height
+            elif 0 <= x <= 1000 and 0 <= y <= 1000:
                 x = x / 1000
                 y = y / 1000
             elif image_size is not None:
                 image_width, image_height = image_size
                 if 0 <= x <= image_width and 0 <= y <= image_height:
-                    # Also accept literal pixel coordinates as a fallback.
                     x = x / image_width
                     y = y / image_height
         if x is not None and not (0 <= x <= 1 and 0 <= y <= 1):
@@ -1170,6 +1614,23 @@ def validate_decision(
         errors.append("non-click action must have null coordinates")
 
     visible_text = str(raw.get("visibleText", ""))[:500]
+    if expected_state.startswith("reward_offer_"):
+        target = "green_store" if expected_state.startswith("reward_offer_green_store") else "training_condition"
+        offer = re.fullmatch(
+            rf"TARGET:{target}; STATE:(ready|grey|limit|unknown); LABEL:(BESPLATNO|OGRAN\. DOSTIGNUTO|UNKNOWN)",
+            visible_text,
+        )
+        if action != "none" or control_type != "none":
+            errors.append("reward offer classification must not click")
+        if offer is None:
+            errors.append("reward offer requires exact target/state/label evidence")
+        else:
+            state, label = offer.groups()
+            required_label = {"ready": "BESPLATNO", "grey": "BESPLATNO", "limit": "OGRAN. DOSTIGNUTO", "unknown": "UNKNOWN"}[state]
+            if label != required_label:
+                errors.append("reward offer state contradicts visible label")
+            if state != "unknown" and (screen_type != "top_eleven" or not raw.get("topElevenReturned") or confidence < max(0.90, float(config["minimumConfidence"]))):
+                errors.append("reward offer has no confident Top Eleven evidence")
     if campus_building and action == "click_campus_building":
         campus_target = re.search(
             r"\bTARGET\b\s*:?\s*(.+?)\s*(?:[;|,\n]\s*)?\bPERCENT\b\s*:?\s*(\d{1,3})\s*%",
@@ -1315,6 +1776,42 @@ def refine_decision_control_center(
     if action not in {"click_close", "click_skip", "click_google_play"}:
         return decision, None
 
+    try:
+        import cv2
+        import numpy as np
+        import XDetector
+
+        rgb = np.asarray(image.convert("RGB"))
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        candidates = [
+            XDetector.run_detector(bgr, live=True),
+            XDetector.detect_yellow_ad_control(bgr),
+            XDetector.detect_top_edge_google_play_badge(bgr),
+        ]
+        candidate = select_pixel_control_candidate(decision, candidates)
+        if candidate is None:
+            return decision, None
+
+        ai_x = float(decision["control"]["x"])
+        ai_y = float(decision["control"]["y"])
+        pixel_x = float(candidate["x"])
+        pixel_y = float(candidate["y"])
+        refined = copy.deepcopy(decision)
+        refined["control"]["x"] = pixel_x
+        refined["control"]["y"] = pixel_y
+        refinement = {
+            "kind": str(candidate["kind"]),
+            "aiX": ai_x,
+            "aiY": ai_y,
+            "pixelX": pixel_x,
+            "pixelY": pixel_y,
+            "method": str(candidate.get("method", "pixel-center")),
+        }
+        return refined, refinement
+    except Exception:
+        # AI coordinate remains untouched when exact pixel matching is unavailable.
+        return decision, None
+
 
 def refine_ai_close_on_fresh_frame(
     image: Image.Image, decision: dict[str, Any]
@@ -1360,49 +1857,38 @@ def refine_ai_close_on_fresh_frame(
             "reason": f"local X refinement failed: {type(exc).__name__}: {exc}",
         }
 
-    try:
-        import cv2
-        import numpy as np
-        import XDetector
-
-        rgb = np.asarray(image.convert("RGB"))
-        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        candidates = [
-            XDetector.run_detector(bgr, live=True),
-            XDetector.detect_yellow_ad_control(bgr),
-            XDetector.detect_top_edge_google_play_badge(bgr),
-        ]
-        candidate = select_pixel_control_candidate(decision, candidates)
-        if candidate is None:
-            return decision, None
-
-        ai_x = float(decision["control"]["x"])
-        ai_y = float(decision["control"]["y"])
-        pixel_x = float(candidate["x"])
-        pixel_y = float(candidate["y"])
-        decision["control"]["x"] = pixel_x
-        decision["control"]["y"] = pixel_y
-        refinement = {
-            "kind": str(candidate["kind"]),
-            "aiX": ai_x,
-            "aiY": ai_y,
-            "pixelX": pixel_x,
-            "pixelY": pixel_y,
-            "method": str(candidate.get("method", "pixel-center")),
-        }
-        return decision, refinement
-    except Exception:
-        # AI coordinate remains untouched when exact pixel matching is unavailable.
-        return decision, None
-
-
 def save_debug(image: Image.Image, result: dict[str, Any], config: dict[str, Any], reason: str) -> None:
     debug_dir = ROOT / str(config["debugDirectory"])
     debug_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    image.save(debug_dir / f"{stamp}-{reason}.jpg", quality=92)
-    with (debug_dir / f"{stamp}-{reason}.json").open("w", encoding="utf-8") as handle:
+    stem = f"{stamp}-{reason}"
+    collision_index = 0
+    while (debug_dir / f"{stem}.jpg").exists() or (debug_dir / f"{stem}.json").exists():
+        collision_index += 1
+        stem = f"{stamp}-{reason}-{collision_index}"
+    image.save(debug_dir / f"{stem}.jpg", quality=92)
+    with (debug_dir / f"{stem}.json").open("w", encoding="utf-8") as handle:
         json.dump(result, handle, indent=2, ensure_ascii=False)
+
+    # Unknown/rejected frames are useful for regressions, but an unattended
+    # agent can otherwise grow this directory forever. Count one JPG+JSON pair
+    # as one capture and remove only captures created by this function.
+    maximum = max(1, int(config.get("maximumDebugCaptures", 200)))
+    captures = sorted(
+        debug_dir.glob("20??????-??????-??????-*.jpg"),
+        key=lambda path: (path.stat().st_mtime_ns, path.name),
+        reverse=True,
+    )
+    for old_image in captures[maximum:]:
+        try:
+            old_image.unlink()
+        except OSError:
+            pass
+        old_metadata = old_image.with_suffix(".json")
+        try:
+            old_metadata.unlink()
+        except OSError:
+            pass
 
 
 class VisionServer:
@@ -1459,6 +1945,16 @@ class VisionServer:
             "latencyMs": round((time.monotonic() - started) * 1000),
             "decision": decision,
             "errors": errors,
+            "modelUsed": (
+                _GEMINI_ACTIVE_MODEL
+                if str(self.config.get("provider", "ollama")).strip().lower() == "gemini"
+                else str(self.config.get("model", ""))
+            ),
+            "keySlotUsed": (
+                _GEMINI_ACTIVE_KEY_INDEX + 1
+                if str(self.config.get("provider", "ollama")).strip().lower() == "gemini"
+                else None
+            ),
         }
         if errors or (config_bool(self.config, "saveUnknownScreenshots") and decision.get("screenType") == "unknown"):
             save_debug(image, result, self.config, "rejected" if errors else "unknown")
@@ -1509,6 +2005,11 @@ def serve(config: dict[str, Any]) -> int:
                     "enabled": config_bool(config, "enabled"),
                     "provider": provider,
                     "model": config["model"],
+                    "modelUsed": (
+                        _GEMINI_ACTIVE_MODEL
+                        if provider == "gemini" and _GEMINI_ACTIVE_MODEL
+                        else config["model"]
+                    ),
                     "credentialsAvailable": (
                         True
                         if provider == "ollama"

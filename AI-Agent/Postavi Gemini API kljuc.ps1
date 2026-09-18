@@ -1,9 +1,75 @@
+param(
+    [ValidateRange(1, 10)]
+    [int]$Slot = 1
+)
+
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+function Set-LocalDotEnvSecret {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$Value
+    )
+
+    $envPath = Join-Path $PSScriptRoot '.env'
+    $tempPath = Join-Path $PSScriptRoot ('.env.{0}.tmp' -f [guid]::NewGuid().ToString('N'))
+    $backupPath = Join-Path $PSScriptRoot ('.env.{0}.bak' -f [guid]::NewGuid().ToString('N'))
+    $newLines = [System.Collections.Generic.List[string]]::new()
+    $keyPattern = '^\s*{0}\s*=' -f [regex]::Escape($Name)
+    $keyWritten = $false
+
+    try {
+        if (Test-Path -LiteralPath $envPath) {
+            foreach ($line in [System.IO.File]::ReadAllLines($envPath)) {
+                if ($line -match $keyPattern) {
+                    if (-not $keyWritten) {
+                        $newLines.Add("$Name=$Value")
+                        $keyWritten = $true
+                    }
+                    continue
+                }
+                $newLines.Add($line)
+            }
+        }
+        if (-not $keyWritten) {
+            $newLines.Add("$Name=$Value")
+        }
+
+        $content = ($newLines -join [Environment]::NewLine) + [Environment]::NewLine
+        [System.IO.File]::WriteAllText(
+            $tempPath,
+            $content,
+            [System.Text.UTF8Encoding]::new($false)
+        )
+
+        # Temp fajl je u istom folderu, pa je zamjena jedan atomski filesystem
+        # korak: agent nikada ne moze procitati napola zapisani API kljuc.
+        if (Test-Path -LiteralPath $envPath) {
+            [System.IO.File]::Replace($tempPath, $envPath, $backupPath, $true)
+            Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
+        }
+        else {
+            [System.IO.File]::Move($tempPath, $envPath)
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $tempPath) {
+            Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path -LiteralPath $backupPath) {
+            Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
+        }
+        $content = $null
+        $newLines = $null
+    }
+}
+
 $form = New-Object System.Windows.Forms.Form
-$form.Text = 'Gemini API kljuc'
+$secretName = if ($Slot -eq 1) { 'GEMINI_API_KEY' } else { "GEMINI_API_KEY_$Slot" }
+$slotLabel = if ($Slot -eq 1) { 'glavni' } else { "rezervni #$Slot" }
+$form.Text = "Gemini API kljuc - $slotLabel"
 $form.StartPosition = 'CenterScreen'
 $form.ClientSize = New-Object System.Drawing.Size(520, 170)
 $form.FormBorderStyle = 'FixedDialog'
@@ -14,7 +80,7 @@ $form.TopMost = $true
 $label = New-Object System.Windows.Forms.Label
 $label.Location = New-Object System.Drawing.Point(20, 18)
 $label.Size = New-Object System.Drawing.Size(480, 42)
-$label.Text = "Unesi Gemini API kljuc. Kljuc se ne upisuje u projekat ni logove."
+$label.Text = "Unesi $slotLabel Gemini API kljuc. Kljuc se lokalno sprema u AI-Agent\.env i nikada se ne ispisuje u logove."
 $form.Controls.Add($label)
 
 $textBox = New-Object System.Windows.Forms.TextBox
@@ -58,9 +124,9 @@ if ([string]::IsNullOrWhiteSpace($plainKey)) {
 }
 
 try {
-    [Environment]::SetEnvironmentVariable('GEMINI_API_KEY', $plainKey, 'User')
+    Set-LocalDotEnvSecret -Name $secretName -Value $plainKey
     [System.Windows.Forms.MessageBox]::Show(
-        'Kljuc je spremljen. Nije upisan u projektne fajlove.',
+        "$slotLabel kljuc je sigurno spremljen u lokalni AI-Agent\.env. Agent ga automatski koristi kada prethodni kljuc vrati quota 429.",
         'Gemini API kljuc',
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Information

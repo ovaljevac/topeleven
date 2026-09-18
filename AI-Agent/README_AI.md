@@ -2,9 +2,9 @@
 
 Ovaj folder sadrzi aktivnu AI-first verziju projekta. Roditeljski folder sadrzi samo ulaznu dokumentaciju i alat za desktop precicu.
 
-Glavni ulaz je `Pokreni AI Agent.cmd`, koji otvara centralni dark dashboard sa svim skriptama, zajednickim logom i Start/Stop kontrolama. Svaki modul se moze pokrenuti zasebno. Za `Pokreni sve` moguce je izabrati pocetnu fazu, a za odmor igraca pocetnu poziciju.
+Glavni ulaz je `Pokreni AI Agent.cmd`, koji otvara centralni svijetli dashboard sa svim skriptama, zajednickim logom i Start/Stop kontrolama. Svaki modul se moze pokrenuti zasebno. Za `Pokreni sve` moguce je izabrati pocetnu fazu, a za odmor igraca pocetnu poziciju. Odvojivi mini-log ima prekidac `Iznad: DA/NE`; iskljuci `Iznad` ako bi prozor prekrivao BlueStacks i ulazio u AI screenshot.
 
-Ako faza padne, zajednicki engine radi BlueStacks force-stop Top Elevena, ponovo pokrece igru i istu fazu pokusava najvise tri puta. U kombinovanom toku se tek nakon tri neuspjeha evidentira greska te nastavlja na sljedecu fazu.
+Obicna AI ili vizuelna neizvjesnost ne gasi Top Eleven: agent ostaje na istom koraku i ponavlja sigurnu provjeru. Potpuni restart tacne BlueStacks instance koristi se samo za potvrdeno zaglavljenu reklamu ili kada je prije sljedece faze neophodan provjeren pocetni ekran. U kombinovanom toku neuspjela faza se evidentira, a agent zatim sigurno prelazi na sljedecu fazu.
 
 ## Kako radi
 
@@ -14,14 +14,14 @@ Ako faza padne, zajednicki engine radi BlueStacks force-stop Top Elevena, ponovo
 4. Za reklamne kontrole prihvataju se samo AI akcije `click_close`, `click_skip` i `click_google_play` sa koordinatom na originalnoj slici.
 5. OpenCV ne predlaze, ne potvrduje, ne pomjera i ne klika X, skip ili Google Play dugmad reklame.
 6. Ako AI nije dostupan ili ne vidi dozvoljenu kontrolu, agent ne klika nista.
-7. Povratak iz Storea koristi Android package/activity signal i novu AI sliku prije svakog dodatnog Back pokusaja.
-8. Povratak u igru potvrduje svjezi `MainPlayerNativeActivity` dogadjaj ili AI koji na trenutnoj slici jasno vidi pravo Top Eleven zaglavlje sa vise kartica resursa.
+7. Google Play i Chrome prepoznaju se iskljucivo preko AI analize slike. ADB ostaje samo za slanje Back komande; Escape je rezerva.
+8. Prihvacena AI potvrda Top Eleven ekrana zavrsava reklamni nadzor. Lokalni puni Pocetni ekran i Prodavnica mogu se potvrditi na dva svjeza framea. Android aktivnost, dumpsys i Player.log ne citaju se i ne ucestvuju ni u jednoj odluci.
 
 AI nikada direktno ne upravlja misem. PowerShell prihvata samo poznatu akciju sa odgovarajucom vrstom kontrole i koordinatom unutar originalne slike. `Install`, `Get`, kupovina i placanje se nikada ne klikcu, ali njihovo prisustvo vise ne skriva odvojeni pravi X/skip niti blokira Back iz Storea.
 
 ## Gemini 3.5 Flash-Lite (trenutno ukljucen)
 
-`ai_config.json` koristi `gemini-3.5-flash-lite` sa `minimal` thinking nivoom radi kratke latencije. Google vise ne daje `gemini-2.5-flash` novim API korisnicima. Otvori `.env` i zalijepi kljuc iza `GEMINI_API_KEY=` bez navodnika. `.env` je iskljucen iz Gita i agent nikada ne ispisuje njegov sadrzaj u logove. Nakon toga provjeri sa `Testiraj Gemini.cmd`.
+`ai_config.json` koristi `gemini-3.5-flash-lite` sa `minimal` thinking nivoom radi kratke latencije. Google vise ne daje `gemini-2.5-flash` novim API korisnicima. U Manageru otvori `Postavke` i izaberi `Postavi API kljuc`: alat atomarno sprema `GEMINI_API_KEY` u lokalni `AI-Agent/.env`, bez prikazivanja ili zapisivanja kljuca u log. `.env` je iskljucen iz Gita. Nakon toga provjeri sa `Testiraj Gemini`.
 
 Free-tier kljuc je dovoljan dok se ne prekorace Googleova ogranicenja zahtjeva. Slike se salju Google Gemini API-ju; ako zelis potpuno lokalnu obradu, vrati Ollama konfiguraciju ispod.
 
@@ -52,17 +52,27 @@ Za povratak na lokalni model postavi:
 "timeoutSeconds": 120
 ```
 
-Prva detekcija X-a pocinje 20.5 sekundi nakon pokretanja reklame. Model se ucitava u pozadini cim se pritisne `POKRENI`, a Google Play Store se vraca preko svjezeg BlueStacks package/activity dogadjaja; AI trenutne slike je fallback i obavezna potvrda prije drugog ili treceg Back pokusaja.
+Prva detekcija X-a pocinje 12 sekundi nakon pokretanja reklame. Model se ucitava u pozadini cim se pritisne `POKRENI`. Google Play Store i Chrome se prepoznaju iz trenutnog `dumpsys` activity stanja i vracaju direktnim Android Back pozivom, pa fokus Managera ili mini-loga ne moze progutati Escape. AI trenutne slike je fallback kada ADB stanje nije dostupno.
 
 Za duge interaktivne reklame postoji wake mehanizam. Nakon 75 sekundi bez izlaza agent svakih 12 sekundi dodirne neutralnu zonu oglasa i bez dodatnog cekanja odmah pravi AI screenshot. Time pokusava ponovo prikazati Google Play/skip kontrole koje se pojave samo nakratko. Vrijednosti su podesive kroz `adWakeTapAfterSeconds`, `adWakeTapIntervalSeconds` i `adWakeTapMaximum` u `config.json`.
 
-Reklamne kontrole su potpuno `AI-only`: Gemini od prve provjere sam bira X, >>/skip ili Google Play/Play Store na cistoj originalnoj BlueStacks slici. OpenCV nema pravo predloziti, potvrditi, precizirati niti kliknuti dugme reklame. Ne postoji univerzalni pomak koordinata; klik koristi tacno koordinatu koju vrati AI.
+Reklamne kontrole su semanticki `AI-only`: Gemini na cistoj originalnoj BlueStacks slici jedini bira da li je kontrola X, >>/skip ili Google Play/Play Store. OpenCV ne smije sam predloziti drugo dugme niti pokrenuti klik; kod X-a smije samo u maloj zoni oko AI tacke potvrditi dijagonale i vratiti njihov stvarni centar. Ne postoji univerzalni pomak koordinata.
 
-Za `X` AI i dalje jedini odlucuje koja je kontrola za zatvaranje. Nakon njegove odluke agent uzima novu sliku i samo u maloj zoni oko te tacke pokusava geometrijski centrirati dvije dijagonale istog X-a. Lokalna analiza ne smije traziti drugo dugme niti primijeniti fiksni pomak. Ako lokalno centriranje ne uspije, ostaje tacna AI koordinata bez izmisljenog pomaka.
+Za `X` AI i dalje jedini odlucuje koja je kontrola za zatvaranje. Nakon njegove odluke agent uzima novu sliku i samo u maloj zoni oko te tacke pokusava geometrijski centrirati dvije dijagonale istog X-a. Lokalna analiza ne smije traziti drugo dugme niti primijeniti fiksni pomak. Jedna AI odluka je dovoljna kada taj svjezi lokalni frame potvrdi dijagonale i njihov centar; tada se X odmah klikne bez drugog Gemini zahtjeva. AI koordinata bez lokalno pronadjenih dijagonala ostaje samo kandidat i ne moze sama autorizovati klik.
 
-Prva AI provjera pocinje 20.5 sekundi nakon pokretanja reklame, zatim se Gemini poziva svakih 20.5 sekundi (`aiProbeIntervalSeconds`). Wake dodir kod dugih interaktivnih reklama odmah pokrece dodatnu AI provjeru.
+Prva AI provjera pocinje 12 sekundi nakon pokretanja reklame, zatim se Gemini redovno poziva svakih 12 sekundi (`aiProbeIntervalSeconds`). Lokalno potvrden X iz te jedne provjere odmah je spreman za klik, bez dodatnog Gemini zahtjeva. Nakon klika ili gubitka kandidata pre-click tok pokrece stvarni nadzor povratka i novih kontrola: potvrden povratak odmah zavrsava reklamu, a novi lokalno potvrden X koristi se u istoj iteraciji. Ako nadzor ostane neodlucan, naredni pokusaj ceka redovni interval. Potrosene koordinate se brisu prije nadzora. Wake provjera takodjer odmah koristi potvrdu povratka umjesto da je odbaci. Wake dodir kod dugih interaktivnih reklama moze odmah pokrenuti dodatnu AI provjeru, uz postojeca ogranicenja API poziva.
 
-Povratak iz Google Play/Chrome toka prvo koristi tacnu Android package/activity informaciju iz BlueStacks loga, a AI provjerava trenutni ekran prije dodatnog Back pokusaja. Povratak u samu igru vise se ne potvrdjuje OpenCV slicnoscu gornje trake: prihvata se samo svjezi `eu.nordeus.common.MainPlayerNativeActivity` dogadjaj nastao nakon pokretanja reklame ili AI potvrda stvarnog Top Eleven zaglavlja sa vise kartica resursa. Oglasni `AdActivity` i stari MainPlayer zapis od prije reklame nisu dovoljni.
+Povratak iz Google Play/Chrome toka koristi svjezu AI potvrdu prije Back-a i novu AI sliku poslije njega. Broj Back komandi je ogranicen, a nepromijenjen ekran prekida niz. Android activity provjere potpuno su uklonjene iz pocetka faza, pokretanja reklama, nadzora, treninga i oporavka. ADB sluzi samo kao kanal za komande, ne za prepoznavanje ekrana.
+
+TV nagrada `PRIRUCNIK` takodjer ima vlastitu sigurnu izlaznu putanju: nakon vec opazene reklame dva uzastopna lokalna `manual_3` framea (`NABAVLJEN NOVI PRIRUCNIK`) odmah predaju tok obradi prirucnika. Time kasni Android activity zapis vise ne ostavlja agent u reklamnoj petlji na ekranu vec osvojene nagrade.
+
+Obicna TV nagrada nakon vec opazene reklame prihvata dva uzastopna lokalna `tv` framea kao povratak, cak i kada Android activity zapis kasni poslije Play Storea. Ova putanja je zabranjena za nagradu `PRIRUCNIK`, koja mora prikazati poseban `manual_3` ekran.
+
+Lokalne brze potvrde povratka (`tv`, `manual_3` i profil igraca) aktiviraju se tek nakon sto je AI na prethodnom svjezem frameu stvarno vidio reklamni ekran. Sam ADB `AdActivity` nije dovoljan, jer se u prvim sekundama iza nove aktivnosti moze jos vidjeti stari ekran igre. Profil igraca uz dva stabilna framea mora imati i vlastiti strogi vizuelni potpis: veliki svijetli modal te poravnate crvenu `POVREDE`, plavu `MORAL` i zelenu `KONDICIJA` kontrolu. Resource zaglavlje nije obavezno jer ga profil moze djelimicno prekriti.
+
+Put saveza nakon AI-potvrdjene reklame prihvata povratak kada dva uzastopna lokalna `alliance_flow` framea vide isti `path` modal i stabilan modalni X. Taj vec potvrden modal ne prolazi kroz dodatnu 75-sekundnu `MainPlayerNativeActivity` kapiju; odmah se predaje postojecoj stabilnoj provjeri X-a i zatvara.
+
+Prije pocetka faze stari ADB/Player.log `AdActivity` zapis ne moze sam pokrenuti reklamni watcher. Ako dva uzastopna lokalna TV-flow framea jasno prepoznaju puni ekran `POCETNI`, zapis se smatra zastarjelim i faza nastavlja bez izmisljene reklame. Stvarni Store/Chrome foreground i dalje ima prioritet i mora se prvo zatvoriti.
 
 Ako Gemini pri potvrdi povratka jednom vrati prekinut ili nedovrsen JSON, agent odmah ponavlja analizu na svjezoj slici. U toku odmora igraca nakon klika na X ostavlja se dovoljno vremena i za narednu provjeru nakon API backoffa, pa jedan neispravan odgovor vise ne prekida cijeli red igraca iako je reklama vec zatvorena.
 
@@ -92,14 +102,34 @@ Za sigurnu provjeru koordinata koristi opciju Kalibracija. Ona ne klikce.
 
 ## Offline provjere
 
+Kampus poslije prvog otvaranja objekta ostaje u detalju i bira naredne objekte iz donje lijeve trake. Puni zeleni indikatori se preskacu, a potpuno vidljive kartice s bijelim ostatkom biraju se uz svjezu lokalnu potvrdu. Traka se prvo dovodi do lijevog kraja, a zatim se za naredne objekte povlaci zdesna nalijevo. Zavrsavanje zahtijeva dva pokusaja bez pomjeranja na desnom kraju i bez vidljivih nepotpunih kartica. Reklama se pokrece samo preko potvrdenog plavog video dugmeta `100%`, nikad preko placenog `+10%` ili `UNAPRIJEDI`.
+
+Najjednostavnije je u Manageru otvoriti `Postavke` i pritisnuti `Provjeri projekat`, ili pokrenuti `Provjeri projekat.cmd`. Provjera ne upravlja BlueStacksom: validira obavezne fajlove, PowerShell i JSON sintaksu, Python testove i oba SelfTesta. Iz komandne linije se moze pokrenuti bez dijaloga:
+
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TopElevenAgent.ps1 -SelfTest
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TopElevenAgent.ps1 -SelfTest
-python -m unittest discover -s .\tests -v
-python -m py_compile .\VisionAgent.py .\XDetector.py
-python .\regression\run_opencv_regression.py
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\Provjeri projekat.ps1" -NoGui
 ```
 
-Regresijski runner cita screenshotove direktno iz roditeljskog `ss.zip`; ne raspakuje ih u projekat i ne mijenja arhivu.
+Ako racunar nema ugradjeni Codex Python runtime, napravi `.venv` ili `venv` i instaliraj zavisnosti:
 
-Ne ukljucuj puni automatizovani red prije testiranja jedne reklame pod nadzorom. Odbijeni i nepoznati AI rezultati spremaju se u `debug` folder radi naknadne analize.
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r .\requirements.txt
+```
+
+Pojedinacne provjere su:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TopElevenAgent.ps1 -SelfTest
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\TopElevenManager.ps1 -SelfTest
+python -m unittest discover -s .\tests -v
+python -m py_compile .\VisionAgent.py .\XDetector.py
+python .\regression\run_opencv_regression.py --zip "C:\putanja\do\ss.zip"
+```
+
+Regresijski runner cita screenshotove direktno iz zadatog `ss.zip`; ne raspakuje ih u projekat i ne mijenja arhivu. Ako arhiva nije prisutna, kompletna provjera je jasno oznacava kao opcionalno preskocenu.
+
+Ne ukljucuj puni automatizovani red prije testiranja jedne reklame pod nadzorom. Odbijeni i nepoznati AI rezultati spremaju se u `debug` folder radi naknadne analize; zadrzava se najvise `maximumDebugCaptures` snimaka (standardno 200) zajedno sa njihovim JSON metapodacima.
+# Rezervni Gemini API kljuc
+
+Pokreni `Postavi rezervni Gemini API kljuc.cmd` za unos drugog kljuca. Kada Gemini vrati HTTP 429 zbog potrosene kvote, VisionAgent automatski prelazi na sljedeci konfigurirani kljuc. Rezervni kljuc treba pripadati drugom Google Cloud projektu s vlastitom dostupnom kvotom; kljucevi istog projekta dijele limit.

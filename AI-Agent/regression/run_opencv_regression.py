@@ -27,15 +27,34 @@ def load_from_zip(archive, name):
 def main():
     parser = argparse.ArgumentParser(description="Replay XDetector against ss.zip screenshots")
     parser.add_argument("--manifest", default=str(Path(__file__).with_name("manifest.json")))
+    parser.add_argument(
+        "--zip",
+        dest="zip_path",
+        help="Optional screenshot archive path; overrides the path from manifest.json",
+    )
     args = parser.parse_args()
 
     manifest_path = Path(args.manifest).resolve()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    zip_path = (manifest_path.parent / manifest["zip"]).resolve()
+    zip_path = (
+        Path(args.zip_path).expanduser().resolve()
+        if args.zip_path
+        else (manifest_path.parent / manifest["zip"]).resolve()
+    )
+    if not zip_path.is_file():
+        parser.error(
+            f"Screenshot archive was not found: {zip_path}. "
+            "Pass its location with --zip or restore ss.zip next to the project."
+        )
     failures = []
 
     with zipfile.ZipFile(zip_path) as archive:
+        archive_names = set(archive.namelist())
         for case in manifest["cases"]:
+            if case["image"] not in archive_names:
+                print(f"FAIL: {case['name']} -> missing archive entry {case['image']}")
+                failures.append(case["name"])
+                continue
             image = load_from_zip(archive, case["image"])
             left, top, right, bottom = case["crop"]
             crop = image[top:bottom, left:right]

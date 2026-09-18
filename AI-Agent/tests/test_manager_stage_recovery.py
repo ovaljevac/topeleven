@@ -149,12 +149,21 @@ class StageRecoveryContractTests(unittest.TestCase):
         cls.agent = read_text(AGENT_PATH)
         cls.config = json.loads(read_text(CONFIG_PATH))
 
-    def test_retry_limit_is_exactly_three(self):
+    def test_only_a_stuck_ad_uses_the_three_attempt_hard_recovery(self):
         self.assertEqual(3, self.config.get("stageRetryAttempts"))
         self.assertRegex(
             self.agent,
             r"\$script:StageRetryAttempts\s*=\s*3\b",
         )
+        hard_recovery_gate = function_body(
+            self.agent, "Test-StageFailureRequiresHardRecovery"
+        )
+        self.assertIn("AgentFailureKind", hard_recovery_gate)
+        self.assertIn("AdTimeout", hard_recovery_gate)
+        self.assertIn("ExternalReturnTimeout", hard_recovery_gate)
+        self.assertNotIn("-match", hard_recovery_gate)
+        self.assertNotIn("AI nije pouzdano", hard_recovery_gate)
+
         retry = function_body(self.agent, "Invoke-StageWithRecovery")
         self.assertIn(
             "for ($attempt = 1; $attempt -le $script:StageRetryAttempts; $attempt++)",
@@ -164,9 +173,17 @@ class StageRecoveryContractTests(unittest.TestCase):
         self.assertRegex(
             retry,
             r"(?i)\$attempt\s+-lt\s+\$script:StageRetryAttempts",
-            "BlueStacks must only restart when another attempt remains",
+            "A stuck ad may restart BlueStacks only while another attempt remains",
         )
-        self.assertIn("Invoke-VerifiedStageRecovery", retry)
+        classifier = retry.index("Test-StageFailureRequiresHardRecovery")
+        soft_return = retry.index("HardRecoveryRequired = $false", classifier)
+        hard_restart = retry.index("Invoke-VerifiedStageRecovery $Name", soft_return)
+        self.assertLess(classifier, soft_return)
+        self.assertLess(soft_return, hard_restart)
+        self.assertIn(
+            "Top Eleven ostaje otvoren i force-stop se nece raditi",
+            retry,
+        )
         verified_recovery = function_body(
             self.agent, "Invoke-VerifiedStageRecovery"
         )
@@ -175,6 +192,18 @@ class StageRecoveryContractTests(unittest.TestCase):
             verified_recovery,
         )
         self.assertIn("Restart-TopElevenForStageRetry", verified_recovery)
+
+    def test_ai_soft_retry_contract_keeps_the_current_screen_open(self):
+        self.assertEqual(180, self.config.get("aiSoftRetryTimeoutSeconds"))
+        self.assertEqual(10, self.config.get("aiSoftRetryIntervalSeconds"))
+        self.assertRegex(
+            self.agent,
+            r"\$script:AiSoftRetryTimeoutSeconds\s*=\s*180\b",
+        )
+        self.assertRegex(
+            self.agent,
+            r"\$script:AiSoftRetryIntervalSeconds\s*=\s*10\b",
+        )
 
     def test_restart_force_stops_only_the_active_instance_and_relaunches(self):
         restart = function_body(self.agent, "Restart-TopElevenForStageRetry")
@@ -203,10 +232,15 @@ class StageRecoveryContractTests(unittest.TestCase):
         combined = function_body(self.agent, "Invoke-CombinedStage")
         self.assertIn("Invoke-StageWithRecovery", combined)
         success_gate = combined.index("if ($result.Success)")
-        final_restart = combined.index("Invoke-VerifiedStageRecovery", success_gate)
+        hard_gate = combined.index(
+            "if ([bool]$result.HardRecoveryRequired)", success_gate
+        )
+        final_restart = combined.index("Invoke-VerifiedStageRecovery", hard_gate)
         failure_return = combined.index("return $false", final_restart)
-        self.assertLess(success_gate, final_restart)
+        self.assertLess(success_gate, hard_gate)
+        self.assertLess(hard_gate, final_restart)
         self.assertLess(final_restart, failure_return)
+        self.assertIn("bez nepotrebnog gasenja igre", combined)
         self.assertIn("$script:StagePreflightRecoveryRequired = $true", combined)
 
         start = function_body(self.agent, "Start-Automation")
@@ -226,6 +260,28 @@ class StageRecoveryContractTests(unittest.TestCase):
             with self.subTest(action=action):
                 self.assertIn(action, start)
         self.assertIn("Invoke-StageWithRecovery 'Uzmi 25 zelenih'", start)
+
+    def test_loaded_game_confirmation_has_no_redundant_ai_one_of_two_gate(self):
+        restart = function_body(self.agent, "Restart-TopElevenForStageRetry")
+        return_probe = function_body(self.agent, "Test-TopElevenReturnedAfterAd")
+        self.assertNotIn(
+            "if (Test-TopElevenResourceHeaderReady $Handle -ForceRefresh:$ForceRefresh) { return $true }",
+            return_probe,
+            "Ad creative colors can resemble the resource header; that signal alone "
+            "must never finish the ad watcher.",
+        )
+        self.assertIn("Test-StoreReturnVisualProof", return_probe)
+        self.assertNotIn("Get-BlueStacksForegroundState", return_probe)
+        self.assertIn("Wait-Agent 300", return_probe)
+        self.assertIn(
+            "Test-TopElevenReturnedAfterAd $handle $launchedAt -ForceRefresh",
+            restart,
+        )
+        ai_gate = restart.index("if ($script:AiTopElevenReturned)")
+        direct_return = restart.index("return $handle", ai_gate)
+        self.assertLess(ai_gate, direct_return)
+        self.assertNotIn("$stableAiHomeFrames", restart)
+        self.assertNotIn("AI potvrda da je ucitan Top Eleven (1/2)", restart)
 
 
 class PutSavezaTimeoutContractTests(unittest.TestCase):
