@@ -40,6 +40,20 @@ class MourinhoFlowTests(unittest.TestCase):
         self.assertIsNotNone(result["button"])
         self.assertGreaterEqual(result["button"]["textScore"], 0.55)
 
+    def test_new_main_screen_reference(self):
+        result = x_detector.detect_mourinho_flow(self.load(3))
+        self.assertEqual("mourinho_home", result["state"])
+        self.assertIsNotNone(result["warning"])
+        self.assertEqual("info_button", result["warning"]["style"])
+        self.assertAlmostEqual(0.614, result["warning"]["x"], delta=0.015)
+        self.assertAlmostEqual(0.977, result["warning"]["y"], delta=0.02)
+
+    def test_new_popup_and_watch_button(self):
+        result = x_detector.detect_mourinho_flow(self.load(4))
+        self.assertEqual("mourinho_popup", result["state"])
+        self.assertIsNotNone(result["button"])
+        self.assertGreaterEqual(result["button"]["textScore"], 0.55)
+
     def test_plain_blue_popup_button_is_rejected(self):
         image = self.load(2)
         image[341:370, 725:842] = (240, 170, 70)

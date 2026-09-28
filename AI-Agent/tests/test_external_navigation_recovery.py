@@ -121,6 +121,7 @@ if ($null -eq $result) {{ 'null' }} else {{ [string]$result }}
         self.assertLess(success_return, escape)
 
 
+
     def test_serial_resolution_is_fail_closed_with_multiple_devices(self):
         resolver = function_body("Resolve-BlueStacksAdbSerial")
         self.assertIn("$deviceSerials.Count -eq 1", resolver)
@@ -150,6 +151,16 @@ class ExternalNavigationRecoveryContractTests(unittest.TestCase):
         self.assertIn("Send-BlueStacksBack $Handle", restore)
         self.assertIn("$script:ExternalNavigationBackAttempts", restore)
         self.assertNotIn("$recentAiPlayClick", restore)
+
+    def test_install_overlay_x_overrides_external_navigation_guess(self):
+        detector = function_body("Test-AiExternalNavigationVisible")
+        self.assertIn("light-overlay-component", detector)
+        self.assertIn("return $false", detector)
+        self.assertLess(
+            detector.index("light-overlay-component"),
+            detector.index("AI je potvrdio da je Google Play/Chrome jos uvijek otvoren"),
+        )
+
 
     def test_current_external_package_is_not_ignored_as_an_already_handled_event(self):
         restore = function_body("Restore-AdFromGooglePlay")

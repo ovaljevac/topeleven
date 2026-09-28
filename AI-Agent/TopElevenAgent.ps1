@@ -1741,6 +1741,23 @@ function Test-AiExternalNavigationVisible {
     $visible = $null -ne $vision -and $vision.accepted -and
         [string]$vision.decision.screenType -in @('google_play_store', 'play_google_chrome') -and
         [string]$vision.decision.recommendedAction -eq 'send_back'
+    if ($visible) {
+        # Advertiser install sheets can resemble a Store page but expose their
+        # own small X. A locally verified X is stronger current-frame evidence
+        # than the semantic guess and lets the normal AI ad-control path close
+        # it safely instead of sending ineffective Back commands forever.
+        Start-XDetector
+        $rect = Get-WindowRectangle $Handle
+        $request = @{ rect = @($rect.Left, $rect.Top, $rect.Right, $rect.Bottom) } | ConvertTo-Json -Compress
+        $script:XDetectorProcess.StandardInput.WriteLine($request)
+        $script:XDetectorProcess.StandardInput.Flush()
+        $localControl = Read-AgentProcessLine $script:XDetectorProcess 'Provjera X-a na install overlayu' $script:XDetectorResponseTimeoutSeconds | ConvertFrom-Json
+        if ([bool]$localControl.found -and [string]$localControl.kind -eq 'close' -and
+            [string]$localControl.method -eq 'light-overlay-component') {
+            Add-Log ("Lokalni verifier je potvrdio X install overlaya na {0:N3},{1:N3}; ne saljem Back nego nastavljam sigurni ad-control tok." -f [double]$localControl.x, [double]$localControl.y)
+            return $false
+        }
+    }
     if ($visible) { Add-Log 'AI je potvrdio da je Google Play/Chrome jos uvijek otvoren.' }
     return $visible
 }
@@ -1761,7 +1778,7 @@ function Get-AiMourinhoWarning {
         y = [double]$vision.decision.control.y
         confidence = [double]$vision.decision.control.confidence
     }
-    Add-Log ("AI je locirao Mourinho dugme: confidence={0:N2}, centar={1:N3},{2:N3}" -f $target.confidence, $target.x, $target.y)
+    Add-Log ("AI je locirao malo Mourinho dugme: confidence={0:N2}, centar={1:N3},{2:N3}" -f $target.confidence, $target.x, $target.y)
     return $target
 }
 
@@ -3066,15 +3083,23 @@ function Wait-MourinhoFlowState {
 function Run-MourinhoAutomation {
     param([IntPtr]$Handle)
 
-    Set-Status 'AI trazi kvadratno dugme desno od readiness progress bara...'
+    Set-Status 'Trazim malo sivo Mourinho i-dugme na kraju Nivo spremnosti...'
     $warningTarget = $null
     $warningDeadline = (Get-Date).AddSeconds($script:AiSoftRetryTimeoutSeconds)
     $attempt = 0
     while ($null -eq $warningTarget -and (Get-Date) -lt $warningDeadline) {
         Test-Cancelled
         $attempt++
-        Add-Log "Saljem AI-u svjezu sliku za Mourinho dugme (soft provjera $attempt)..."
-        $warningTarget = Get-AiMourinhoWarning $Handle
+        Add-Log "Trazim Mourinho dugme na svjezoj slici (provjera $attempt)..."
+        $snapshot = Get-MourinhoFlowSnapshot $Handle
+        if ([string]$snapshot.state -eq 'mourinho_home' -and $null -ne $snapshot.warning) {
+            $warningTarget = $snapshot.warning
+            Add-Log ("OpenCV je locirao Mourinho dugme: centar={0:N3},{1:N3}, stil={2}" -f $warningTarget.x, $warningTarget.y, $warningTarget.style)
+        }
+        if ($null -eq $warningTarget) {
+            Add-Log 'OpenCV nije potvrdio dugme; saljem sliku AI-u kao rezervnu provjeru.'
+            $warningTarget = Get-AiMourinhoWarning $Handle
+        }
         if ($null -eq $warningTarget) {
             if (Try-RecoverConnectionInterruptedPopup $Handle) {
                 Add-Log 'Popup je uklonjen tokom trazenja Mourinho dugmeta; ostajem na istom koraku.'
@@ -3084,7 +3109,7 @@ function Run-MourinhoAutomation {
         }
     }
     if ($null -eq $warningTarget) {
-        throw 'AI nije pronasao kvadratno Mourinho dugme desno od readiness bara i lijevo od PREGLED UTAKMICE.'
+        throw 'Nije pronadjeno malo sivo Mourinho i-dugme na kraju Nivo spremnosti.'
     }
 
     Click-Relative $Handle $warningTarget.x $warningTarget.y 'Mourinho dugme - AI lokacija'

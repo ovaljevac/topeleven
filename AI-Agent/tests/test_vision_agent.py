@@ -154,9 +154,39 @@ class VisionGuardTests(unittest.TestCase):
     def test_prompt_explicitly_recognizes_embedded_google_play_app_page(self):
         source = (ROOT / "VisionAgent.py").read_text(encoding="utf-8")
         self.assertIn("literal header \"Google Play\"", source)
-        self.assertIn("app-detail page with a visible back arrow", source)
-        self.assertIn("rendered inside an ad webview", source)
+        self.assertIn("dark centered popup", source)
+        self.assertIn("underlying ad remains visible", source)
+        self.assertIn("uses an X in its own upper-right instead of a back arrow", source)
         self.assertIn("The Install button is evidence", source)
+
+    def test_external_navigation_needs_one_current_ai_confirmation(self):
+        config = {
+            "minimumConfidence": 0.85,
+            "requiredAgreementCount": 2,
+            "coordinateTolerance": 0.035,
+            "saveUnknownScreenshots": False,
+        }
+        server = vision_agent.VisionServer(config)
+        original_request = vision_agent.request_vision_model
+        raw = decision(
+            action="send_back",
+            control="back",
+            x=None,
+            y=None,
+            confidence=0.99,
+            text="Google Play Warline Install",
+        )
+        raw["screenType"] = "google_play_store"
+        vision_agent.request_vision_model = lambda image, expected, config: raw
+        try:
+            result = server.analyze(
+                vision_agent.Image.new("RGB", (1095, 631), "black"),
+                "external_navigation_123",
+            )
+        finally:
+            vision_agent.request_vision_model = original_request
+        self.assertTrue(result["accepted"])
+        self.assertEqual(1, result["requiredStableCount"])
 
     def test_ai_only_server_keeps_exact_ai_coordinates_without_opencv_refinement(self):
         config = {
@@ -247,7 +277,7 @@ class VisionGuardTests(unittest.TestCase):
         try:
             image = vision_agent.Image.new("RGB", (32, 32), "black")
             self.assertFalse(server.analyze(image, "ad_control")["accepted"])
-            self.assertFalse(server.analyze(image, "external_navigation")["accepted"])
+            self.assertTrue(server.analyze(image, "external_navigation")["accepted"])
             self.assertTrue(server.analyze(image, "ad_control")["accepted"])
             self.assertTrue(server.analyze(image, "external_navigation")["accepted"])
         finally:
@@ -919,6 +949,8 @@ class VisionGuardTests(unittest.TestCase):
         )
         try:
             prompt, supplied = vision_agent.build_user_prompt(image, "mourinho_warning")
+            self.assertIn("lowercase 'i'", prompt)
+            self.assertIn("Do not select either purple badge", prompt)
             self.assertIn("Nivo spremnosti", prompt)
             self.assertIn("PREGLED UTAKMICE", prompt)
             self.assertIn("control.type=mourinho_warning", prompt)
@@ -927,22 +959,44 @@ class VisionGuardTests(unittest.TestCase):
         finally:
             vision_agent.detect_guarded_candidate = original
 
-    def test_accepts_ai_mourinho_target_inside_readiness_zone(self):
+    def test_accepts_ai_mourinho_target_inside_readiness_opponent_zone(self):
         normalized, errors = vision_agent.validate_decision(
-            mourinho_decision(), self.config, "mourinho_warning", image_size=(1091, 634)
+            mourinho_decision(x=0.55, y=0.90),
+            self.config,
+            "mourinho_warning",
+            image_size=(1091, 634),
         )
         self.assertEqual([], errors)
         self.assertEqual("click_target", normalized["recommendedAction"])
         self.assertEqual("mourinho_warning", normalized["control"]["type"])
 
-    def test_rejects_ai_mourinho_target_outside_readiness_zone(self):
+    def test_accepts_redesigned_gray_info_mourinho_button_zone(self):
+        normalized, errors = vision_agent.validate_decision(
+            mourinho_decision(x=0.614, y=0.977),
+            self.config,
+            "mourinho_warning",
+            image_size=(1067, 616),
+        )
+        self.assertEqual([], errors)
+        self.assertEqual("click_target", normalized["recommendedAction"])
+
+    def test_rejects_redesigned_match_preview_button(self):
+        _, errors = vision_agent.validate_decision(
+            mourinho_decision(x=0.485, y=0.805),
+            self.config,
+            "mourinho_warning",
+            image_size=(1067, 616),
+        )
+        self.assertIn("Mourinho button coordinate outside readiness-info zone", errors)
+
+    def test_rejects_ai_mourinho_target_outside_readiness_opponent_zone(self):
         _, errors = vision_agent.validate_decision(
             mourinho_decision(x=0.2, y=0.2),
             self.config,
             "mourinho_warning",
             image_size=(1091, 634),
         )
-        self.assertIn("Mourinho warning coordinate outside readiness-bar zone", errors)
+        self.assertIn("Mourinho button coordinate outside readiness-info zone", errors)
 
     def test_rejects_click_target_in_other_states(self):
         _, errors = vision_agent.validate_decision(

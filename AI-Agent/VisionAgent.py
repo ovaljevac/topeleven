@@ -357,12 +357,13 @@ Safety is more important than closing an ad:
   badge/pill, never an Install/Get/Open/Buy button inside a store page.
 - Control priority on an ad is: genuine close X first, then genuine >>/Skip,
   then an ad Google Play/Play Store badge only when no close or skip control is visible.
-- Use send_back only on Google Play Store or a standalone Chrome destination opened by
-  the ad. Chrome destinations include play.google.com, googleadservices.com/pagead/aclk,
+- Use send_back only on Google Play Store, a Google Play app-detail modal opened over
+  the ad, or a standalone Chrome destination opened by the ad. Chrome destinations include play.google.com, googleadservices.com/pagead/aclk,
   a blank redirect tab, or the advertiser page when Chrome's own tabs/address bar is visible.
-- A full app-detail destination with a visible back arrow, the literal header "Google Play",
-  an app title, and an Install button IS a Google Play Store screen even when it appears inside
-  the BlueStacks content area, an ad webview, or without the usual standalone Play Store chrome.
+- A full app-detail destination with the literal header "Google Play", an app title, and
+  an Install button IS a Google Play Store screen even when it is a dark centered popup over
+  the still-visible ad, uses an X in its own upper-right instead of a back arrow, appears inside
+  an ad webview, or lacks the usual standalone Play Store chrome.
   Return send_back for that destination; never click its Install button.
 - Use click_target only when expected state is exactly mourinho_warning. In that
   state it means the small square !/information button immediately to the right
@@ -956,11 +957,14 @@ def build_user_prompt(
     if mourinho_warning:
         prompt = (
             "The screenshot is expected to show the Top Eleven home screen. Locate exactly "
-            "one small square information/warning button immediately to the RIGHT of the "
-            "horizontal readiness progress bar labelled 'Nivo spremnosti' and to the LEFT of "
-            "the large 'PREGLED UTAKMICE' button. The target may be red with a white !, yellow "
-            "with a dark ! or i, and its position may move with the window layout. Return the "
-            "CENTER of that small square in coordinates normalized to the full supplied image. "
+            "one small Mourinho information button at the RIGHT END of the readiness area "
+            "labelled 'Nivo spremnosti'. In the redesigned screen it is a small gray rectangular "
+            "button with a lowercase 'i' near the BOTTOM edge around x=0.62; in the older screen "
+            "it can be a red or yellow square with an ! or i immediately after the readiness bar. "
+            "Return the CENTER of that small button in coordinates normalized to the full supplied image. "
+            "Do not select either purple badge beside a team crest, the blue PREGLED heading, "
+            "the large PREGLED UTAKMICE button, a banner button, a team crest, the opponent's "
+            "green arrow, or any resource icon. "
             "If clearly visible return screenType=top_eleven, control.type=mourinho_warning, "
             "recommendedAction=click_target and confidence. Do not select the TV icon, chat "
             "button, progress bar, PREGLED UTAKMICE, an ad, or any other square. If the exact "
@@ -1127,15 +1131,19 @@ def build_user_prompt(
             "If either external destination is visible, return "
             "screenType=google_play_store for the Store or screenType=play_google_chrome for "
             "a Chrome destination, control.type=back, recommendedAction=send_back, "
-            "x=null and y=null. Treat an app-detail page with a visible back arrow, the literal "
-            "'Google Play' header, an app name and an Install button as Google Play Store even when "
-            "it is rendered inside an ad webview or fills only the BlueStacks content viewport. "
+            "x=null and y=null. A dark centered popup with the literal 'Google Play' header, an "
+            "app publisher/name, rating/download details, an Install button, and its own X in the "
+            "upper-right IS a Google Play Store app-detail destination. Return send_back for it even "
+            "when it fills only part of the BlueStacks viewport and the underlying ad remains visible. "
             "The Install button is evidence of the destination but must never be clicked. "
             "If the ad or Top Eleven is visible instead, return control.type=none "
             "and recommendedAction=none. Campus buildings, maintenance percentages and the "
             "Top Eleven resource bar belong to the game, not to Google Play. Never recommend "
             "click_campus_building or any game action in this external-navigation check. "
-            "A Google Play logo or Install button inside an ordinary ad alone is not a Store page. "
+            "A small Google Play logo or CTA inside an ordinary ad is not enough by itself; the full "
+            "app-detail modal with the literal Google Play header, app title and Install button is a Store destination. "
+            "A white advertiser landing sheet with an app title, Install button and its own X but WITHOUT "
+            "the literal Google Play header is still part of the ad, not external navigation; return none. "
             "Do not use a remembered previous screen and do not return "
             "coordinates for Back. Return only the schema-conforming object."
         )
@@ -1579,8 +1587,10 @@ def validate_decision(
         if x is not None and not ai_only and action == "click_google_play" and (x < 0.55 or y > 0.35):
             errors.append("Google Play coordinate outside guarded top-right zone")
         if x is not None and mourinho_warning and action == "click_target":
-            if not (0.42 <= x <= 0.65 and 0.70 <= y <= 1.0):
-                errors.append("Mourinho warning coordinate outside readiness-bar zone")
+            legacy_zone = 0.47 <= x <= 0.68 and 0.84 <= y <= 0.99
+            redesigned_zone = 0.58 <= x <= 0.67 and 0.91 <= y <= 1.0
+            if not (legacy_zone or redesigned_zone):
+                errors.append("Mourinho button coordinate outside readiness-info zone")
         if x is not None and campus_building and action == "click_campus_building":
             if not (0.05 <= x <= 0.88 and 0.25 <= y <= 0.92):
                 errors.append("Campus building coordinate outside campus object zone")
@@ -1934,6 +1944,11 @@ class VisionServer:
                 if decision.get("recommendedAction") == "click_campus_building"
                 else max(2, int(self.config["requiredAgreementCount"]))
             )
+        elif expected_state.startswith("external_navigation"):
+            # Back is reversible and has no click coordinates. One current AI
+            # confirmation is sufficient; the next 12-second probe verifies
+            # whether the destination actually disappeared.
+            required = 1
         else:
             required = int(self.config["requiredAgreementCount"])
         accepted = not errors and state["stable_count"] >= required

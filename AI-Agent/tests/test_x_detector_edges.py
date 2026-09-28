@@ -119,6 +119,32 @@ class GuardedEdgeTests(unittest.TestCase):
         self.assertEqual("top-left-google-play-badge", result["method"])
         self.assertLess(result["y"], 0.09)
 
+    def test_detects_dark_x_on_white_install_overlay(self):
+        image = x_detector.np.full((615, 1067, 3), 245, dtype=x_detector.np.uint8)
+        # BlueStacks toolbar begins after the app viewport and must not become
+        # part of the candidate component.
+        image[:, 1034:] = (40, 40, 40)
+        x_detector.cv2.line(image, (1001, 60), (1013, 72), (115, 115, 115), 2)
+        x_detector.cv2.line(image, (1013, 60), (1001, 72), (115, 115, 115), 2)
+
+        result = x_detector.detect_x(image, live=True)
+
+        self.assertIsNotNone(result)
+        self.assertEqual("close", result["kind"])
+        self.assertAlmostEqual(1007 / 1067, result["x"], delta=0.005)
+        self.assertAlmostEqual(66 / 615, result["y"], delta=0.01)
+
+    def test_light_install_overlay_x_refines_nearby_ai_coordinate(self):
+        image = x_detector.np.full((615, 1067, 3), 245, dtype=x_detector.np.uint8)
+        image[:, 1034:] = (40, 40, 40)
+        x_detector.cv2.line(image, (1001, 60), (1013, 72), (115, 115, 115), 2)
+        x_detector.cv2.line(image, (1013, 60), (1001, 72), (115, 115, 115), 2)
+
+        result = x_detector.refine_close_x_near_point(image, 0.943, 0.108)
+
+        self.assertTrue(result["found"])
+        self.assertEqual("ai-local-light-overlay-component", result["method"])
+
 
 if __name__ == "__main__":
     unittest.main()

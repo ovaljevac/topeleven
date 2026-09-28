@@ -581,6 +581,80 @@ def _detect_right_corner_x(bgr, live=False):
     }
 
 
+def _detect_light_overlay_x(bgr):
+    """Detect the thin dark X on a nearly white advertiser landing sheet."""
+    height, width = bgr.shape[:2]
+    if width < 400 or height < 300:
+        return None
+
+    game_right = max(1, width - 42)
+    left = int(width * 0.88)
+    right = min(game_right, int(width * 0.98))
+    top = int(height * 0.06)
+    bottom = min(height, int(height * 0.16))
+    roi = cv2.cvtColor(bgr[top:bottom, left:right], cv2.COLOR_BGR2GRAY)
+    if roi.size == 0 or float(np.mean(roi >= 225)) < 0.72:
+        return None
+
+    dark = (roi < 190).astype(np.uint8)
+    count, labels, stats, centers = cv2.connectedComponentsWithStats(dark)
+    candidates = []
+    for index, (stat, center) in enumerate(zip(stats[1:count], centers[1:count]), start=1):
+        x, y, component_width, component_height, area = map(int, stat)
+        if not (8 <= component_width <= 24 and 8 <= component_height <= 24):
+            continue
+        aspect = component_width / float(max(1, component_height))
+        fill = area / float(max(1, component_width * component_height))
+        if not (0.72 <= aspect <= 1.38 and 0.16 <= fill <= 0.55):
+            continue
+
+        component = labels[y:y + component_height, x:x + component_width] == index
+        points_y, points_x = np.where(component)
+        if len(points_x) < 24:
+            continue
+        normalized_component_x = points_x / float(max(1, component_width - 1))
+        normalized_component_y = points_y / float(max(1, component_height - 1))
+        diagonal_band = 0.26
+        arms = (
+            np.count_nonzero((normalized_component_x < 0.45) & (normalized_component_y < 0.45) &
+                             (np.abs(normalized_component_x - normalized_component_y) <= diagonal_band)),
+            np.count_nonzero((normalized_component_x > 0.55) & (normalized_component_y > 0.55) &
+                             (np.abs(normalized_component_x - normalized_component_y) <= diagonal_band)),
+            np.count_nonzero((normalized_component_x > 0.55) & (normalized_component_y < 0.45) &
+                             (np.abs(normalized_component_x + normalized_component_y - 1.0) <= diagonal_band)),
+            np.count_nonzero((normalized_component_x < 0.45) & (normalized_component_y > 0.55) &
+                             (np.abs(normalized_component_x + normalized_component_y - 1.0) <= diagonal_band)),
+        )
+        center_pixels = np.count_nonzero(
+            (normalized_component_x >= 0.30) & (normalized_component_x <= 0.70) &
+            (normalized_component_y >= 0.30) & (normalized_component_y <= 0.70)
+        )
+        if min(arms) < 3 or center_pixels < 4:
+            continue
+
+        screen_x = left + float(center[0])
+        screen_y = top + float(center[1])
+        normalized_screen_x = screen_x / width
+        normalized_screen_y = screen_y / height
+        if not (0.90 <= normalized_screen_x <= 0.97 and 0.075 <= normalized_screen_y <= 0.15):
+            continue
+        candidates.append((area, screen_x, screen_y))
+
+    if not candidates:
+        return None
+    area, center_x, center_y = max(candidates)
+    return {
+        "found": True,
+        "x": float(center_x / width),
+        "y": float(center_y / height),
+        "score": round(float(220 + area), 2),
+        "polarity": "dark-on-light",
+        "method": "light-overlay-component",
+        "shape": 100.0,
+        "kind": "close",
+    }
+
+
 def refine_close_x_near_point(bgr, normalized_x, normalized_y):
     """Find the geometric center of an X only near an AI-selected point."""
     height, width = bgr.shape[:2]
@@ -593,6 +667,18 @@ def refine_close_x_near_point(bgr, normalized_x, normalized_y):
         return {"found": False, "reason": "invalid-ai-point"}
 
     radius = int(max(24, min(64, round(min(width, height) * 0.075))))
+    light_overlay = _detect_light_overlay_x(bgr)
+    if light_overlay is not None:
+        overlay_x = float(light_overlay["x"]) * width
+        overlay_y = float(light_overlay["y"]) * height
+        overlay_distance = math.hypot(overlay_x - ai_x, overlay_y - ai_y)
+        if overlay_distance <= radius:
+            result = dict(light_overlay)
+            result["distancePixels"] = round(overlay_distance, 2)
+            result["radiusPixels"] = radius
+            result["method"] = "ai-local-light-overlay-component"
+            return result
+
     left = max(0, int(round(ai_x)) - radius)
     right = min(width, int(round(ai_x)) + radius + 1)
     top = max(0, int(round(ai_y)) - radius)
@@ -667,6 +753,10 @@ def detect_x(bgr, live=False):
         left_result["side"] = "left"
         if float(left_result["x"]) <= 0.14:
             candidates.append(left_result)
+
+    light_overlay = _detect_light_overlay_x(bgr)
+    if light_overlay is not None:
+        candidates.append(light_overlay)
 
     # A geometrically verified X has priority over a skip/chevron candidate.
     # Reward-granted text can otherwise create a false double-chevron inside
@@ -1075,6 +1165,13 @@ def _tv_watch_text_templates():
         crop = mourinho_reference[341:369, 725:842]
         if crop.size:
             templates.append(np.all(crop >= 190, axis=2).astype(np.uint8))
+    new_mourinho_reference = cv2.imread(
+        os.path.join(MOURINHO_REFERENCE_DIR, "4.png"), cv2.IMREAD_COLOR
+    )
+    if new_mourinho_reference is not None:
+        crop = new_mourinho_reference[359:386, 642:799]
+        if crop.size:
+            templates.append(np.all(crop >= 190, axis=2).astype(np.uint8))
     _TV_WATCH_TEXT_TEMPLATES = templates
     return templates
 
@@ -1270,7 +1367,7 @@ def _mourinho_reference_features():
     if _MOURINHO_REFERENCE_FEATURES is not None:
         return _MOURINHO_REFERENCE_FEATURES
     features = {}
-    for index in (1, 2):
+    for index in (1, 2, 3, 4):
         reference = cv2.imread(
             os.path.join(MOURINHO_REFERENCE_DIR, f"{index}.png"), cv2.IMREAD_COLOR
         )
@@ -1323,6 +1420,54 @@ def detect_mourinho_flow(bgr):
         }
         break
 
+    # Redesigned home screen: Mourinho opens from the small gray information
+    # button at the right end of the readiness bar near the bottom edge.  The
+    # purple badges beside either crest are team/competition artwork and must
+    # never be clicked.  Require both the light rectangular button and the
+    # dark dot/stem of its centered lowercase "i" glyph.
+    info_left = int(width * 0.58)
+    info_right = int(width * 0.67)
+    info_top = int(height * 0.90)
+    info_roi = bgr[info_top:height, info_left:info_right]
+    if info_roi.size:
+        info_hsv = cv2.cvtColor(info_roi, cv2.COLOR_BGR2HSV)
+        info_light = cv2.inRange(
+            info_hsv, np.array([0, 0, 130]), np.array([179, 90, 255])
+        )
+        info_count, _, info_stats, info_centers = cv2.connectedComponentsWithStats(
+            info_light
+        )
+        info_candidates = []
+        for stat, center in zip(info_stats[1:info_count], info_centers[1:info_count]):
+            x, y, component_width, component_height, area = map(int, stat)
+            screen_x = info_left + float(center[0])
+            screen_y = info_top + float(center[1])
+            normalized_x = screen_x / width
+            normalized_y = screen_y / height
+            fill = area / float(max(1, component_width * component_height))
+            if not (width * 0.018 <= component_width <= width * 0.040):
+                continue
+            if not (height * 0.018 <= component_height <= height * 0.040):
+                continue
+            if not (0.59 <= normalized_x <= 0.65 and 0.93 <= normalized_y <= 0.995):
+                continue
+            if fill < 0.78:
+                continue
+            button_gray = cv2.cvtColor(
+                info_roi[y:y + component_height, x:x + component_width],
+                cv2.COLOR_BGR2GRAY,
+            )
+            glyph = button_gray[
+                int(component_height * 0.35):component_height,
+                int(component_width * 0.34):int(component_width * 0.66),
+            ]
+            if glyph.size == 0 or int(np.count_nonzero(glyph < 105)) < 8:
+                continue
+            info_candidates.append((area, normalized_x, normalized_y))
+        if info_candidates:
+            _, warning_x, warning_y = max(info_candidates)
+            warning = {"x": warning_x, "y": warning_y, "style": "info_button"}
+
     # The readiness row can move in both axes and its warning can be red with
     # a white glyph or yellow with a dark glyph. Prefer the small saturated
     # square immediately to the right of the readiness bar and click its
@@ -1333,7 +1478,7 @@ def detect_mourinho_flow(bgr):
     warning_region = bgr[
         warning_region_top:height, warning_region_left:warning_region_right
     ]
-    if warning_region.size:
+    if warning is None and warning_region.size:
         warning_hsv = cv2.cvtColor(warning_region, cv2.COLOR_BGR2HSV)
         warning_color = cv2.inRange(
             warning_hsv, np.array([0, 65, 80]), np.array([179, 255, 255])
@@ -1395,9 +1540,9 @@ def detect_mourinho_flow(bgr):
             warning = {"x": warning_x, "y": warning_y}
 
     state = "unknown"
-    if button is not None or (nearest == 2 and nearest_distance <= 45):
+    if button is not None or (nearest in (2, 4) and nearest_distance <= 45):
         state = "mourinho_popup"
-    elif warning is not None or (nearest == 1 and nearest_distance <= 45):
+    elif warning is not None or (nearest in (1, 3) and nearest_distance <= 45):
         state = "mourinho_home"
 
     return {
