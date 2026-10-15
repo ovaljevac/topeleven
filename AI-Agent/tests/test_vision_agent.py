@@ -107,14 +107,74 @@ class VisionGuardTests(unittest.TestCase):
             "wait_for_gemini_rate_slot",
             original_rate_wait,
         )
+        original_cooldown_file = vision_agent._GEMINI_MODEL_COOLDOWN_FILE
+        cooldown_directory = tempfile.TemporaryDirectory()
+        vision_agent._GEMINI_MODEL_COOLDOWN_FILE = (
+            Path(cooldown_directory.name) / "gemini-model-cooldowns.json"
+        )
+        self.addCleanup(cooldown_directory.cleanup)
+        self.addCleanup(
+            setattr,
+            vision_agent,
+            "_GEMINI_MODEL_COOLDOWN_FILE",
+            original_cooldown_file,
+        )
 
     def test_accepts_high_confidence_edge_close(self):
         normalized, errors = vision_agent.validate_decision(decision(), self.config)
         self.assertEqual([], errors)
         self.assertEqual("click_close", normalized["recommendedAction"])
 
-    def test_rejects_install_or_get_screen(self):
+    def test_accepts_separate_ad_close_when_install_or_get_is_visible(self):
         _, errors = vision_agent.validate_decision(decision(text="Install  Get"), self.config)
+        self.assertEqual([], errors)
+
+    def test_accepts_bottom_right_google_play_badge_even_when_install_is_visible(self):
+        raw = decision(
+            action="click_google_play",
+            control="google_play",
+            x=0.896,
+            y=0.944,
+            confidence=0.99,
+            text="GET IT ON Google Play; Install",
+        )
+        normalized, errors = vision_agent.validate_decision(
+            raw, self.config, "ad_control_ai_only_123", image_size=(1067, 616)
+        )
+        self.assertEqual([], errors)
+        self.assertEqual("click_google_play", normalized["recommendedAction"])
+
+    def test_accepts_top_right_open_store_pill_from_ai_without_local_verifier(self):
+        raw = decision(
+            action="click_google_play",
+            control="google_play",
+            x=0.922,
+            y=0.121,
+            confidence=0.99,
+            text="Open Store >>",
+        )
+        normalized, errors = vision_agent.validate_decision(
+            raw, self.config, "ad_control_ai_only_training_player_123",
+            image_size=(1072, 614),
+        )
+        self.assertEqual([], errors)
+        self.assertEqual("click_google_play", normalized["recommendedAction"])
+        self.assertAlmostEqual(0.922, normalized["control"]["x"])
+        self.assertAlmostEqual(0.121, normalized["control"]["y"])
+
+    def test_rejects_install_button_mislabeled_as_google_play(self):
+        raw = decision(
+            action="click_google_play",
+            control="google_play",
+            x=0.64,
+            y=0.76,
+            confidence=0.99,
+            text="Install",
+        )
+        _, errors = vision_agent.validate_decision(
+            raw, self.config, "ad_control_ai_only_123", image_size=(1067, 630)
+        )
+        self.assertIn("Google Play coordinate outside guarded badge zones", errors)
         self.assertIn("dangerous commerce/install text is visible", errors)
 
     def test_accepts_store_back_and_discards_grounded_coordinates(self):
@@ -197,12 +257,8 @@ class VisionGuardTests(unittest.TestCase):
         }
         server = vision_agent.VisionServer(config)
         original_request = vision_agent.request_vision_model
-        original_refine = vision_agent.refine_decision_control_center
         vision_agent.request_vision_model = lambda image, expected, supplied: decision(
             x=0.913, y=0.087
-        )
-        vision_agent.refine_decision_control_center = lambda image, result: self.fail(
-            "OpenCV refinement must not run for ad controls"
         )
         try:
             image = vision_agent.Image.new("RGB", (1095, 631), "black")
@@ -212,7 +268,6 @@ class VisionGuardTests(unittest.TestCase):
             self.assertEqual(0.087, result["decision"]["control"]["y"])
         finally:
             vision_agent.request_vision_model = original_request
-            vision_agent.refine_decision_control_center = original_refine
 
     def test_ai_only_profile_return_discards_profile_x_instead_of_rejecting(self):
         raw = decision(
@@ -350,6 +405,7 @@ class VisionGuardTests(unittest.TestCase):
         captured = {}
         original_key = vision_agent.get_secret_environment_variable
         original_urlopen = vision_agent.urllib.request.urlopen
+        original_active_model = vision_agent._GEMINI_ACTIVE_MODEL
 
         class FakeResponse:
             def __enter__(self):
@@ -372,6 +428,7 @@ class VisionGuardTests(unittest.TestCase):
 
         vision_agent.get_secret_environment_variable = lambda name: "test-key"
         vision_agent.urllib.request.urlopen = fake_urlopen
+        vision_agent._GEMINI_ACTIVE_MODEL = None
         try:
             image = vision_agent.Image.new("RGB", (320, 180), "black")
             result = vision_agent.request_gemini(
@@ -390,6 +447,65 @@ class VisionGuardTests(unittest.TestCase):
             self.assertNotIn("temperature", generation)
             self.assertEqual("click_close", result["recommendedAction"])
         finally:
+            vision_agent._GEMINI_ACTIVE_MODEL = original_active_model
+            vision_agent.get_secret_environment_variable = original_key
+            vision_agent.urllib.request.urlopen = original_urlopen
+
+    def test_gemma_four_uses_plain_json_contract_without_response_schema(self):
+        captured = {}
+        original_key = vision_agent.get_secret_environment_variable
+        original_urlopen = vision_agent.urllib.request.urlopen
+        original_active_model = vision_agent._GEMINI_ACTIVE_MODEL
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                envelope = {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [
+                                    {"thought": True, "text": "internal reasoning"},
+                                    {"text": f"```json\n{json.dumps(decision())}\n```"},
+                                ]
+                            }
+                        }
+                    ]
+                }
+                return json.dumps(envelope).encode("utf-8")
+
+        def fake_urlopen(request, timeout):
+            captured["payload"] = json.loads(request.data.decode("utf-8"))
+            return FakeResponse()
+
+        vision_agent.get_secret_environment_variable = lambda name: "test-key"
+        vision_agent.urllib.request.urlopen = fake_urlopen
+        vision_agent._GEMINI_ACTIVE_MODEL = None
+        try:
+            result = vision_agent.request_gemini(
+                vision_agent.Image.new("RGB", (320, 180), "black"),
+                "ad_control_ai_only_test",
+                {
+                    "model": "gemma-4-31b-it",
+                    "endpoint": "https://example.invalid/{model}:generateContent",
+                    "maximumOutputTokens": 512,
+                    "thinkingLevel": "minimal",
+                },
+            )
+            generation = captured["payload"]["generationConfig"]
+            supplied_prompt = captured["payload"]["contents"][0]["parts"][-1]["text"]
+            self.assertNotIn("responseMimeType", generation)
+            self.assertNotIn("responseSchema", generation)
+            self.assertEqual("minimal", generation["thinkingConfig"]["thinkingLevel"])
+            self.assertIn("Use exactly these fields", supplied_prompt)
+            self.assertEqual("click_close", result["recommendedAction"])
+        finally:
+            vision_agent._GEMINI_ACTIVE_MODEL = original_active_model
             vision_agent.get_secret_environment_variable = original_key
             vision_agent.urllib.request.urlopen = original_urlopen
 
@@ -449,6 +565,59 @@ class VisionGuardTests(unittest.TestCase):
             vision_agent._GEMINI_REQUEST_TIMES.clear()
             vision_agent._GEMINI_ACTIVE_MODEL = original_active_model
             vision_agent._GEMINI_ACTIVE_KEY_INDEX = original_active_key
+            vision_agent.get_secret_environment_variable = original_key
+            vision_agent.urllib.request.urlopen = original_urlopen
+
+    def test_gemma_transient_server_error_retries_same_model_and_key(self):
+        calls = []
+        original_key = vision_agent.get_secret_environment_variable
+        original_urlopen = vision_agent.urllib.request.urlopen
+        original_active_model = vision_agent._GEMINI_ACTIVE_MODEL
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                envelope = {
+                    "candidates": [
+                        {"content": {"parts": [{"text": json.dumps(decision())}]}}
+                    ]
+                }
+                return json.dumps(envelope).encode("utf-8")
+
+        def fake_urlopen(request, timeout):
+            calls.append((request.full_url, timeout))
+            if len(calls) == 1:
+                body = json.dumps({"error": {"message": "Internal error encountered."}}).encode()
+                raise vision_agent.urllib.error.HTTPError(
+                    request.full_url, 500, "Internal Server Error", {}, io.BytesIO(body)
+                )
+            return FakeResponse()
+
+        vision_agent.get_secret_environment_variable = lambda name: "test-key"
+        vision_agent.urllib.request.urlopen = fake_urlopen
+        vision_agent._GEMINI_ACTIVE_MODEL = None
+        try:
+            result = vision_agent.request_gemini(
+                vision_agent.Image.new("RGB", (320, 180), "black"),
+                "ad_control_ai_only_test",
+                {
+                    "model": "gemma-4-31b-it",
+                    "endpoint": "https://example.invalid/{model}:generateContent",
+                    "maximumOutputTokens": 512,
+                    "thinkingLevel": "minimal",
+                },
+            )
+            self.assertEqual("click_close", result["recommendedAction"])
+            self.assertEqual(2, len(calls))
+            self.assertEqual([45.0, 45.0], [timeout for _, timeout in calls])
+            self.assertTrue(all("gemma-4-31b-it" in url for url, _ in calls))
+        finally:
+            vision_agent._GEMINI_ACTIVE_MODEL = original_active_model
             vision_agent.get_secret_environment_variable = original_key
             vision_agent.urllib.request.urlopen = original_urlopen
 
@@ -560,16 +729,34 @@ class VisionGuardTests(unittest.TestCase):
             vision_agent.get_secret_environment_variable = original_key
             vision_agent.urllib.request.urlopen = original_urlopen
 
-    def test_gemini_quota_on_all_keys_stops_without_cycling_models(self):
+    def test_gemini_quota_on_all_keys_switches_to_fallback_model(self):
         original_key = vision_agent.get_secret_environment_variable
         original_urlopen = vision_agent.urllib.request.urlopen
+        original_active_model = vision_agent._GEMINI_ACTIVE_MODEL
         observed_urls = []
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                envelope = {
+                    "candidates": [
+                        {"content": {"parts": [{"text": json.dumps(decision())}]}}
+                    ]
+                }
+                return json.dumps(envelope).encode("utf-8")
 
         def fake_key(name):
             return {"TEST_GEMINI_KEY": "primary", "TEST_GEMINI_KEY_2": "backup"}.get(name)
 
         def fake_urlopen(request, timeout):
             observed_urls.append(request.full_url)
+            if len(observed_urls) > 2:
+                return FakeResponse()
             body = json.dumps({"error": {"message": "quota exceeded"}}).encode("utf-8")
             raise vision_agent.urllib.error.HTTPError(
                 request.full_url, 429, "Too Many Requests", {}, io.BytesIO(body)
@@ -577,27 +764,165 @@ class VisionGuardTests(unittest.TestCase):
 
         vision_agent.get_secret_environment_variable = fake_key
         vision_agent.urllib.request.urlopen = fake_urlopen
+        vision_agent._GEMINI_ACTIVE_MODEL = None
+        try:
+            result = vision_agent.request_gemini(
+                vision_agent.Image.new("RGB", (320, 180), "black"),
+                "ad_control",
+                {
+                    "apiKeyEnvironmentVariable": "TEST_GEMINI_KEY",
+                    "model": "gemini-3.5-flash-lite",
+                    "fallbackModels": ["gemini-3.1-flash-lite"],
+                    "endpoint": "https://example.invalid/{model}:generateContent",
+                    "maximumRequestsPerMinute": 15,
+                    "maximumOutputTokens": 256,
+                    "thinkingLevel": "minimal",
+                },
+            )
+            self.assertEqual("click_close", result["recommendedAction"])
+            self.assertEqual(3, len(observed_urls))
+            self.assertTrue(all("gemini-3.5-flash-lite" in url for url in observed_urls[:2]))
+            self.assertIn("gemini-3.1-flash-lite", observed_urls[2])
+            self.assertEqual("gemini-3.1-flash-lite", vision_agent._GEMINI_ACTIVE_MODEL)
+        finally:
+            vision_agent._GEMINI_ACTIVE_MODEL = original_active_model
+            vision_agent.get_secret_environment_variable = original_key
+            vision_agent.urllib.request.urlopen = original_urlopen
+
+    def test_model_cooldown_survives_selection_and_skips_known_exhausted_primary(self):
+        observed_urls = []
+        original_key = vision_agent.get_secret_environment_variable
+        original_urlopen = vision_agent.urllib.request.urlopen
+        original_active_model = vision_agent._GEMINI_ACTIVE_MODEL
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                envelope = {
+                    "candidates": [
+                        {"content": {"parts": [{"text": json.dumps(decision())}]}}
+                    ]
+                }
+                return json.dumps(envelope).encode("utf-8")
+
+        vision_agent.set_gemini_model_cooldown(
+            "gemini-3.5-flash-lite", 60, {}, "test_quota"
+        )
+        vision_agent.get_secret_environment_variable = lambda name: "test-key"
+        vision_agent.urllib.request.urlopen = lambda request, timeout: (
+            observed_urls.append(request.full_url) or FakeResponse()
+        )
+        vision_agent._GEMINI_ACTIVE_MODEL = None
+        try:
+            result = vision_agent.request_gemini(
+                vision_agent.Image.new("RGB", (320, 180), "black"),
+                "ad_control",
+                {
+                    "model": "gemini-3.5-flash-lite",
+                    "fallbackModels": ["gemini-3.1-flash-lite"],
+                    "endpoint": "https://example.invalid/{model}:generateContent",
+                    "maximumOutputTokens": 256,
+                    "thinkingLevel": "minimal",
+                },
+            )
+            self.assertEqual("click_close", result["recommendedAction"])
+            self.assertEqual(1, len(observed_urls))
+            self.assertIn("gemini-3.1-flash-lite", observed_urls[0])
+        finally:
+            vision_agent._GEMINI_ACTIVE_MODEL = original_active_model
+            vision_agent.get_secret_environment_variable = original_key
+            vision_agent.urllib.request.urlopen = original_urlopen
+
+    def test_primary_model_is_retried_after_its_cooldown_expires(self):
+        observed_urls = []
+        original_key = vision_agent.get_secret_environment_variable
+        original_urlopen = vision_agent.urllib.request.urlopen
+        original_cooldown_remaining = vision_agent.gemini_model_cooldown_remaining
+        original_active_model = vision_agent._GEMINI_ACTIVE_MODEL
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def read(self):
+                envelope = {
+                    "candidates": [
+                        {"content": {"parts": [{"text": json.dumps(decision())}]}}
+                    ]
+                }
+                return json.dumps(envelope).encode("utf-8")
+
+        vision_agent.get_secret_environment_variable = lambda name: "test-key"
+        vision_agent.urllib.request.urlopen = lambda request, timeout: (
+            observed_urls.append(request.full_url) or FakeResponse()
+        )
+        vision_agent.gemini_model_cooldown_remaining = lambda model: 0.0
+        vision_agent._GEMINI_ACTIVE_MODEL = "gemini-3.1-flash-lite"
+        try:
+            result = vision_agent.request_gemini(
+                vision_agent.Image.new("RGB", (320, 180), "black"),
+                "ad_control",
+                {
+                    "model": "gemini-3.5-flash-lite",
+                    "fallbackModels": ["gemini-3.1-flash-lite"],
+                    "endpoint": "https://example.invalid/{model}:generateContent",
+                    "maximumOutputTokens": 256,
+                    "thinkingLevel": "minimal",
+                },
+            )
+            self.assertEqual("click_close", result["recommendedAction"])
+            self.assertEqual(1, len(observed_urls))
+            self.assertIn("gemini-3.5-flash-lite", observed_urls[0])
+            self.assertEqual("gemini-3.5-flash-lite", vision_agent._GEMINI_ACTIVE_MODEL)
+        finally:
+            vision_agent._GEMINI_ACTIVE_MODEL = original_active_model
+            vision_agent.gemini_model_cooldown_remaining = original_cooldown_remaining
+            vision_agent.get_secret_environment_variable = original_key
+            vision_agent.urllib.request.urlopen = original_urlopen
+
+    def test_all_models_cooling_down_fails_transiently_without_http_call(self):
+        original_key = vision_agent.get_secret_environment_variable
+        original_urlopen = vision_agent.urllib.request.urlopen
+        calls = []
+        vision_agent.set_gemini_model_cooldown("gemini-3.5-flash-lite", 60, {}, "test")
+        vision_agent.set_gemini_model_cooldown("gemini-3.1-flash-lite", 16, {}, "test")
+        vision_agent.get_secret_environment_variable = lambda name: "test-key"
+        vision_agent.urllib.request.urlopen = lambda request, timeout: calls.append(request)
         try:
             with self.assertRaises(vision_agent.GeminiHttpError) as raised:
                 vision_agent.request_gemini(
                     vision_agent.Image.new("RGB", (320, 180), "black"),
                     "ad_control",
                     {
-                        "apiKeyEnvironmentVariable": "TEST_GEMINI_KEY",
                         "model": "gemini-3.5-flash-lite",
                         "fallbackModels": ["gemini-3.1-flash-lite"],
                         "endpoint": "https://example.invalid/{model}:generateContent",
-                        "maximumRequestsPerMinute": 15,
                         "maximumOutputTokens": 256,
                         "thinkingLevel": "minimal",
                     },
                 )
-            self.assertEqual(429, raised.exception.status)
-            self.assertEqual(2, len(observed_urls))
-            self.assertTrue(all("gemini-3.5-flash-lite" in url for url in observed_urls))
+            self.assertEqual(503, raised.exception.status)
+            self.assertIn("cooling down", raised.exception.detail)
+            self.assertEqual([], calls)
         finally:
             vision_agent.get_secret_environment_variable = original_key
             vision_agent.urllib.request.urlopen = original_urlopen
+
+    def test_retry_after_seconds_is_parsed_from_google_quota_detail(self):
+        self.assertAlmostEqual(
+            39.934,
+            vision_agent.gemini_retry_after_seconds("Please retry in 39.934s."),
+            places=3,
+        )
+        self.assertIsNone(vision_agent.gemini_retry_after_seconds("quota exceeded"))
 
     def test_gemini_mixed_timeout_and_quota_stops_without_model_cycle(self):
         original_key = vision_agent.get_secret_environment_variable
@@ -700,7 +1025,7 @@ class VisionGuardTests(unittest.TestCase):
     def test_config_caps_gemini_to_fifteen_requests_per_minute(self):
         config = json.loads((ROOT / "ai_config.json").read_text(encoding="utf-8"))
         self.assertEqual(15, config["maximumRequestsPerMinute"])
-        self.assertEqual([], config["fallbackModels"])
+        self.assertEqual(["gemini-3.1-flash-lite"], config["fallbackModels"])
         source = (ROOT / "VisionAgent.py").read_text(encoding="utf-8")
         self.assertIn('"gemini-request-times.json"', source)
         self.assertIn("time.time()", source)
@@ -708,6 +1033,15 @@ class VisionGuardTests(unittest.TestCase):
     def test_runtime_rate_limit_cannot_be_configured_above_fifteen(self):
         self.assertEqual(15, vision_agent.gemini_rate_limit({"maximumRequestsPerMinute": 999}))
         self.assertEqual(1, vision_agent.gemini_rate_limit({"maximumRequestsPerMinute": 0}))
+
+    def test_gemini_diagnostics_include_sanitized_expected_state(self):
+        source = (ROOT / "VisionAgent.py").read_text(encoding="utf-8")
+        self.assertIn('diagnostic_state = re.sub(r"\\d{8,}"', source)
+        self.assertIn('f"state={diagnostic_state} model=', source)
+
+    def test_gemma_four_uses_thinking_level_not_unsupported_budget(self):
+        source = (ROOT / "VisionAgent.py").read_text(encoding="utf-8")
+        self.assertIn('model_name.startswith(("gemini-3", "gemma-4"))', source)
 
     def test_original_image_states_use_matching_coordinate_prompt(self):
         states = (
@@ -741,8 +1075,14 @@ class VisionGuardTests(unittest.TestCase):
             )
             self.assertIn("independent AI-only control check", prompt)
             self.assertIn("Reward granted", prompt)
+            self.assertIn("FAR-RIGHT", prompt)
+            self.assertIn("Learn More", prompt)
             self.assertIn("Play Store", prompt)
             self.assertIn("click_google_play", prompt)
+            self.assertIn("no matching local computer-vision marker", prompt)
+            self.assertIn("Never return click_skip for a button whose label is Install", prompt)
+            self.assertIn("wake tap may reveal that tiny", prompt)
+            self.assertIn("permanent INSTALL artwork", prompt)
             self.assertIn("resource counters/cards", prompt)
             self.assertIn("topElevenReturned=true", prompt)
             self.assertEqual(image.size, diagnostic.size)
@@ -815,28 +1155,6 @@ class VisionGuardTests(unittest.TestCase):
         self.assertAlmostEqual(0.9375, normalized["control"]["x"])
         self.assertAlmostEqual(0.1, normalized["control"]["y"])
 
-    def test_refine_decision_control_center_executes_candidate_selection(self):
-        original = vision_agent.select_pixel_control_candidate
-        candidate = {
-            "found": True,
-            "kind": "close",
-            "x": 0.91,
-            "y": 0.08,
-            "method": "test-center",
-        }
-        vision_agent.select_pixel_control_candidate = lambda supplied, candidates: candidate
-        try:
-            raw = decision(x=0.90, y=0.09)
-            refined, metadata = vision_agent.refine_decision_control_center(
-                vision_agent.Image.new("RGB", (320, 180), "black"), raw
-            )
-            self.assertEqual(0.91, refined["control"]["x"])
-            self.assertEqual(0.08, refined["control"]["y"])
-            self.assertEqual("test-center", metadata["method"])
-            self.assertEqual(0.90, raw["control"]["x"])
-        finally:
-            vision_agent.select_pixel_control_candidate = original
-
     def test_debug_capture_retention_is_bounded(self):
         original_root = vision_agent.ROOT
         try:
@@ -851,95 +1169,62 @@ class VisionGuardTests(unittest.TestCase):
         finally:
             vision_agent.ROOT = original_root
 
-    def test_pixel_center_replaces_close_ai_coordinate_without_offset(self):
-        model_decision = decision(x=0.85, y=0.105, confidence=0.99)
-        candidate = {
-            "found": True,
-            "kind": "close",
-            "x": 0.8645,
-            "y": 0.0774,
-            "method": "tiny-overlay",
-        }
-        selected = vision_agent.select_pixel_control_candidate(
-            model_decision, [candidate]
-        )
-        self.assertIs(candidate, selected)
-        self.assertEqual(0.0774, selected["y"])
+    def test_local_ad_control_verifier_paths_are_restored(self):
+        source = (ROOT / "VisionAgent.py").read_text(encoding="utf-8")
+        serve = source[source.index("def serve("):]
+        self.assertIn("refine_decision_control_center", source)
+        self.assertIn("refine_ai_close_on_fresh_frame", source)
+        self.assertIn("recover_strict_reward_granted_close", source)
+        self.assertIn("recover_strict_top_edge_skip", serve)
+        self.assertIn("closeRefinement", serve)
+        self.assertIn("skipRefinement", serve)
+        self.assertIn("googlePlayRefinement", serve)
+        self.assertIn("Google Play badge was not locally verified", serve)
 
-    def test_ai_close_is_centered_only_near_selected_point(self):
+    def test_local_verifier_recovers_top_edge_skip_missed_by_ai(self):
         import cv2
         import numpy as np
 
         image = np.zeros((600, 1000, 3), dtype=np.uint8)
-        cv2.line(image, (910, 70), (930, 90), (255, 255, 255), 3)
-        cv2.line(image, (930, 70), (910, 90), (255, 255, 255), 3)
-        pil_image = vision_agent.Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-        model_decision = decision(x=0.920, y=0.145, confidence=0.99)
-
-        refined, info = vision_agent.refine_ai_close_on_fresh_frame(
-            pil_image, model_decision
+        cv2.putText(
+            image, ">>", (915, 105), cv2.FONT_HERSHEY_SIMPLEX,
+            0.75, (255, 255, 255), 2, cv2.LINE_AA,
         )
-
-        self.assertTrue(info["ok"])
-        self.assertTrue(info["applied"])
-        self.assertAlmostEqual(0.920, refined["control"]["x"], places=3)
-        self.assertAlmostEqual(80 / 600, refined["control"]["y"], places=3)
-        self.assertEqual(0.145, model_decision["control"]["y"])
-
-    def test_ai_close_refinement_fails_closed_without_nearby_x(self):
-        blank = vision_agent.Image.new("RGB", (1000, 600), "black")
-        model_decision = decision(x=0.920, y=0.145, confidence=0.99)
-        refined, info = vision_agent.refine_ai_close_on_fresh_frame(
-            blank, model_decision
-        )
-        self.assertFalse(info["ok"])
-        self.assertFalse(info["applied"])
-        self.assertEqual(model_decision, refined)
-
-    def test_server_uses_exact_ai_close_when_optional_pixel_style_is_unknown(self):
-        source = (ROOT / "VisionAgent.py").read_text(encoding="utf-8")
-        serve_start = source.index("def serve(")
-        serve = source[serve_start:]
-        refinement_start = serve.index('if refinement.get("ok") and refinement.get("applied")')
-        refinement_end = serve.index("if (", refinement_start + 20)
-        fallback_block = serve[refinement_start:refinement_end]
-        self.assertIn('fallbackToAiCoordinate', fallback_block)
-        self.assertNotIn('result["accepted"] = False', fallback_block)
-        self.assertNotIn('AI close X was not locally verified', fallback_block)
-
-    def test_pixel_center_matches_google_play_control_type(self):
+        frame = vision_agent.Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
         model_decision = decision(
-            action="click_google_play",
-            control="google_play",
-            x=0.88,
-            y=0.14,
-            confidence=0.99,
+            action="none", control="none", x=None, y=None, confidence=0.9
         )
-        close = {"found": True, "kind": "close", "x": 0.90, "y": 0.11}
-        play = {
-            "found": True,
-            "kind": "google_play",
-            "x": 0.89,
-            "y": 0.10,
-        }
-        selected = vision_agent.select_pixel_control_candidate(
-            model_decision, [close, play]
-        )
-        self.assertIs(play, selected)
+        model_decision["screenType"] = "ad"
 
-    def test_far_pixel_candidate_does_not_move_ai_coordinate(self):
-        model_decision = decision(x=0.90, y=0.10, confidence=0.99)
-        far_candidate = {
-            "found": True,
-            "kind": "close",
-            "x": 0.65,
-            "y": 0.30,
-        }
-        self.assertIsNone(
-            vision_agent.select_pixel_control_candidate(
-                model_decision, [far_candidate]
-            )
+        recovered, info = vision_agent.recover_strict_top_edge_skip(
+            frame, model_decision
         )
+
+        self.assertEqual("click_skip", recovered["recommendedAction"])
+        self.assertEqual("skip", recovered["control"]["type"])
+        self.assertTrue(info["applied"])
+
+    def test_local_verifier_recovers_reward_granted_x_missed_by_ai(self):
+        import cv2
+        import numpy as np
+
+        image = np.full((615, 1067, 3), (42, 39, 43), dtype=np.uint8)
+        cv2.rectangle(image, (890, 43), (1030, 72), (105, 105, 105), -1)
+        cv2.line(image, (1010, 50), (1022, 64), (245, 245, 245), 3)
+        cv2.line(image, (1022, 50), (1010, 64), (245, 245, 245), 3)
+        frame = vision_agent.Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+        model_decision = decision(
+            action="none", control="none", x=None, y=None, confidence=0.95
+        )
+        model_decision["screenType"] = "ad"
+
+        recovered, info = vision_agent.recover_strict_reward_granted_close(
+            frame, model_decision
+        )
+
+        self.assertEqual("click_close", recovered["recommendedAction"])
+        self.assertEqual("close_x", recovered["control"]["type"])
+        self.assertTrue(info["applied"])
 
     def test_mourinho_prompt_uses_full_image_without_opencv_candidate(self):
         image = vision_agent.Image.new("RGB", (1091, 634), "black")

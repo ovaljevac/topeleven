@@ -109,16 +109,18 @@ if ($null -eq $result) {{ 'null' }} else {{ [string]$result }}
         self.assertIn("WaitForExit($TimeoutMs)", invoke)
         self.assertIn("$process.Kill()", invoke)
 
-    def test_back_prefers_exact_adb_device_and_retains_escape_fallback(self):
+    def test_back_prefers_exact_adb_device_and_uses_system_toolbar_fallback(self):
         back = function_body("Send-BlueStacksBack")
         resolve = back.index("Resolve-BlueStacksAdbSerial")
         adb_key = back.index("KEYCODE_BACK", resolve)
         adb_success = back.index("if ($adbBack.Success)", adb_key)
         success_return = back.index("return", adb_success)
-        escape = back.index("[Win32Agent]::keybd_event", success_return)
+        toolbar_back = back.index("[Win32Agent]::SetCursorPos($backX, $backY)", success_return)
         self.assertLess(resolve, adb_key)
         self.assertLess(adb_key, success_return)
-        self.assertLess(success_return, escape)
+        self.assertLess(success_return, toolbar_back)
+        self.assertNotIn("keybd_event", back)
+        self.assertIn("sistemsko Back dugme", back)
 
 
 
@@ -147,10 +149,27 @@ class ExternalNavigationRecoveryContractTests(unittest.TestCase):
     def test_external_restore_supports_store_and_chrome_and_sends_android_back(self):
         restore = function_body("Restore-AdFromGooglePlay")
         self.assertIn("Test-AiExternalNavigationVisible", restore)
+        first_probe = restore[:restore.index("$externalByAi") + 200]
+        self.assertNotIn("-ForceRefresh", first_probe)
         self.assertNotIn("Get-BlueStacksForegroundState", restore)
         self.assertIn("Send-BlueStacksBack $Handle", restore)
         self.assertIn("$script:ExternalNavigationBackAttempts", restore)
         self.assertNotIn("$recentAiPlayClick", restore)
+
+    def test_external_navigation_probe_is_throttled_outside_post_back_check(self):
+        probe = function_body("Test-AiExternalNavigationVisible")
+        self.assertIn("$script:ExternalNavigationProbeIntervalSeconds", probe)
+        self.assertIn("$script:LastExternalNavigationProbeAt = Get-Date", probe)
+        self.assertLess(
+            probe.index("$script:LastExternalNavigationProbeAt = Get-Date"),
+            probe.index("Invoke-VisionAnalysis"),
+        )
+
+    def test_full_play_store_uses_only_system_back(self):
+        restore = function_body("Restore-AdFromGooglePlay")
+        self.assertIn("Send-BlueStacksBack $Handle", restore)
+        self.assertNotIn("Click-GameRelative", restore)
+        self.assertNotIn("strelica nazad", restore)
 
     def test_install_overlay_x_overrides_external_navigation_guess(self):
         detector = function_body("Test-AiExternalNavigationVisible")
@@ -216,8 +235,10 @@ class ExternalNavigationRecoveryContractTests(unittest.TestCase):
 
     def test_campus_post_ad_click_has_external_navigation_preflight(self):
         campus = function_body("Invoke-CampusStripMaintenance")
-        self.assertIn("Watch-TVAdvertisement $Handle $false 'campus'", campus)
-        self.assertIn("Wait-CampusFlowState $Handle @('campus_detail')", campus)
+        reward = function_body("Invoke-CampusDetailReward")
+        self.assertIn("Invoke-CampusDetailReward $Handle", campus)
+        self.assertIn("Watch-TVAdvertisement $Handle $false 'campus'", reward)
+        self.assertIn("Wait-CampusFlowState $Handle @('campus_detail')", reward)
         self.assertIn("$fresh.objectStrip.verified", campus)
         self.assertLess(campus.index("$fresh.objectStrip.verified"), campus.index("Click-Relative"))
         self.assertNotIn("zatvori detalj", campus)

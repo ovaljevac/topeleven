@@ -48,6 +48,21 @@ class AgentCoreSafetyContractTests(unittest.TestCase):
         self.assertGreaterEqual(SCRIPT.count("BeginErrorReadLine()"), 2)
         self.assertIn("$script:VisionResponseTimeoutSeconds = 60", SCRIPT)
 
+    def test_gemini_model_fallback_is_reported_in_agent_log(self):
+        invoke = function_body("Invoke-VisionAnalysis")
+        self.assertIn("$result.modelUsed", invoke)
+        self.assertIn("Gemini je automatski presao na model", invoke)
+        start = function_body("Start-VisionAgent")
+        self.assertIn("$visionStartupConfig.model", start)
+
+    def test_transient_gemini_failures_do_not_restart_healthy_vision_process(self):
+        invoke = function_body("Invoke-VisionAnalysis")
+        transient = invoke[invoke.index("$isTransientGeminiFailure"):]
+        transient = transient[:transient.index("Stop-VisionAgent")]
+        self.assertIn("Gemini HTTP (429|500|502|503|504)", transient)
+        self.assertIn("return $null", transient)
+        self.assertNotIn("Stop-VisionAgent", transient)
+
     def test_discord_restart_mode_uses_verified_recovery_without_ai(self):
         start = function_body("Start-Automation")
         self.assertIn("$script:Mode -eq 'Restart'", start)
@@ -62,13 +77,32 @@ class AgentCoreSafetyContractTests(unittest.TestCase):
         self.assertIn("postojeca instanca nije restartovana", start_mode)
         self.assertIn("Restart-TopElevenForStageRetry 'Discord start'", start_mode)
 
-    def test_wake_taps_are_fail_closed_on_a_fresh_ai_frame(self):
+    def test_wake_taps_are_portrait_only_and_fail_closed_on_a_fresh_ai_frame(self):
         gate = function_body("Test-AdWakeTapAllowed")
+        self.assertIn("Get-GameViewportRectangle", gate)
+        self.assertIn("$viewportHeight -lt ($viewportWidth * 1.25)", gate)
         self.assertIn("-ForceRefresh", gate)
         self.assertIn("$script:AiTopElevenReturned", gate)
         self.assertIn("$controlReady", gate)
         self.assertIn("$script:AiAdVisible", gate)
+        self.assertIn("$script:AiAdWakeTapAllowed", gate)
+        self.assertIn("portretnu reklamu bez aktivne kontrole", gate)
+        self.assertIn("return $true", gate)
         self.assertEqual(3, SCRIPT.count("Test-AdWakeTapAllowed $"))
+        self.assertEqual(3, SCRIPT.count("Wait-Agent $script:PortraitAdWakeCaptureDelayMs"))
+        self.assertIn("$script:PortraitAdWakeCaptureDelayMs = 1100", SCRIPT)
+        self.assertIn("$script:AdWakeAnalysisPerformed = $false", gate)
+        self.assertIn("$script:AdWakeAnalysisPerformed = $true", gate)
+        self.assertEqual(
+            3,
+            SCRIPT.count("$reuseWakeAnalysis = [bool]$script:AdWakeAnalysisPerformed"),
+        )
+        self.assertEqual(
+            3,
+            SCRIPT.count(
+                "$adStartedAt.AddSeconds($script:AdWakeTapAfterSeconds)"
+            ),
+        )
 
     def test_return_stability_uses_fresh_frames_at_least_300ms_apart(self):
         probe = function_body("Test-TopElevenReturnedAfterAd")

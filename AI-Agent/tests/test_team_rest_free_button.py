@@ -1,4 +1,5 @@
 import importlib.util
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -16,7 +17,10 @@ SPEC.loader.exec_module(x_detector)
 
 
 def function_body(source, name):
-    start = source.index(f"function {name}")
+    match = re.search(rf"(?m)^function\s+{re.escape(name)}\s*\{{", source)
+    if match is None:
+        raise AssertionError(f"PowerShell function {name!r} not found")
+    start = match.start()
     opening = source.index("{", start)
     depth = 0
     for index in range(opening, len(source)):

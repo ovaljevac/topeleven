@@ -1,4 +1,5 @@
 import argparse
+import base64
 import json
 import math
 import os
@@ -285,82 +286,184 @@ def _looks_like_double_chevron(gray, cx, cy, polarity):
     return False
 
 
+def _looks_like_open_chevron_component(component):
+    """Require the two sloping arms of >, rather than letter-sized blobs."""
+    h, w = component.shape
+    if h < 7 or w < 3:
+        return False
+    row_centers = []
+    for row in component:
+        xs = np.flatnonzero(row)
+        if not len(xs):
+            return False
+        row_centers.append(float(np.mean(xs)))
+    q = max(1, h // 4)
+    upper = float(np.mean(row_centers[:q]))
+    lower = float(np.mean(row_centers[-q:]))
+    tip = float(np.mean(row_centers[max(0, h//2-1):h//2+2]))
+    return (tip-max(upper, lower) >= max(1, w*.25)
+            and abs(upper-lower) <= max(1, w*.25)
+            # A seven-pixel antialiased > can be one row out of phase.
+            and float(np.mean(component == np.flipud(component))) >= .60)
+
+
+def _looks_like_filled_fast_forward_component(component):
+    """Recognize a compact filled >>/>>| glyph inside one connected component."""
+    if component.size == 0:
+        return False
+    height, width = component.shape
+    if height < 7 or width < 14:
+        return False
+    row_fill = np.count_nonzero(component, axis=1) / float(width)
+    vertical_symmetry = float(np.mean(component == np.flipud(component)))
+    middle_start = max(0, height // 2 - 1)
+    middle_end = min(height, height // 2 + 2)
+    return (
+        vertical_symmetry >= 0.80
+        and float(np.max(row_fill[middle_start:middle_end])) >= 0.80
+        and float(row_fill[0]) <= 0.45
+        and float(row_fill[-1]) <= 0.45
+        # An H also has a full central row and symmetric side bars. Real
+        # triangles widen progressively through both quarter-height rows.
+        and row_fill[height//4] > max(row_fill[0], row_fill[-1]) + .10
+        and row_fill[(3*height)//4] > max(row_fill[0], row_fill[-1]) + .10
+    )
+
+
 def _detect_double_chevron_control(bgr):
-    """Detect a dedicated top-right >> control without mistaking Play pills."""
+    """Detect a dedicated top-left or top-right >> control without CTA clicks."""
     height, width = bgr.shape[:2]
     if width < 200 or height < 120:
         return None
 
-    left = int(width * (0.82 if height > width * 1.25 else 0.88))
-    top = 24
+    # Start below the BlueStacks title bar so its own << collapse icon cannot
+    # be mistaken for an in-ad Skip control.
+    top = max(24, int(height * 0.055))
     bottom = min(height, max(125, int(height * 0.20)))
-    roi = bgr[top:bottom, left:width]
-    if roi.size == 0:
-        return None
+    side_width = int(width * (0.18 if height > width * 1.25 else 0.14))
+    regions = ((0, side_width, "left"), (width - side_width, width, "right"))
+    detected = []
+    for region_left, region_right, side in regions:
+        roi = bgr[top:bottom, region_left:region_right]
+        if roi.size == 0:
+            continue
 
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    _, binary = cv2.threshold(gray, 195, 255, cv2.THRESH_BINARY)
-    component_count, _, stats, centers = cv2.connectedComponentsWithStats(binary)
-    chevrons = []
-    combined_chevrons = []
-    for index in range(1, component_count):
-        component_width = int(stats[index, cv2.CC_STAT_WIDTH])
-        component_height = int(stats[index, cv2.CC_STAT_HEIGHT])
-        area = int(stats[index, cv2.CC_STAT_AREA])
-        if (
-            3 <= component_width <= 18
-            and 7 <= component_height <= 30
-            and 14 <= area <= 190
-            and component_width <= component_height * 1.15
-        ):
-            chevrons.append((float(centers[index][0]), float(centers[index][1])))
-        elif (
-            14 <= component_width <= 32
-            and 7 <= component_height <= 18
-            and 40 <= area <= 220
-            and 1.2 <= component_width / max(1.0, component_height) <= 3.2
-        ):
-            combined_chevrons.append((float(centers[index][0]), float(centers[index][1])))
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        _, binary = cv2.threshold(gray, 195, 255, cv2.THRESH_BINARY)
+        component_count, labels, stats, centers = cv2.connectedComponentsWithStats(binary)
+        chevrons = []
+        combined_chevrons = []
+        for index in range(1, component_count):
+            component_width = int(stats[index, cv2.CC_STAT_WIDTH])
+            component_height = int(stats[index, cv2.CC_STAT_HEIGHT])
+            area = int(stats[index, cv2.CC_STAT_AREA])
+            if (
+                3 <= component_width <= 18
+                and 7 <= component_height <= 30
+                and 14 <= area <= 190
+                and component_width <= component_height * 1.15
+            ):
+                x, y = map(int, stats[index, :2])
+                component = labels[y:y+component_height, x:x+component_width] == index
+                if _looks_like_open_chevron_component(component):
+                    chevrons.append((float(centers[index][0]), float(centers[index][1])))
+            elif (
+                14 <= component_width <= 32
+                and 7 <= component_height <= 18
+                and 40 <= area <= 220
+                and 1.2 <= component_width / max(1.0, component_height) <= 3.2
+            ):
+                component_left = int(stats[index, cv2.CC_STAT_LEFT])
+                component_top = int(stats[index, cv2.CC_STAT_TOP])
+                component = labels[
+                    component_top:component_top + component_height,
+                    component_left:component_left + component_width,
+                ] == index
+                if _looks_like_filled_fast_forward_component(component):
+                    combined_chevrons.append(
+                        (float(centers[index][0]), float(centers[index][1]))
+                    )
 
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    def build_result(cx, cy):
-        x0, x1 = max(0, int(cx) - 28), min(roi.shape[1], int(cx) + 29)
-        y0, y1 = max(0, int(cy) - 20), min(roi.shape[0], int(cy) + 21)
-        saturation = float(np.median(hsv[y0:y1, x0:x1, 1]))
-        # Google Play pills also contain >> but have a saturated yellow
-        # background. Only accept a neutral black/gray skip control.
-        if saturation > 80:
-            return None
-        screen_x = cx + left
-        screen_y = cy + top
-        return {
-            "found": True,
-            "x": float(screen_x / width),
-            "y": float(screen_y / height),
-            "score": 500.0,
-            "polarity": "bright-on-dark",
-            "method": "double-chevron",
-            "shape": 100.0,
-            "kind": "skip",
-        }
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        eligible_centers = chevrons + combined_chevrons
 
-    for cx, cy in combined_chevrons:
-        result = build_result(cx, cy)
-        if result:
-            return result
+        def build_result(cx, cy):
+            # A real Skip glyph is isolated: normally two chevrons, sometimes
+            # plus one nearby separator. Dense white branding such as
+            # WHITEOUT SURVIVAL contains many letter components on the same
+            # row and previously produced a false left-edge >> candidate.
+            nearby_components = sum(
+                1
+                for component_x, component_y in eligible_centers
+                if abs(component_x - cx) <= 70 and abs(component_y - cy) <= 10
+            )
+            if nearby_components > 2:
+                return None
+            x0, x1 = max(0, int(cx) - 28), min(roi.shape[1], int(cx) + 29)
+            y0, y1 = max(0, int(cy) - 20), min(roi.shape[0], int(cy) + 21)
+            screen_x = cx + region_left
+            screen_y = cy + top
+            normalized_x = float(screen_x / width)
+            normalized_y = float(screen_y / height)
+            saturation = float(np.median(hsv[y0:y1, x0:x1, 1]))
+            # Google Play/Install pills use saturated colored backgrounds.
+            # The War Robots creative also uses a genuine compact fast-forward
+            # glyph on an orange banner at the extreme upper-left. Permit only
+            # that tightly guarded orange corner variant, never a blue/green
+            # Install/Download CTA or saturated control elsewhere.
+            if saturation > 135:
+                hue = float(np.median(hsv[y0:y1, x0:x1, 0]))
+                orange_left_skip = (
+                    side == "left"
+                    and normalized_x <= 0.08
+                    and 0.07 <= normalized_y <= 0.18
+                    and 5 <= hue <= 35
+                )
+                if not orange_left_skip:
+                    return None
+            # Skip is an edge control. Resource icons and playable artwork can
+            # form tiny chevrons around x=0.87, but clicking there advances the
+            # ad game instead of skipping it. Keep both real corner layouts.
+            if side == "left" and normalized_x > 0.16:
+                return None
+            if side == "right" and normalized_x < 0.89:
+                return None
+            return {
+                "found": True,
+                "x": normalized_x,
+                "y": normalized_y,
+                "score": 500.0,
+                "polarity": "bright-on-dark",
+                "method": "double-chevron",
+                "shape": 100.0,
+                "kind": "skip",
+                "side": side,
+            }
 
-    for first_index, first in enumerate(chevrons):
-        for second in chevrons[first_index + 1:]:
-            horizontal_gap = abs(first[0] - second[0])
-            vertical_gap = abs(first[1] - second[1])
-            if not (4 <= horizontal_gap <= 22 and vertical_gap <= 7):
-                continue
-            cx = (first[0] + second[0]) / 2.0
-            cy = (first[1] + second[1]) / 2.0
+        for cx, cy in combined_chevrons:
             result = build_result(cx, cy)
             if result:
-                return result
-    return None
+                detected.append(result)
+
+        for first_index, first in enumerate(chevrons):
+            for second in chevrons[first_index + 1:]:
+                horizontal_gap = abs(first[0] - second[0])
+                vertical_gap = abs(first[1] - second[1])
+                if not (4 <= horizontal_gap <= 22 and vertical_gap <= 7):
+                    continue
+                cx = (first[0] + second[0]) / 2.0
+                cy = (first[1] + second[1]) / 2.0
+                result = build_result(cx, cy)
+                if result:
+                    detected.append(result)
+    if not detected:
+        return None
+    # When ad artwork also contains chevron-like letters, the genuine control
+    # is the candidate closest to either guarded outer edge.
+    return min(
+        detected,
+        key=lambda result: min(float(result["x"]), 1.0 - float(result["x"])),
+    )
 
 
 def _matches_tiny_x_component(gray, cx, cy):
@@ -690,25 +793,42 @@ def refine_close_x_near_point(bgr, normalized_x, normalized_y):
     raw_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(raw_gray, (3, 3), 0)
     candidates = []
-    for gray, source in ((raw_gray, "raw-response"), (blurred, "blurred-response")):
-        for cx, cy, response_strength in sorted(
-            _response_centers(gray), key=lambda item: item[2], reverse=True
-        )[:16]:
-            contrast, polarity = _x_contrast_score(gray, cx, cy)
-            if polarity is None:
-                continue
-            shape = _x_shape_quality(gray, cx, cy, polarity)
-            if shape < 82.0:
-                continue
-            screen_x, screen_y = cx + left, cy + top
-            distance = math.hypot(screen_x - ai_x, screen_y - ai_y)
-            if distance > radius:
-                continue
-            score = float(contrast) + float(response_strength)
-            if score < 190:
-                continue
-            rank = score + shape * 1.5 - distance * 1.2
-            candidates.append((rank, screen_x, screen_y, score, shape, polarity, source, distance))
+    for scale in (1, 2):
+        # Portrait end cards can render an X only 5-7 pixels wide. The same
+        # four-arm verifier works after local enlargement; no shape or
+        # contrast threshold is relaxed, and the search stays near AI's point.
+        if candidates:
+            break
+        views = ((raw_gray, "raw-response"), (blurred, "blurred-response")) if scale == 1 else (
+            (cv2.resize(raw_gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC),
+             "upscaled-2x-response"),
+        )
+        for gray, source in views:
+            for cx, cy, response_strength in sorted(
+                _response_centers(gray), key=lambda item: item[2], reverse=True
+            )[:16]:
+                contrast, polarity = _x_contrast_score(gray, cx, cy)
+                if polarity is None:
+                    continue
+                if scale > 1:
+                    # Interpolation can soften an already antialiased icon.
+                    # Preserve stronger evidence from its original pixels,
+                    # provided both views agree on foreground polarity.
+                    native_contrast, native_polarity = _x_contrast_score(raw_gray, cx / scale, cy / scale)
+                    if native_polarity == polarity:
+                        contrast = max(contrast, native_contrast)
+                shape = _x_shape_quality(gray, cx, cy, polarity)
+                if shape < 82.0:
+                    continue
+                screen_x, screen_y = cx / scale + left, cy / scale + top
+                distance = math.hypot(screen_x - ai_x, screen_y - ai_y)
+                if distance > radius:
+                    continue
+                score = float(contrast) + float(response_strength)
+                if score < 190:
+                    continue
+                rank = score + shape * 1.5 - distance * 1.2
+                candidates.append((rank, screen_x, screen_y, score, shape, polarity, source, distance))
 
     if not candidates:
         return {
@@ -766,7 +886,43 @@ def detect_x(bgr, live=False):
     return skip_result
 
 
-def detect_top_resource_cards(bgr):
+def _verify_game_resource_card_layout(bgr):
+    """Require aligned green/blue/red icons inside separate dark header cards."""
+    height, width = bgr.shape[:2]
+    left, right = int(width*.45), int(width*.96)
+    top, bottom = 38, min(height, 90)
+    strip = bgr[top:bottom,left:right]
+    if not strip.size:
+        return False
+    hsv = cv2.cvtColor(strip,cv2.COLOR_BGR2HSV)
+    masks = [
+        cv2.inRange(hsv,np.array([35,90,90]),np.array([85,255,255])),
+        cv2.inRange(hsv,np.array([90,90,90]),np.array([120,255,255])),
+        cv2.inRange(hsv,np.array([0,90,90]),np.array([12,255,255])) | cv2.inRange(hsv,np.array([165,90,90]),np.array([180,255,255])),
+    ]
+    icons=[]
+    for mask in masks:
+        count,_,stats,_=cv2.connectedComponentsWithStats(mask)
+        choices=[]
+        for x,y,w,h,area in stats[1:count]:
+            if not (12<=w<=36 and 10<=h<=30 and .65<=w/max(1,h)<=2.0 and area>=85):
+                continue
+            # Resource icons have a counter to their right on a gray card.
+            card = hsv[max(0,y-3):min(hsv.shape[0],y+h+3),x+w:min(hsv.shape[1],x+w+int(width*.055))]
+            if not card.size or np.mean((card[:,:,1]<80)&(card[:,:,2]<115))<.55:
+                continue
+            choices.append((left+x+w/2,top+y+h/2))
+        icons.append(choices)
+    for green in icons[0]:
+        for blue in icons[1]:
+            for red in icons[2]:
+                if (.075*width<blue[0]-green[0]<.17*width and .075*width<red[0]-blue[0]<.17*width
+                    and max(green[1],blue[1],red[1])-min(green[1],blue[1],red[1])<=6):
+                    return True
+    return False
+
+
+def _detect_top_resource_cards_at_reference_scale(bgr):
     """Detect Top Eleven's green, blue and red resource cards from pixels."""
     height, width = bgr.shape[:2]
     if width < 400 or height < 140:
@@ -812,7 +968,58 @@ def detect_top_resource_cards(bgr):
         ):
             best = candidate
 
+    if best["found"]:
+        best["gameHeaderVerified"] = _verify_game_resource_card_layout(bgr)
+        # Find the small green + within the green-rest resource card, never
+        # the large cash + at the far right or an ad's colored resource art.
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        green = cv2.inRange(hsv, np.array([35, 80, 100]), np.array([95, 255, 255]))
+        roi = green[38:min(height, 83), int(game_width*.51):int(game_width*.72)]
+        count, _, stats, _ = cv2.connectedComponentsWithStats(roi)
+        plus_points = []
+        for x, y, w, h, area in stats[1:count]:
+            if not (5 <= w <= 18 and 5 <= h <= 18 and .60 <= w/max(1, h) <= 1.65):
+                continue
+            patch = roi[y:y+h, x:x+w] > 0
+            if area < 8 or np.mean(patch) > .80:
+                continue
+            # JPEG antialiasing can leave a one-pixel vertical stroke offset
+            # from the bounding-box center. Require both crossing bars rather
+            # than averaging that thin stroke with two empty neighbor columns.
+            row_coverage = np.mean(patch, axis=1)
+            column_coverage = np.mean(patch, axis=0)
+            if (max(row_coverage[max(1,h//4):min(h-1,(3*h)//4+1)]) < .65
+                    or max(column_coverage[1:w-1]) < .65):
+                continue
+            plus_points.append(((int(game_width*.51)+x+w/2)/width, (38+y+h/2)/height))
+        if plus_points:
+            best["greenPlus"] = {"x": max(plus_points)[0], "y": max(plus_points)[1]}
     return best
+
+
+def detect_top_resource_cards(bgr):
+    """Normalize screenshot scale before header geometry and plus detection.
+
+    Coordinates remain normalized to the original window, so resize does not
+    introduce offsets into the click. Keep native color counts as fallback for
+    older callers; only the strict card layout can verify a game header.
+    """
+    height, width = bgr.shape[:2]
+    native = _detect_top_resource_cards_at_reference_scale(bgr)
+    if native.get("gameHeaderVerified") and native.get("greenPlus"):
+        return native
+    if height < 140 or width < 400:
+        return native
+    reference = cv2.resize(bgr, (round(width * 615 / height), 615),
+                           interpolation=cv2.INTER_AREA if height > 615 else cv2.INTER_LINEAR)
+    normalized = _detect_top_resource_cards_at_reference_scale(reference)
+    if normalized.get("gameHeaderVerified"):
+        return normalized
+    return native
+
+
+def verify_game_resource_card_layout(bgr):
+    return bool(detect_top_resource_cards(bgr).get("gameHeaderVerified"))
 
 
 def detect_top_edge_google_play_badge(bgr):
@@ -845,11 +1052,197 @@ def detect_top_edge_google_play_badge(bgr):
             and area >= 110
             and y <= max(20, int((bottom - top) * 0.58))
             and x <= int(right * 0.55)
+            # Artwork below the disclosure often enters this shallow ROI.
+            # A component clipped by its bottom is not a complete badge.
+            and y + badge_height < bottom - top
         ):
             continue
         center_x = x + badge_width / 2.0
         center_y = top + y + badge_height / 2.0
         candidates.append((area, center_x, center_y, badge_width, badge_height))
+
+    if not candidates:
+        return {"found": False}
+    # The disclosure is the first compact line at the top. Choosing the
+    # largest pale component instead selects the Kingshot logo underneath it.
+    _, center_x, center_y, badge_width, badge_height = min(
+        candidates, key=lambda item: (item[2] - item[4] / 2, -item[0])
+    )
+    return {
+        "found": True,
+        "kind": "google_play",
+        "x": float(center_x / width),
+        "y": float(center_y / height),
+        "width": int(badge_width),
+        "height": int(badge_height),
+        "method": "top-left-google-play-badge",
+    }
+
+
+def detect_verified_top_left_store_badge(bgr):
+    """Match the fixed Google Play disclosure lettering, never a prior AI crop."""
+    h, w = bgr.shape[:2]
+    if w < 260 or h < 180:
+        return {"found": False}
+    # Normalize the same emulator chrome and lettering scale as the fixtures.
+    scale = 615 / h
+    reference = cv2.resize(bgr, (round(w*scale), 615), interpolation=cv2.INTER_LINEAR)
+    glyph = cv2.imread(os.path.join(PROJECT_DIR, "google-play-disclosure-wordmark.png"), cv2.IMREAD_GRAYSCALE)
+    if glyph is None:
+        return {"found": False}
+    rw = reference.shape[1]
+    left, top = 0, 34
+    patch = cv2.cvtColor(reference[top:69, :min(rw-32, max(100, round(rw*.30)))], cv2.COLOR_BGR2GRAY)
+    if patch.shape[0] < glyph.shape[0] or patch.shape[1] < glyph.shape[1]:
+        return {"found": False}
+    _, score, _, point = cv2.minMaxLoc(cv2.matchTemplate(patch, glyph, cv2.TM_CCOEFF_NORMED))
+    gx = left + point[0] + glyph.shape[1]/2
+    gy = top + point[1] + glyph.shape[0]/2
+    if score < .86 or gx/rw > .20 or not (.06 <= gy/615 <= .112):
+        return {"found": False}
+    return {"found": True, "kind": "google_play", "x": gx/rw, "y": gy/615,
+            "score": float(score), "method": "fixed-google-play-disclosure-wordmark"}
+
+
+def refine_google_play_control_near_point(bgr, control):
+    """Require a fresh, nearby store badge before dispatching its click."""
+    try:
+        x, y = float(control["x"]), float(control["y"])
+        if not (0 <= x <= 1 and 0 <= y <= 1):
+            return {"found": False}
+        if x <= .35 and y <= .12:
+            candidates = [detect_verified_top_left_store_badge(bgr)]
+        else:
+            candidates = [detect_bottom_right_google_play_badge(bgr),
+                          verify_ai_google_play_badge(bgr, control),
+                          detect_yellow_ad_control(bgr)]
+        h, w = bgr.shape[:2]
+        radius = max(10, min(45, round(min(w, h)*.04)))
+        nearby = [c for c in candidates if c.get("found") and c.get("kind") == "google_play"
+                  and math.hypot((c["x"]-x)*w, (c["y"]-y)*h) <= radius]
+        if nearby:
+            return min(nearby, key=lambda c: math.hypot((c["x"]-x)*w, (c["y"]-y)*h))
+        crop = skip_control_text_crop(bgr, control)
+        return {"found": False, "googlePlayTextCheck": crop}
+    except (KeyError, TypeError, ValueError, cv2.error):
+        return {"found": False}
+
+
+def verify_ai_google_play_badge(bgr, control):
+    """Verify Google Play wordmark and color triangle near the AI-selected point.
+
+    This never proposes a control on its own. The tight ROI belongs to the
+    AI-selected badge, including badges along the bottom-left or a landing sheet.
+    """
+    try:
+        ai_x, ai_y = float(control["x"]), float(control["y"])
+    except (KeyError, TypeError, ValueError):
+        return {"found": False}
+    height, width = bgr.shape[:2]
+    left, right = max(0, int((ai_x - .12) * width)), min(width - 38, int((ai_x + .12) * width))
+    top, bottom = max(34, int((ai_y - .045) * height)), min(height, int((ai_y + .045) * height))
+    roi = bgr[top:bottom, left:right]
+    if not roi.size:
+        return {"found": False}
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    candidates = []
+    template_path = os.path.join(PROJECT_DIR, "google-play-wordmark.png")
+    template = cv2.imread(template_path, cv2.IMREAD_GRAYSCALE)
+    if template is None:
+        return {"found": False}
+    for scale in (.70, .80, .90, 1.0, 1.10, 1.20, 1.35, 1.50):
+        glyph = cv2.resize(template, None, fx=scale, fy=scale)
+        gh, gw = glyph.shape
+        if gh > gray.shape[0] or gw > gray.shape[1]:
+            continue
+        scores = np.abs(cv2.matchTemplate(gray, glyph, cv2.TM_CCOEFF_NORMED))
+        for _ in range(3):
+            _, score, _, point = cv2.minMaxLoc(scores)
+            if score < .67:
+                break
+            tx, ty = point
+            scores[max(0, ty-3):ty+4, max(0, tx-3):tx+4] = 0
+            icon = hsv[max(0, ty-int(gh*.4)):min(roi.shape[0], ty+int(gh*1.4)), max(0, tx-int(gh*2.4)):tx]
+            if not icon.size:
+                continue
+            saturated = (icon[:, :, 1] > 90) & (icon[:, :, 2] > 100)
+            hues = icon[:, :, 0]
+            bands = [
+                np.count_nonzero(saturated & ((hues < 13) | (hues > 165))),
+                np.count_nonzero(saturated & (hues >= 13) & (hues < 39)),
+                np.count_nonzero(saturated & (hues >= 39) & (hues < 91)),
+                np.count_nonzero(saturated & (hues >= 91) & (hues < 136)),
+            ]
+            if min(bands) < 3:
+                continue
+            icon_y, icon_x = np.where(saturated)
+            icon_left = max(0, tx-int(gh*2.4)) + int(icon_x.min())
+            icon_top = max(0, ty-int(gh*.4)) + int(icon_y.min())
+            icon_bottom = max(0, ty-int(gh*.4)) + int(icon_y.max()) + 1
+            cx = (left + (icon_left + tx + gw) / 2) / width
+            cy = (top + (min(icon_top, ty) + max(icon_bottom, ty + gh)) / 2) / height
+            if math.hypot(cx-ai_x, cy-ai_y) > .055:
+                continue
+            candidates.append((score, cx, cy))
+    if not candidates:
+        return {"found": False}
+    score, cx, cy = max(candidates)
+    return {"found": True, "kind": "google_play", "x": cx, "y": cy,
+            "score": round(score, 3), "method": "ai-local-google-play-wordmark"}
+
+
+def detect_bottom_right_google_play_badge(bgr):
+    """Locate the black GET IT ON Google Play badge used by playable ads."""
+    height, width = bgr.shape[:2]
+    if width < 400 or height < 300:
+        return {"found": False}
+
+    game_right = max(1, width - 42)
+    left = int(game_right * 0.68)
+    top = int(height * 0.75)
+    roi = bgr[top:height, left:game_right]
+    if roi.size == 0:
+        return {"found": False}
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    dark = (gray < 55).astype(np.uint8) * 255
+    dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, np.ones((5, 9), np.uint8))
+    contours, _ = cv2.findContours(dark, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    candidates = []
+    for contour in contours:
+        x, y, badge_width, badge_height = cv2.boundingRect(contour)
+        area = float(cv2.contourArea(contour))
+        if not (
+            80 <= badge_width <= 190
+            and 24 <= badge_height <= 65
+            and 2.2 <= badge_width / float(max(1, badge_height)) <= 5.5
+            and area >= badge_width * badge_height * 0.72
+        ):
+            continue
+        screen_x = left + x + badge_width / 2.0
+        screen_y = top + y + badge_height / 2.0
+        normalized_x = screen_x / width
+        normalized_y = screen_y / height
+        if not (0.78 <= normalized_x <= 0.96 and 0.84 <= normalized_y <= 0.98):
+            continue
+
+        badge = bgr[top + y:top + y + badge_height, left + x:left + x + badge_width]
+        badge_hsv = cv2.cvtColor(badge, cv2.COLOR_BGR2HSV)
+        white_ratio = float(np.mean(
+            (badge_hsv[:, :, 1] < 70) & (badge_hsv[:, :, 2] > 180)
+        ))
+        icon = badge_hsv[:, :max(1, int(badge_width * 0.30))]
+        saturated = (icon[:, :, 1] > 100) & (icon[:, :, 2] > 100)
+        hue_bands = (
+            np.count_nonzero(saturated & ((icon[:, :, 0] <= 12) | (icon[:, :, 0] >= 165))),
+            np.count_nonzero(saturated & (icon[:, :, 0] >= 13) & (icon[:, :, 0] <= 38)),
+            np.count_nonzero(saturated & (icon[:, :, 0] >= 39) & (icon[:, :, 0] <= 90)),
+            np.count_nonzero(saturated & (icon[:, :, 0] >= 91) & (icon[:, :, 0] <= 135)),
+        )
+        if white_ratio < 0.012 or min(hue_bands) < 12:
+            continue
+        candidates.append((area, screen_x, screen_y, badge_width, badge_height))
 
     if not candidates:
         return {"found": False}
@@ -861,7 +1254,7 @@ def detect_top_edge_google_play_badge(bgr):
         "y": float(center_y / height),
         "width": int(badge_width),
         "height": int(badge_height),
-        "method": "top-left-google-play-badge",
+        "method": "bottom-right-google-play-badge",
     }
 
 
@@ -1012,6 +1405,9 @@ def detect_yellow_ad_control(bgr):
             candidates.append((area, "google_play", cx, cy, control_width, control_height, "neutral-counter"))
 
     if not candidates:
+        bottom_badge = detect_bottom_right_google_play_badge(bgr)
+        if bottom_badge.get("found"):
+            return bottom_badge
         return detect_top_edge_google_play_badge(bgr)
 
     # Closing the ad always has priority if a Play pill and an X coexist.
@@ -1400,7 +1796,10 @@ def detect_mourinho_flow(bgr):
         x, y, component_width, component_height, area = map(int, stat)
         normalized_x = float(center[0] / width)
         normalized_y = float(center[1] / height)
-        if not (0.55 <= normalized_x <= 0.85 and 0.45 <= normalized_y <= 0.68):
+        # The readiness popup moves down when the home screen has a taller
+        # event banner. Keep its lower watch row in range; the verified
+        # POGLEDAJ glyphs below still reject unrelated blue controls.
+        if not (0.55 <= normalized_x <= 0.85 and 0.42 <= normalized_y <= 0.85):
             continue
         if not (width * 0.07 <= component_width <= width * 0.16):
             continue
@@ -1611,7 +2010,7 @@ def _campus_100_text_score(button_bgr):
 
 
 def _campus_maintenance_badges(bgr):
-    """Find the repeated green percentage/status badges on the Campus map.
+    """Find green, yellow and partially red percentage/status bars on the map.
 
     The Campus camera slowly pans and zooms, so a whole-frame reference can
     alternate between the normal and maintenance views even though the green
@@ -1621,38 +2020,63 @@ def _campus_maintenance_badges(bgr):
     """
     height, width = bgr.shape[:2]
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    green = cv2.inRange(
-        hsv,
-        np.array([35, 100, 100]),
-        np.array([95, 255, 255]),
-    )
-    green = cv2.morphologyEx(
-        green, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8)
-    )
-    count, _, stats, centers = cv2.connectedComponentsWithStats(green)
     badges = []
     frame_area = float(max(1, width * height))
-    for stat, center in zip(stats[1:count], centers[1:count]):
+    masks = {
+        "green": cv2.inRange(hsv, np.array([35, 100, 100]), np.array([95, 255, 255])),
+        "yellow": cv2.inRange(hsv, np.array([20, 100, 150]), np.array([34, 255, 255])),
+        "red": cv2.inRange(hsv, np.array([0, 100, 100]), np.array([10, 255, 255]))
+        | cv2.inRange(hsv, np.array([170, 100, 100]), np.array([180, 255, 255])),
+    }
+    components = []
+    for color, mask in masks.items():
+        kernel_width = 3 if color == "green" else 13
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, kernel_width), np.uint8))
+        if color != "green":
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((7, 9), np.uint8))
+        count, _, stats, _ = cv2.connectedComponentsWithStats(mask)
+        components.extend((color, stat) for stat in stats[1:count])
+    for color, stat in components:
         x, y, component_width, component_height, area = map(int, stat)
-        normalized_x = float(center[0] / width)
-        normalized_y = float(center[1] / height)
-        aspect = component_width / float(max(1, component_height))
+        normalized_y = float((y + component_height / 2) / height)
+        if not (0.01 * width <= component_width <= 0.11 * width):
+            continue
+        if not (height * 0.018 <= component_height <= height * 0.060):
+            continue
+        # A low percentage colors only the left end of a white status bar.
+        # Extend across the pale tail, allowing the black percentage glyphs.
+        tail = 0
+        for column in range(x + component_width, min(width, x + int(width * .12))):
+            pixels = bgr[y + 2:y + component_height - 2, column]
+            if color == "green":
+                break
+            if not pixels.size or np.mean(np.all(pixels >= 160, axis=1)) < .12:
+                if tail < 4:
+                    tail += 1
+                    continue
+                break
+            tail += 1
+        full_width = component_width + tail
+        normalized_x = float((x + full_width / 2) / width)
+        aspect = full_width / float(max(1, component_height))
         fill = area / float(max(1, component_width * component_height))
         if not (0.04 <= normalized_x <= 0.90 and 0.25 <= normalized_y <= 0.90):
             continue
-        if not (width * 0.04 <= component_width <= width * 0.11):
+        if not (width * 0.04 <= full_width <= width * 0.11):
             continue
         if not (height * 0.018 <= component_height <= height * 0.060):
             continue
         if not (2.20 <= aspect <= 5.50):
             continue
-        if area < frame_area * 0.0009 or fill < 0.68:
+        minimum_area = 0.0009 if color == "green" else 0.00025
+        if area < frame_area * minimum_area or fill < 0.68:
             continue
         badges.append({
             "x": normalized_x,
             "y": normalized_y,
-            "width": component_width / float(width),
+            "width": full_width / float(width),
             "height": component_height / float(height),
+            "statusColor": color,
         })
     return badges
 
@@ -1660,7 +2084,12 @@ def _campus_maintenance_badges(bgr):
 def _campus_object_strip(bgr):
     height, width = bgr.shape[:2]
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, np.array([35, 90, 100]), np.array([85, 255, 255]))
+    # Maintenance cards use green, yellow or red fills. Low percentages can
+    # color only a narrow left end; identify the complete bar with its pale tail.
+    mask = (cv2.inRange(hsv, np.array([35, 90, 100]), np.array([95, 255, 255]))
+            | cv2.inRange(hsv, np.array([20, 90, 140]), np.array([34, 255, 255]))
+            | cv2.inRange(hsv, np.array([0, 90, 100]), np.array([10, 255, 255]))
+            | cv2.inRange(hsv, np.array([170, 90, 100]), np.array([180, 255, 255])))
     mask[:int(height * .72)] = 0
     mask[int(height * .86):] = 0
     mask[:, int(width * .50):] = 0
@@ -1669,19 +2098,21 @@ def _campus_object_strip(bgr):
     cards = []
     for x, y, w, h, area in stats[1:count]:
         x, y, w, h = map(int, (x, y, w, h))
-        if not (.060 * width <= w <= .12 * width and .025 * height <= h <= .06 * height):
+        if not (.008 * width <= w <= .12 * width and .025 * height <= h <= .06 * height):
             continue
         if x < width * .018 or x + w >= width * .48 or area < w * h * .65:
             continue
         tail = 0
-        for column in range(x + w, min(int(width * .50), x + w + int(width * .035))):
-            pixels = bgr[y + 2:y + h - 2, column]
-            if not pixels.size or np.mean(np.all(pixels >= 175, axis=1)) < .65:
+        for column in range(x + w, min(int(width * .50), x + int(width * .14))):
+            pixels = hsv[y:y + h, column]
+            # Black percentage glyphs cross the pale tail. Requiring 65% white
+            # per column cuts the bar in the middle of text on the real game.
+            if not pixels.size or np.mean((pixels[:, 1] < 65) & (pixels[:, 2] >= 160)) < .15:
                 if tail == 0 and column < x + w + 3:
                     continue
                 break
             tail += 1
-        if x + w + tail >= width * .495:
+        if not (.060 * width <= w + tail <= .14 * width) or x + w + tail >= width * .495:
             continue
         thumbnail = bgr[y+h:min(height, y+h+int(height*.11)), x:x+w+tail]
         identity = cv2.resize(cv2.cvtColor(thumbnail, cv2.COLOR_BGR2GRAY), (16, 8)).flatten().tolist()
@@ -2457,6 +2888,14 @@ def detect_team_rest_free_button(bgr):
             )
             if green_resource_ratio < 0.05:
                 continue
+            # A disabled gray BESPLATNO retains the word and both icons.
+            # Those glyphs alone cannot authorize a click on a gray button.
+            row_center = int(sum(glyph["y"] for glyph in row) / len(row))
+            word_left = int(row[1]["x"])
+            word_right = int(row[-2]["x"] + row[-2]["width"] / 2)
+            background = cv2.cvtColor(store_text_roi[max(0,row_center-12):row_center+13, word_left:word_right], cv2.COLOR_BGR2HSV)
+            if not background.size or np.mean((background[:,:,0] >= 85) & (background[:,:,0] <= 125) & (background[:,:,1] >= 65) & (background[:,:,2] >= 100)) < .35:
+                continue
             text_components = row[1:-1]
             # Spoji komponente koje pripadaju istom slovu i imaju gotovo isti
             # horizontalni centar. Na prilozenom stvarnom BESPLATNO redu S, P
@@ -2612,6 +3051,50 @@ def detect_team_rest_free_button(bgr):
     if ready_candidates:
         return max(ready_candidates, key=lambda candidate: candidate["whitePixels"])
     return max(visible_candidates, key=lambda candidate: candidate["whitePixels"])
+
+
+def detect_green_store_offer(bgr, last_offer_y=None):
+    """Fast local green offer, with small OCR crops only for grey/limit text."""
+    snapshot = detect_team_rest_free_button(bgr)
+    result = {**snapshot, "offerState": "unknown", "offerRows": []}
+    if not snapshot.get("storeLoaded"):
+        return result
+    if snapshot.get("ready") and snapshot.get("layout") == "store":
+        result["offerState"] = "ready"
+        return result
+    height, width = bgr.shape[:2]
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    left, right = int(width*.78), int(width*.99)
+    top, bottom = int(height*.18), int(height*.70)
+    roi = hsv[top:bottom, int(width*.92):right]
+    green = cv2.inRange(roi, np.array([35, 90, 90]), np.array([85, 255, 255]))
+    green = cv2.morphologyEx(green, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8))
+    count, _, stats, _ = cv2.connectedComponentsWithStats(green)
+    rows = []
+    for x, y, w, h, area in stats[1:count]:
+        if width*.009 <= w <= width*.035 and height*.012 <= h <= height*.050 and area >= 30:
+            rows.append((top+y+h/2)/height)
+    if last_offer_y is not None and .18 <= float(last_offer_y) <= .70:
+        rows.append(float(last_offer_y))
+    for row_y in sorted(rows):
+        if any(abs(row_y-row["y"]) < .025 for row in result["offerRows"]):
+            continue
+        y1, y2 = max(top, int((row_y-.03)*height)), min(bottom, int((row_y+.03)*height))
+        crop = bgr[y1:y2, left:right]
+        if not crop.size:
+            continue
+        # Sample the word area without white glyphs or the green resource icon.
+        word_hsv = hsv[y1:y2, int(width*.825):int(width*.93)]
+        colored_blue = (word_hsv[:,:,0] >= 85) & (word_hsv[:,:,0] <= 125) & (word_hsv[:,:,1] >= 65) & (word_hsv[:,:,2] >= 100)
+        blue_ratio = float(np.mean(colored_blue))
+        neutral_ratio = float(np.mean((word_hsv[:,:,1] < 65) & (word_hsv[:,:,2] < 200)))
+        enlarged = cv2.resize(crop, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+        ok, encoded = cv2.imencode(".png", enlarged)
+        if ok:
+            result["offerRows"].append({"x": (left+right)/2/width, "y": row_y,
+                "greyBackground": neutral_ratio >= .50 and blue_ratio < .20,
+                "imageBase64": base64.b64encode(encoded).decode("ascii")})
+    return result
 
 
 def _training_player_reference_features():
@@ -2866,6 +3349,46 @@ def detect_training_player_flow(bgr):
     return result
 
 
+def skip_control_text_crop(bgr, control):
+    """Export the selected label for local OCR; pixels alone do not prove text."""
+    h, w = bgr.shape[:2]
+    x, y = float(control['x']) * w, float(control['y']) * h
+    if not (0 <= x < w and 0 <= y < h):
+        return None
+    rx, ry = max(24, round(w*.06)), max(10, round(h*.02))
+    left, top = max(0, round(x)-rx), max(0, round(y)-ry)
+    right, bottom = min(w, round(x)+rx+1), min(h, round(y)+ry+1)
+    patch = bgr[top:bottom, left:right]
+    if patch.size == 0:
+        return None
+    scale = 4
+    ok, encoded = cv2.imencode('.png', cv2.resize(patch, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC))
+    if not ok:
+        return None
+    return {'image': base64.b64encode(encoded).decode('ascii'),
+            'windowSize': [w, h], 'sourceBox': [left, top, right, bottom],
+            'scale': scale, 'x': float(control['x']), 'y': float(control['y'])}
+
+
+def refine_skip_control_near_point(bgr, control, template=None):
+    """Verify a Skip on the current frame; never authorize a different action."""
+    h, w = bgr.shape[:2]
+    try:
+        x, y = float(control['x'])*w, float(control['y'])*h
+        if not (0 <= x < w and 0 <= y < h):
+            return {'found': False}
+        radius = max(10, min(45, round(min(w, h)*.04)))
+        chevron = _detect_double_chevron_control(bgr)
+        if chevron and chevron.get('found') and math.hypot(
+                chevron['x']*w-x, chevron['y']*h-y) <= radius:
+            return {**chevron, 'method': 'ai-local-fresh-skip-chevron'}
+        # A static logo can match a previous crop perfectly. Image similarity
+        # never proves that its pixels are a Skip control.
+        return {'found': False, 'skipTextCheck': skip_control_text_crop(bgr, control)}
+    except (KeyError, TypeError, ValueError, cv2.error):
+        return {'found': False}
+
+
 def load_image(path):
     image = cv2.imread(path, cv2.IMREAD_COLOR)
     if image is None:
@@ -2879,7 +3402,13 @@ def capture_rect(rect):
     return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
 
-def run_detector(image, mode=None, live=False):
+def run_detector(image, mode=None, live=False, last_offer_y=None, skip_control=None, skip_template=None):
+    if mode == 'wake_store_badge':
+        return detect_verified_top_left_store_badge(image)
+    if mode == 'google_play_control':
+        return refine_google_play_control_near_point(image, skip_control or {})
+    if mode == 'skip_control':
+        return refine_skip_control_near_point(image, skip_control or {}, skip_template)
     if mode == "frame_fingerprint":
         return {"pixels": cv2.resize(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), (32, 18)).flatten().tolist()}
     if mode == "top_resource_cards":
@@ -2898,6 +3427,8 @@ def run_detector(image, mode=None, live=False):
         return detect_alliance_flow(image)
     if mode == "team_rest_free_button":
         return detect_team_rest_free_button(image)
+    if mode == "green_store_offer":
+        return detect_green_store_offer(image, last_offer_y)
     if mode == "training_player_flow":
         return detect_training_player_flow(image)
     return detect_x(image, live=live) or {"found": False}
@@ -2914,7 +3445,8 @@ def server_loop():
                 image = capture_rect(request["rect"])
             else:
                 image = load_image(request["image"])
-            result = run_detector(image, request.get("mode"), live=("rect" in request))
+            result = run_detector(image, request.get("mode"), live=("rect" in request), last_offer_y=request.get("lastOfferY"),
+                                  skip_control=request.get('control'), skip_template=request.get('skipTemplate'))
             print(json.dumps(result), flush=True)
         except Exception as exc:
             print(json.dumps({"found": False, "error": str(exc)}), flush=True)
@@ -2926,7 +3458,7 @@ def main():
     parser.add_argument("--server", action="store_true")
     parser.add_argument(
         "--mode",
-        choices=("x", "top_resource_cards", "yellow_ad_control", "play_destination", "tv_flow", "mourinho_flow", "campus_flow", "alliance_flow", "team_rest_free_button", "training_player_flow"),
+        choices=("x", "top_resource_cards", "yellow_ad_control", "play_destination", "tv_flow", "mourinho_flow", "campus_flow", "alliance_flow", "team_rest_free_button", "green_store_offer", "training_player_flow"),
         default="x",
     )
     args = parser.parse_args()

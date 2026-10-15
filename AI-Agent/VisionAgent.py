@@ -67,6 +67,9 @@ _GEMINI_RATE_FILE = (
     / "gemini-request-times.json"
 )
 _GEMINI_DIAGNOSTIC_FILE = _GEMINI_RATE_FILE.with_name("gemini-diagnostics.log")
+_GEMINI_MODEL_COOLDOWN_FILE = _GEMINI_RATE_FILE.with_name(
+    "gemini-model-cooldowns.json"
+)
 
 
 def log_gemini_event(config: dict[str, Any], message: str) -> None:
@@ -174,6 +177,69 @@ def wait_for_gemini_rate_slot(config: dict[str, Any]) -> None:
                     return
                 wait_seconds = max(0.05, window - (now - _GEMINI_REQUEST_TIMES[0]))
         time.sleep(wait_seconds)
+
+
+def gemini_retry_after_seconds(detail: str) -> float | None:
+    """Extract Google's human-readable retry delay without trusting other text."""
+    match = re.search(r"retry\s+in\s+([0-9]+(?:\.[0-9]+)?)\s*s", detail, re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return max(0.0, float(match.group(1)))
+    except ValueError:
+        return None
+
+
+def _read_gemini_model_cooldowns(now: float | None = None) -> dict[str, float]:
+    """Read restart-safe per-model cooldowns and discard expired entries."""
+    current = time.time() if now is None else now
+    try:
+        supplied = json.loads(
+            _GEMINI_MODEL_COOLDOWN_FILE.read_text(encoding="utf-8")
+        )
+        if not isinstance(supplied, dict):
+            return {}
+        return {
+            str(model): float(until)
+            for model, until in supplied.items()
+            if float(until) > current
+        }
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {}
+
+
+def set_gemini_model_cooldown(
+    model: str, seconds: float, config: dict[str, Any], reason: str
+) -> None:
+    """Persist a bounded model cooldown so child-process restarts cannot erase it."""
+    now = time.time()
+    until = now + max(1.0, float(seconds))
+    with _GEMINI_RATE_LOCK:
+        with _gemini_interprocess_rate_lock():
+            cooldowns = _read_gemini_model_cooldowns(now)
+            cooldowns[model] = max(until, cooldowns.get(model, 0.0))
+            try:
+                _GEMINI_MODEL_COOLDOWN_FILE.parent.mkdir(parents=True, exist_ok=True)
+                temporary = _GEMINI_MODEL_COOLDOWN_FILE.with_name(
+                    f"{_GEMINI_MODEL_COOLDOWN_FILE.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+                )
+                temporary.write_text(json.dumps(cooldowns), encoding="utf-8")
+                temporary.replace(_GEMINI_MODEL_COOLDOWN_FILE)
+            except OSError:
+                pass
+    log_gemini_event(
+        config,
+        f"model={model} cooldown={max(1.0, float(seconds)):g}s reason={reason}",
+    )
+
+
+def gemini_model_cooldown_remaining(model: str) -> float:
+    """Return the restart-safe cooldown still remaining for one model."""
+    now = time.time()
+    with _GEMINI_RATE_LOCK:
+        with _gemini_interprocess_rate_lock():
+            cooldowns = _read_gemini_model_cooldowns(now)
+    return max(0.0, cooldowns.get(model, 0.0) - now)
 
 
 class GeminiHttpError(RuntimeError):
@@ -355,6 +421,10 @@ Safety is more important than closing an ad:
 - Use click_skip only for a genuine skip or >> control.
 - Use click_google_play only for the ad's Google Play, Play Store, or Visit Google Play
   badge/pill, never an Install/Get/Open/Buy button inside a store page.
+- A branded GET IT ON Google Play badge at the ad's BOTTOM-RIGHT edge and an
+  Open Store >> pill at the ad's TOP-RIGHT edge are store badges: return
+  click_google_play for them, never click_skip. Prefer the branded bottom-right
+  badge when both are visible.
 - Control priority on an ad is: genuine close X first, then genuine >>/Skip,
   then an ad Google Play/Play Store badge only when no close or skip control is visible.
 - Use send_back only on Google Play Store, a Google Play app-detail modal opened over
@@ -396,6 +466,27 @@ AI_ONLY_SYSTEM_PROMPT = SYSTEM_PROMPT.replace(
     "Always report x/y normalized to this image. The coordinate origin is top-left.",
 )
 
+AD_CORNERS_SYSTEM_PROMPT = """You inspect two cropped upper corners of an ad in BlueStacks.
+The supplied image has LEFT CORNER on the left and RIGHT CORNER on the right.
+It contains only those two crops, labels and a separator. The emulator title bar
+and toolbar are excluded. Return the standard JSON schema. Report x/y normalized
+to the ENTIRE supplied two-panel image, not to either individual panel or the
+original window. The coordinate origin is the supplied image's top-left.
+Choose a genuine ad close X first, then a genuine >>/Skip, then a visibly branded
+Google Play, Play Store, Visit Google Play or Open Store badge/pill. Install, Get, Download, Buy, Learn More, Play Now,
+sound, pause, menu, information and game controls are never close or skip.
+Game logos, including Kingshot lettering, and the Google Play triangle/wordmark
+are never Skip. Choose Skip only for an isolated literal Skip label or an actual
+pair of right-pointing chevrons. Do not infer chevrons from unreadable letters.
+An Open Store >> pill is a store control, not Skip. Seeing an Install button does
+not hide a separate genuine X or Skip. Never click labels or the separator.
+You cannot see the full screen. Do not infer a return to Top Eleven or issue
+send_back from these crops. Always set topElevenReturned=false. If no permitted
+control is visible, return recommendedAction=none, control.type=none and x/y=null.
+Use screenType=ad when the crops visibly belong to an ad, otherwise unknown.
+Map actions exactly: click_close=close_x, click_skip=skip,
+click_google_play=google_play, none=none. Do not invent a control or coordinate."""
+
 
 def expected_state_uses_original_image(expected_state: str) -> bool:
     """Return whether a state sends Gemini the unmodified full screenshot."""
@@ -415,6 +506,8 @@ def expected_state_uses_original_image(expected_state: str) -> bool:
 
 def system_prompt_for_expected_state(expected_state: str) -> str:
     """Keep the coordinate instructions consistent with the supplied image."""
+    if expected_state.endswith("__ad_corners"):
+        return AD_CORNERS_SYSTEM_PROMPT
     return (
         AI_ONLY_SYSTEM_PROMPT
         if expected_state_uses_original_image(expected_state)
@@ -463,6 +556,73 @@ def encode_image(image: Image.Image) -> str:
     output = io.BytesIO()
     image.save(output, format="JPEG", quality=92, optimize=True)
     return base64.b64encode(output.getvalue()).decode("ascii")
+
+
+def build_ad_corner_image(image: Image.Image, config: dict[str, Any]):
+    """Pack only the upper game corners, keeping an exact inverse pixel map."""
+    width, height = image.size
+    top = max(0, min(height-1, int(config.get("adCornerTopInsetPx", 40))))
+    right = max(1, width-max(0, int(config.get("adCornerRightInsetPx", 42))))
+    fraction_x = max(.10, min(.40, float(config.get("adCornerWidthFraction", .22))))
+    fraction_y = max(.15, min(.50, float(config.get("adCornerHeightFraction", .35))))
+    crop_width = max(1, round(right*fraction_x))
+    crop_height = max(1, round((height-top)*fraction_y))
+    boxes = [(0, top, crop_width, top+crop_height),
+             (right-crop_width, top, right, top+crop_height)]
+    scale = 2
+    panel_width, panel_height = crop_width*scale, crop_height*scale
+    label_height, gap = 24, 16
+    canvas = Image.new("RGB", (panel_width*2+gap, panel_height+label_height), "black")
+    draw = ImageDraw.Draw(canvas)
+    regions = []
+    for index, box in enumerate(boxes):
+        left = index*(panel_width+gap)
+        canvas.paste(image.crop(box).convert("RGB").resize(
+            (panel_width, panel_height), Image.Resampling.LANCZOS), (left, label_height))
+        draw.text((left+8, 6), "LEFT CORNER" if index == 0 else "RIGHT CORNER", fill="white")
+        regions.append({"source": box,
+                        "panel": (left, label_height, left+panel_width, label_height+panel_height)})
+    return canvas, regions
+
+
+def map_ad_corner_decision(raw, corner_size, original_size, regions):
+    """Convert the model's panel coordinate into the original window once."""
+    if not isinstance(raw, dict):
+        return raw
+    mapped = copy.deepcopy(raw)
+    mapped["topElevenReturned"] = False
+    if mapped.get("recommendedAction") == "none":
+        if mapped.get("screenType") == "top_eleven":
+            mapped["screenType"] = "unknown"
+        return mapped
+    if mapped.get("recommendedAction") not in {"click_close", "click_skip", "click_google_play"}:
+        mapped["recommendedAction"] = "invalid_corner_action"
+        return mapped
+    control = mapped.get("control")
+    if not isinstance(control, dict):
+        return mapped
+    try:
+        x, y = float(control["x"]), float(control["y"])
+        if x > 1 or y > 1:
+            if (x > 1000 or y > 1000) and 0 <= x <= corner_size[0] and 0 <= y <= corner_size[1]:
+                x, y = x/corner_size[0], y/corner_size[1]
+            elif 0 <= x <= 1000 and 0 <= y <= 1000:
+                x, y = x/1000, y/1000
+        if not (0 <= x <= 1 and 0 <= y <= 1):
+            raise ValueError("outside corner image")
+        px, py = x*corner_size[0], y*corner_size[1]
+        for region in regions:
+            left, top, right, bottom = region["panel"]
+            if left <= px < right and top <= py < bottom:
+                sx1, sy1, sx2, sy2 = region["source"]
+                control["x"] = (sx1+(px-left)*(sx2-sx1)/(right-left))/original_size[0]
+                control["y"] = (sy1+(py-top)*(sy2-sy1)/(bottom-top))/original_size[1]
+                return mapped
+        raise ValueError("coordinate on corner label or separator")
+    except (KeyError, TypeError, ValueError, OverflowError):
+        # Let the existing schema validator reject it; never click a panel label.
+        control["x"] = control["y"] = -1
+        return mapped
 
 
 def _fold_campus_text(value: str) -> str:
@@ -686,7 +846,7 @@ def ground_campus_click_on_fresh_frame(
             y1 = max(0, int((by - bh * 1.20) * fresh_height))
             y2 = min(fresh_height, int((by + bh * 1.20) * fresh_height))
             status_side = fresh_bgr[y1:y2, x1:x2]
-            if status_side.size:
+            if status_side.size and nearest_badge.get("statusColor", "green") == "green":
                 status_hsv = cv2.cvtColor(status_side, cv2.COLOR_BGR2HSV)
                 yellow = cv2.inRange(
                     status_hsv,
@@ -815,7 +975,8 @@ def build_diagnostic_image(
 
 
 def request_ollama(image: Image.Image, expected_state: str, config: dict[str, Any]) -> dict[str, Any]:
-    candidate = detect_guarded_candidate(image)
+    corners = expected_state.endswith("__ad_corners")
+    candidate = None if corners else detect_guarded_candidate(image)
     candidate_prompt = ""
     if candidate:
         candidate_description = (
@@ -839,6 +1000,10 @@ def request_ollama(image: Image.Image, expected_state: str, config: dict[str, An
         "Return only the schema-conforming object."
         + candidate_prompt
     )
+    if corners:
+        prompt, supplied_image = build_user_prompt(image, expected_state)
+    else:
+        supplied_image = build_diagnostic_image(image, candidate)
     payload = {
         "model": config["model"],
         "stream": False,
@@ -851,11 +1016,11 @@ def request_ollama(image: Image.Image, expected_state: str, config: dict[str, An
         },
         "keep_alive": str(config.get("keepAlive", "30m")),
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": AD_CORNERS_SYSTEM_PROMPT if corners else SYSTEM_PROMPT},
             {
                 "role": "user",
                 "content": prompt,
-                "images": [encode_image(build_diagnostic_image(image, candidate))],
+                "images": [encode_image(supplied_image)],
             },
         ],
     }
@@ -897,13 +1062,24 @@ def request_ollama(image: Image.Image, expected_state: str, config: dict[str, An
 def build_user_prompt(
     image: Image.Image, expected_state: str
 ) -> tuple[str, Image.Image]:
+    if expected_state.endswith("__ad_corners"):
+        return (
+            "Inspect only the LEFT CORNER and RIGHT CORNER panels for a genuine ad X, "
+            ">>/Skip, Google Play, Play Store, Visit Google Play or Open Store control. "
+            "Inspect the FAR-RIGHT end of a Reward granted pill for its small X. "
+            "Open Store >> is click_google_play, never click_skip. Ignore Install/Get, "
+            "sound, pause and game controls. Return one JSON decision with the coordinate "
+            "normalized to the ENTIRE supplied two-panel image. If no allowed control "
+            "is visible return none. You cannot determine the full-screen destination "
+            "or a game return from these crops; topElevenReturned must be false.", image
+        )
     if expected_state.startswith("reward_offer_"):
         target = "green_store" if expected_state.startswith("reward_offer_green_store") else "training_condition"
         return (
             "Inspect ONLY the current Top Eleven free green-rest reward offer. "
             + ("Target: the Odmori row in PRODAVNICA, with the GREEN rest icon at the RIGHT of the video button. Ignore blue MORAL rewards and the BESPLATNI navigation tab. "
                if target == "green_store" else
-               "Target: the video reward button in the open KONDICIJA recovery panel of a player profile. Ignore POVREDE, MORAL, the paid Unajmi button and all plus buttons. A gold rare-player profile is valid. The top resource header may be obscured. ")
+               "Target: the video reward button in the open KONDICIJA recovery panel of a player profile. Ignore POVREDE, MORAL, the paid Unajmi button and all plus buttons. A gold rare-player profile is valid. The open player profile with the KONDICIJA row and Unajmi button is itself sufficient Top Eleven evidence; the top resource header may be obscured. ")
             + "Read the ACTUAL label and background of this target, not other text or previous frames. "
             "Classify limit ONLY when its label visibly reads OGRAN. DOSTIGNUTO (limit reached); "
             "grey ONLY when the full word BESPLATNO is visible on a grey/dark disabled background; "
@@ -1166,11 +1342,27 @@ def build_user_prompt(
             "single ad counter, coin badge, store header, emulator title bar, or ad graphic is not "
             "the Top Eleven resource header. If Top Eleven has returned to a player profile, its "
             "profile X and green condition + are GAME controls, not ad controls: still return none. "
-            "Look especially for a small X attached to a Reward granted label, a close X, "
-            "or a genuine >>/skip control. If no close or skip control is visible, also look "
+            "Look especially for a small white X at the FAR-RIGHT end of a gray Reward granted "
+            "pill near the ad's upper-right edge, or another genuine close X. The large Learn More "
+            "button below the video is not the close control. Also look for "
+            "or a genuine >>/skip/fast-forward control. Skip may be in EITHER upper corner: "
+            "for example a tiny white >> at the upper-right beside resource counters, or a white "
+            ">>| symbol inside a neutral gray circle at the upper-left. Return click_skip for "
+            "either real Skip control and place the coordinate at its visible center even when it "
+            "is tiny, colored, stylized, or has no matching local computer-vision marker. Never "
+            "return click_skip for a button whose label is Install, Download, Get, Open, Buy, "
+            "Learn More, or Play Now. Never confuse a separate colored INSTALL button with Skip. "
+            "If no close or skip control is visible, also look "
             "for the ad's Google Play, Play Store, or Visit Google Play badge, including a "
-            "very small Google Play disclosure badge at the ad's TOP-LEFT edge, and return "
-            "click_google_play. Never choose Install, Get, Open, Buy, Learn More, or a store-page "
+            "very small Google Play disclosure badge at the ad's TOP-LEFT edge, an Open Store >> "
+            "pill at the TOP-RIGHT edge, or a branded GET IT ON Google Play badge at the "
+            "BOTTOM-RIGHT edge. Prefer the branded bottom-right badge and return "
+            "click_google_play. Also check a branded BOTTOM-LEFT badge or the Google Play wordmark "
+            "with its multicolor triangle at the bottom of an advertiser landing sheet. "
+            "On a narrow portrait playable ad, a wake tap may reveal that tiny "
+            "top-left Google Play badge for only a few seconds; inspect the supplied frame itself "
+            "carefully and never confuse the permanent INSTALL artwork below it with the badge. "
+            "Never choose Install, Get, Open, Buy, Learn More, or a store-page "
             "button. If the entire current content is already a Google Play app-detail destination "
             "with a back arrow, literal Google Play header, app name and Install button, return "
             "screenType=google_play_store, control.type=back and recommendedAction=send_back instead "
@@ -1276,12 +1468,24 @@ def parse_gemini_envelope(envelope: dict[str, Any]) -> dict[str, Any]:
         block_reason = (envelope.get("promptFeedback") or {}).get("blockReason", "unknown")
         raise ValueError(f"Gemini response has no candidate (blockReason={block_reason})")
     parts = ((candidates[0].get("content") or {}).get("parts") or [])
-    content = "".join(part.get("text", "") for part in parts if isinstance(part, dict))
+    # Thinking-capable models can return a separate thought part before the
+    # answer. It is not part of the JSON decision and must never be parsed as
+    # one. Gemma 4 may also wrap its plain-text JSON in a Markdown fence when
+    # responseSchema is unavailable for that model.
+    answer_parts = [
+        part.get("text", "")
+        for part in parts
+        if isinstance(part, dict) and not part.get("thought") and part.get("text")
+    ]
+    content = "".join(answer_parts).strip()
     if not content.strip():
         raise ValueError(
             "Gemini response has no text "
             f"(finishReason={candidates[0].get('finishReason', 'unknown')})"
         )
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", content, flags=re.DOTALL | re.IGNORECASE)
+    if fenced:
+        content = fenced.group(1).strip()
     return json.loads(content)
 
 
@@ -1321,27 +1525,42 @@ def request_gemini(image: Image.Image, expected_state: str, config: dict[str, An
             }
         ],
     }
-    models = []
-    if _GEMINI_ACTIVE_MODEL:
-        models.append(_GEMINI_ACTIVE_MODEL)
-    models.append(str(config["model"]))
+    # Always prefer the configured primary model. A fallback may be active
+    # while the primary is cooling down, but it must not become permanently
+    # sticky after that cooldown expires.
+    models = [str(config["model"])]
     models.extend(str(item) for item in config.get("fallbackModels", []) if str(item).strip())
     models = list(dict.fromkeys(models))
     last_error: GeminiHttpError | None = None
     last_response_error: ValueError | None = None
     last_timeout_error: BaseException | None = None
+    cooling_models: list[tuple[str, float]] = []
     key_order = list(range(len(api_keys)))
     if 0 <= _GEMINI_ACTIVE_KEY_INDEX < len(api_keys):
         key_order.remove(_GEMINI_ACTIVE_KEY_INDEX)
         key_order.insert(0, _GEMINI_ACTIVE_KEY_INDEX)
+    diagnostic_state = re.sub(r"\d{8,}", "<session>", expected_state)[:120]
 
     for model_index, model_name in enumerate(models):
+        cooldown_remaining = gemini_model_cooldown_remaining(model_name)
+        if cooldown_remaining > 0:
+            cooling_models.append((model_name, cooldown_remaining))
+            log_gemini_event(
+                config,
+                f"state={diagnostic_state} model={model_name} skipped_cooldown={cooldown_remaining:.1f}s",
+            )
+            continue
+        is_gemma_four = model_name.startswith("gemma-4")
         generation_config: dict[str, Any] = {
             "maxOutputTokens": int(config.get("maximumOutputTokens", 256)),
-            "responseMimeType": "application/json",
-            "responseSchema": gemini_response_schema(),
         }
-        if model_name.startswith("gemini-3"):
+        # Gemma 4 currently accepts multimodal generateContent requests but
+        # returns HTTP 500 when the Gemini structured-output responseSchema is
+        # attached. Ask it for the same JSON contract in text instead.
+        if not is_gemma_four:
+            generation_config["responseMimeType"] = "application/json"
+            generation_config["responseSchema"] = gemini_response_schema()
+        if model_name.startswith(("gemini-3", "gemma-4")):
             generation_config["thinkingConfig"] = {
                 "thinkingLevel": str(config.get("thinkingLevel", "minimal"))
             }
@@ -1351,11 +1570,22 @@ def request_gemini(image: Image.Image, expected_state: str, config: dict[str, An
                 "thinkingBudget": int(config.get("thinkingBudget", 0))
             }
         payload = copy.deepcopy(base_payload)
+        if is_gemma_four:
+            payload["contents"][0]["parts"][-1]["text"] += (
+                "\nReturn exactly one valid JSON object and nothing else. Do not use Markdown "
+                "fences. Use exactly these fields: "
+                '{"screenType":"ad","topElevenReturned":false,'
+                '"control":{"type":"none","x":null,"y":null,"confidence":0.0},'
+                '"recommendedAction":"none","reason":"short reason",'
+                '"visibleText":"visible UI text"}. Replace the example values with your decision; '
+                "coordinates are normalized numbers from 0 to 1 or null."
+            )
         payload["generationConfig"] = generation_config
         endpoint = endpoint_template.replace("{model}", model_name)
         model_failed = False
         timed_out_keys = 0
         quota_exhausted_keys = 0
+        quota_retry_after = 0.0
         for key_index in key_order:
             api_key = api_keys[key_index]
             timeout_attempts = 0
@@ -1365,15 +1595,25 @@ def request_gemini(image: Image.Image, expected_state: str, config: dict[str, An
                 headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
                 method="POST",
             )
-            attempt_timeouts = (
-                float(config.get("initialRequestTimeoutSeconds", 15)),
-                float(config.get("retryRequestTimeoutSeconds", 10)),
-            )
+            if is_gemma_four:
+                # Hosted Gemma 4 vision responses in the standard tier commonly
+                # take 30-35 seconds. The shorter Gemini Flash limits would
+                # terminate every otherwise healthy request before completion.
+                attempt_timeouts = (
+                    float(config.get("gemmaInitialRequestTimeoutSeconds", 45)),
+                    float(config.get("gemmaRetryRequestTimeoutSeconds", 45)),
+                )
+            else:
+                attempt_timeouts = (
+                    float(config.get("initialRequestTimeoutSeconds", 15)),
+                    float(config.get("retryRequestTimeoutSeconds", 10)),
+                )
             for attempt_index, attempt_timeout in enumerate(attempt_timeouts, start=1):
                 wait_for_gemini_rate_slot(config)
                 log_gemini_event(
                     config,
-                    f"model={model_name} key_slot={key_index + 1} attempt={attempt_index} timeout={attempt_timeout:g}s sent",
+                    f"state={diagnostic_state} model={model_name} key_slot={key_index + 1} "
+                    f"attempt={attempt_index} timeout={attempt_timeout:g}s sent",
                 )
                 try:
                     response_bytes = urlopen_read_with_hard_timeout(request, attempt_timeout)
@@ -1383,7 +1623,8 @@ def request_gemini(image: Image.Image, expected_state: str, config: dict[str, An
                     _GEMINI_ACTIVE_KEY_INDEX = key_index
                     log_gemini_event(
                         config,
-                        f"model={model_name} key_slot={key_index + 1} attempt={attempt_index} success",
+                        f"state={diagnostic_state} model={model_name} key_slot={key_index + 1} "
+                        f"attempt={attempt_index} success",
                     )
                     return decision
                 except urllib.error.HTTPError as exc:
@@ -1396,15 +1637,35 @@ def request_gemini(image: Image.Image, expected_state: str, config: dict[str, An
                     last_error = GeminiHttpError(exc.code, str(detail or exc.reason))
                     log_gemini_event(
                         config,
-                        f"model={model_name} key_slot={key_index + 1} attempt={attempt_index} http={last_error.status}",
+                        f"state={diagnostic_state} model={model_name} key_slot={key_index + 1} "
+                        f"attempt={attempt_index} http={last_error.status}",
                     )
                     if last_error.status == 429:
                         # Quota is known to be exhausted: do not waste the
                         # second attempt, move to the next configured key.
                         quota_exhausted_keys += 1
+                        quota_retry_after = max(
+                            quota_retry_after,
+                            gemini_retry_after_seconds(last_error.detail) or 0.0,
+                        )
                         break
+                    if (
+                        500 <= last_error.status <= 599
+                        and attempt_index < len(attempt_timeouts)
+                    ):
+                        # Gemma's hosted preview can return a short transient
+                        # backend 500. Retry once on the same model/key; this is
+                        # bounded by both the per-minute limiter and attempt list.
+                        continue
                     if not gemini_error_allows_model_fallback(last_error):
                         raise last_error from exc
+                    if 500 <= last_error.status <= 599:
+                        set_gemini_model_cooldown(
+                            model_name,
+                            float(config.get("highDemandModelCooldownSeconds", 16)),
+                            config,
+                            f"http_{last_error.status}",
+                        )
                     model_failed = True
                     break
                 except (TimeoutError, urllib.error.URLError) as exc:
@@ -1414,7 +1675,8 @@ def request_gemini(image: Image.Image, expected_state: str, config: dict[str, An
                     timeout_attempts += 1
                     log_gemini_event(
                         config,
-                        f"model={model_name} key_slot={key_index + 1} attempt={attempt_index} timeout",
+                        f"state={diagnostic_state} model={model_name} key_slot={key_index + 1} "
+                        f"attempt={attempt_index} timeout",
                     )
                     # First silence retries after 15 s. Second silence after
                     # another 10 s leaves this key and moves to the next one.
@@ -1434,8 +1696,20 @@ def request_gemini(image: Image.Image, expected_state: str, config: dict[str, An
         if timed_out_keys == len(key_order) and timed_out_keys > 0:
             raise last_timeout_error
         if quota_exhausted_keys == len(key_order) and quota_exhausted_keys > 0:
-            # Quota belongs to the project/key, so cycling through fallback
-            # models only hides the real error until the parent timeout.
+            # Every configured key is out of quota for this model. Move to the
+            # next configured model (3.1 Flash-Lite in production); if this was
+            # the last model, preserve the original 429 for the caller.
+            set_gemini_model_cooldown(
+                model_name,
+                max(
+                    float(config.get("quotaModelCooldownSeconds", 60)),
+                    quota_retry_after + 2.0,
+                ),
+                config,
+                "quota_429_all_keys",
+            )
+            if model_index + 1 < len(models):
+                continue
             raise last_error
         if timed_out_keys + quota_exhausted_keys == len(key_order):
             # Mixed failure is equally terminal for this request: for example,
@@ -1448,8 +1722,21 @@ def request_gemini(image: Image.Image, expected_state: str, config: dict[str, An
             raise last_response_error or last_error or RuntimeError(
                 "Gemini model fallbacks did not return a usable response"
             )
+    if cooling_models and len(cooling_models) == len(models):
+        summary = ", ".join(
+            f"{model} {remaining:.0f}s" for model, remaining in cooling_models
+        )
+        raise GeminiHttpError(503, f"All configured models are cooling down: {summary}")
     raise last_response_error or last_error or last_timeout_error or RuntimeError(
         "Gemini request failed without a usable response"
+    )
+
+
+def uses_ad_corner_view(expected_state: str) -> bool:
+    # Preflight must classify the game and external destinations; two corners
+    # cannot authorize either a game return or Android Back.
+    return expected_state.startswith("ad_control") and not expected_state.startswith(
+        "ad_control_ai_only_preflight_"
     )
 
 
@@ -1457,11 +1744,15 @@ def request_vision_model(
     image: Image.Image, expected_state: str, config: dict[str, Any]
 ) -> dict[str, Any]:
     provider = str(config.get("provider", "ollama")).strip().lower()
-    if provider == "ollama":
-        return request_ollama(image, expected_state, config)
-    if provider == "gemini":
-        return request_gemini(image, expected_state, config)
-    raise ValueError(f"Unsupported vision provider: {provider}")
+    request = {"ollama": request_ollama, "gemini": request_gemini}.get(provider)
+    if request is None:
+        raise ValueError(f"Unsupported vision provider: {provider}")
+    if uses_ad_corner_view(expected_state):
+        corners, regions = build_ad_corner_image(image, config)
+        corner_state = expected_state + "__ad_corners"
+        raw = request(corners, corner_state, config)
+        return map_ad_corner_decision(raw, corners.size, image.size, regions)
+    return request(image, expected_state, config)
 
 
 def validate_decision(
@@ -1523,6 +1814,8 @@ def validate_decision(
         errors.append("invalid control type")
     if action in ACTION_CONTROL and control_type != ACTION_CONTROL[action]:
         errors.append("action and control do not match")
+    if action in {"click_close", "click_skip", "click_google_play"} and screen_type != "ad":
+        errors.append("ad control requires an ad screen")
     if action == "click_target" and not mourinho_warning:
         errors.append("click_target is only allowed for mourinho_warning")
     if action == "click_campus_building" and not campus_building:
@@ -1549,6 +1842,7 @@ def validate_decision(
         errors.append("confidence outside 0..1")
 
     x, y = control.get("x"), control.get("y")
+    google_play_badge_zone = False
     if action.startswith("click_"):
         try:
             x, y = float(x), float(y)
@@ -1584,8 +1878,17 @@ def validate_decision(
         if x is not None and not ai_only and action in {"click_close", "click_skip"}:
             if y > 0.35 or not (x <= 0.40 or x >= 0.60):
                 errors.append("close/skip coordinate outside guarded edge zone")
-        if x is not None and not ai_only and action == "click_google_play" and (x < 0.55 or y > 0.35):
-            errors.append("Google Play coordinate outside guarded top-right zone")
+        google_play_badge_zone = (
+            x is not None and y is not None and (
+                (0.00 <= x <= 0.25 and 0.04 <= y <= 0.24)
+                or (0.70 <= x <= 0.98 and 0.04 <= y <= 0.28)
+                or (0.78 <= x <= 0.96 and 0.84 <= y <= 0.98)
+                or (0.02 <= x <= 0.18 and 0.86 <= y <= 0.98)
+                or (0.34 <= x <= 0.55 and 0.78 <= y <= 0.95)
+            )
+        )
+        if x is not None and action == "click_google_play" and not google_play_badge_zone:
+            errors.append("Google Play coordinate outside guarded badge zones")
         if x is not None and mourinho_warning and action == "click_target":
             legacy_zone = 0.47 <= x <= 0.68 and 0.84 <= y <= 0.99
             redesigned_zone = 0.58 <= x <= 0.67 and 0.91 <= y <= 1.0
@@ -1639,7 +1942,10 @@ def validate_decision(
             required_label = {"ready": "BESPLATNO", "grey": "BESPLATNO", "limit": "OGRAN. DOSTIGNUTO", "unknown": "UNKNOWN"}[state]
             if label != required_label:
                 errors.append("reward offer state contradicts visible label")
-            if state != "unknown" and (screen_type != "top_eleven" or not raw.get("topElevenReturned") or confidence < max(0.90, float(config["minimumConfidence"]))):
+            # For reward-offer classification the exact target panel is the
+            # current-screen evidence. `topElevenReturned` describes ad return
+            # and is not a valid prerequisite before the ad has even started.
+            if state != "unknown" and (screen_type != "top_eleven" or confidence < max(0.90, float(config["minimumConfidence"]))):
                 errors.append("reward offer has no confident Top Eleven evidence")
     if campus_building and action == "click_campus_building":
         campus_target = re.search(
@@ -1688,13 +1994,18 @@ def validate_decision(
             elif profile_condition >= 85 and action != "click_training_player_close":
                 errors.append("training profile at 85% or more must target profile X")
     dangerous_pattern = r"\b(install|get|buy|purchase|subscribe|payment|placanje|kupi)\b"
-    ai_only_close = ai_only and action in {"click_close", "click_skip"}
+    safe_ad_exit = screen_type == "ad" and action in {"click_close", "click_skip"}
+    safe_google_play_control = (
+        action == "click_google_play"
+        and screen_type == "ad"
+        and bool(google_play_badge_zone)
+    )
     safe_recovery_control = (
         connection_popup and action == "click_connection_confirm"
     ) or (
         incidental_popup and action == "click_incidental_popup_close"
     )
-    if action not in {"none", "send_back"} and not ai_only_close and not safe_recovery_control and re.search(dangerous_pattern, visible_text, flags=re.IGNORECASE):
+    if action not in {"none", "send_back"} and not safe_ad_exit and not safe_google_play_control and not safe_recovery_control and re.search(dangerous_pattern, visible_text, flags=re.IGNORECASE):
         errors.append("dangerous commerce/install text is visible")
 
     normalized = {
@@ -1797,6 +2108,8 @@ def refine_decision_control_center(
             XDetector.run_detector(bgr, live=True),
             XDetector.detect_yellow_ad_control(bgr),
             XDetector.detect_top_edge_google_play_badge(bgr),
+            XDetector.detect_bottom_right_google_play_badge(bgr),
+            XDetector.verify_ai_google_play_badge(bgr, decision.get("control") or {}),
         ]
         candidate = select_pixel_control_candidate(decision, candidates)
         if candidate is None:
@@ -1816,10 +2129,104 @@ def refine_decision_control_center(
             "pixelX": pixel_x,
             "pixelY": pixel_y,
             "method": str(candidate.get("method", "pixel-center")),
+            "applied": True,
         }
         return refined, refinement
     except Exception:
-        # AI coordinate remains untouched when exact pixel matching is unavailable.
+        return decision, None
+
+
+def recover_strict_top_edge_skip(
+    image: Image.Image, decision: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Recover a missed, locally proven top-edge >> without trusting ad CTA text."""
+    if (
+        decision.get("recommendedAction") != "none"
+        or decision.get("screenType") != "ad"
+        or decision.get("topElevenReturned")
+    ):
+        return decision, None
+    try:
+        import cv2
+        import numpy as np
+        import XDetector
+
+        rgb = np.asarray(image.convert("RGB"))
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        candidate = XDetector.run_detector(bgr, live=True)
+        if not candidate or not candidate.get("found") or candidate.get("kind") != "skip":
+            return decision, None
+        x, y = float(candidate["x"]), float(candidate["y"])
+        if y > 0.25 or not (x <= 0.16 or x >= 0.89):
+            return decision, None
+        recovered = copy.deepcopy(decision)
+        recovered["control"] = {
+            "type": "skip",
+            "x": x,
+            "y": y,
+            "confidence": 0.99,
+        }
+        recovered["recommendedAction"] = "click_skip"
+        recovered["reason"] = "Fresh local frame contains a strict top-edge double-chevron Skip control."
+        return recovered, {
+            "kind": "skip",
+            "pixelX": x,
+            "pixelY": y,
+            "method": str(candidate.get("method", "strict-top-edge-skip")),
+            "applied": True,
+        }
+    except Exception:
+        return decision, None
+
+
+def recover_strict_reward_granted_close(
+    image: Image.Image, decision: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Recover the strong top-right X that weaker models miss in Reward granted pills."""
+    if (
+        decision.get("recommendedAction") != "none"
+        or decision.get("screenType") != "ad"
+        or decision.get("topElevenReturned")
+    ):
+        return decision, None
+    try:
+        import cv2
+        import numpy as np
+        import XDetector
+
+        rgb = np.asarray(image.convert("RGB"))
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        candidate = XDetector.detect_x(bgr, live=True)
+        if not candidate or not candidate.get("found") or candidate.get("kind") != "close":
+            return decision, None
+        x, y = float(candidate["x"]), float(candidate["y"])
+        score = float(candidate.get("score", 0.0))
+        shape = float(candidate.get("shape", 0.0))
+        if not (0.89 <= x <= 0.98 and 0.055 <= y <= 0.18):
+            return decision, None
+        if score < 100.0 or shape < 55.0:
+            return decision, None
+        recovered = copy.deepcopy(decision)
+        recovered["control"] = {
+            "type": "close_x",
+            "x": x,
+            "y": y,
+            "confidence": 0.99,
+        }
+        recovered["recommendedAction"] = "click_close"
+        recovered["reason"] = "Fresh local frame contains a strict high-quality top-right ad close X."
+        return recovered, {
+            "ok": True,
+            "kind": "close",
+            "pixelX": x,
+            "pixelY": y,
+            "score": score,
+            "shape": shape,
+            "method": str(candidate.get("method", "strict-reward-close")),
+            "applied": True,
+            "recoveredFromAiNone": True,
+        }
+    except Exception:
         return decision, None
 
 
@@ -1867,6 +2274,42 @@ def refine_ai_close_on_fresh_frame(
             "reason": f"local X refinement failed: {type(exc).__name__}: {exc}",
         }
 
+
+def refine_ai_skip_on_fresh_frame(image, fresh_image, decision):
+    import cv2
+    import numpy as np
+    import XDetector
+    if image.size != fresh_image.size:
+        return decision, {'applied': False, 'reason': 'Window size changed during Skip analysis'}
+    fresh = cv2.cvtColor(np.asarray(fresh_image.convert('RGB')), cv2.COLOR_RGB2BGR)
+    candidate = XDetector.refine_skip_control_near_point(fresh, decision['control'])
+    if not candidate.get('found'):
+        return decision, {'applied': False, 'reason': 'Skip shape not verified on fresh frame',
+                          'textCheck': candidate.get('skipTextCheck')}
+    refined = copy.deepcopy(decision)
+    refined['control']['x'], refined['control']['y'] = candidate['x'], candidate['y']
+    return refined, {'applied': True, 'method': candidate['method'],
+                     'pixelX': candidate['x'], 'pixelY': candidate['y']}
+
+
+def store_control_text_crop(image: Image.Image, control: dict[str, Any]) -> str | None:
+    """Crop the AI-selected store pill for local Windows OCR, never another target."""
+    try:
+        x, y = float(control["x"])*image.width, float(control["y"])*image.height
+        half_width = max(60, round(image.width*.10))
+        half_height = max(14, round(image.height*.035))
+        box = (max(0, round(x-half_width)), max(40, round(y-half_height)),
+               min(image.width-32, round(x+half_width)), min(image.height, round(y+half_height)))
+        if box[2] <= box[0] or box[3] <= box[1]:
+            return None
+        crop = image.crop(box)
+        output = io.BytesIO()
+        crop.resize((crop.width*3, crop.height*3), Image.Resampling.LANCZOS).save(output, format="PNG")
+        return base64.b64encode(output.getvalue()).decode("ascii")
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+
+
 def save_debug(image: Image.Image, result: dict[str, Any], config: dict[str, Any], reason: str) -> None:
     debug_dir = ROOT / str(config["debugDirectory"])
     debug_dir.mkdir(parents=True, exist_ok=True)
@@ -1906,9 +2349,14 @@ class VisionServer:
         self.config = config
         self.state_by_expected: dict[str, dict[str, Any]] = {}
 
-    def analyze(self, image: Image.Image, expected_state: str) -> dict[str, Any]:
+    def analyze(self, image: Image.Image, expected_state: str, ad_corner_insets=None) -> dict[str, Any]:
         started = time.monotonic()
-        raw = request_vision_model(image, expected_state, self.config)
+        request_config = self.config
+        if ad_corner_insets is not None:
+            request_config = {**self.config,
+                              "adCornerTopInsetPx": ad_corner_insets["top"],
+                              "adCornerRightInsetPx": ad_corner_insets["right"]}
+        raw = request_vision_model(image, expected_state, request_config)
         decision, errors = validate_decision(
             raw, self.config, expected_state, image.size
         )
@@ -1954,6 +2402,7 @@ class VisionServer:
         accepted = not errors and state["stable_count"] >= required
         result = {
             "ok": True,
+            "inputView": "ad_corners" if uses_ad_corner_view(expected_state) else "full",
             "accepted": accepted,
             "stableCount": state["stable_count"],
             "requiredStableCount": required,
@@ -2004,6 +2453,27 @@ def preload_ollama(config: dict[str, Any]) -> None:
         pass
 
 
+def portrait_wake_has_content(image: Image.Image) -> bool:
+    """Veto wake taps on blank containers, excluding emulator chrome.
+
+    This never authorizes a tap by itself: AI must still confirm ad/none.
+    """
+    import numpy as np
+
+    width, height = image.size
+    if height < width * 1.25:
+        return False
+    interior = image.convert("L").crop(
+        (int(width*.07), int(height*.12), int(width*.85), int(height*.90))
+    ).resize((96, 96))
+    pixels = np.asarray(interior)
+    textured = sum(
+        float(np.std(pixels[row:row+24, column:column+24])) >= 9
+        for row in range(0, 96, 24) for column in range(0, 96, 24)
+    )
+    return textured >= 4
+
+
 def serve(config: dict[str, Any]) -> int:
     server = VisionServer(config)
     if str(config.get("provider", "ollama")).strip().lower() == "ollama":
@@ -2040,17 +2510,55 @@ def serve(config: dict[str, Any]) -> int:
             else:
                 expected_state = str(request.get("expectedState", "ad"))
                 image = capture_rect(request["rect"])
-                result = server.analyze(image, expected_state)
+                result = server.analyze(image, expected_state, request.get("adCornerInsets"))
+                if expected_state.startswith("ad_control_ai_only_wake_"):
+                    wake_decision = result.get("decision") or {}
+                    result["wakeTapAllowed"] = bool(
+                        result.get("accepted")
+                        and wake_decision.get("screenType") == "ad"
+                        and not wake_decision.get("topElevenReturned")
+                        and wake_decision.get("recommendedAction") == "none"
+                        and portrait_wake_has_content(image)
+                        and portrait_wake_has_content(capture_rect(request["rect"]))
+                    )
+                if ("ai_only" in expected_state and result.get("accepted")
+                    and (result.get("decision") or {}).get("recommendedAction") == "click_skip"):
+                    refined, refinement = refine_ai_skip_on_fresh_frame(
+                        image, capture_rect(request['rect']), result['decision'])
+                    result['skipRefinement'] = refinement
+                    if refinement.get('applied'):
+                        result['decision'] = refined
+                    else:
+                        result['accepted'] = False
+                        result.setdefault('errors', []).append('Skip was not verified on fresh frame')
+                        result['skipTextCheck'] = refinement.get('textCheck')
+                if (
+                    "ai_only" in expected_state
+                    and result.get("accepted")
+                    and (result.get("decision") or {}).get("recommendedAction")
+                    == "none"
+                    and (result.get("decision") or {}).get("screenType") == "ad"
+                ):
+                    fresh_image = capture_rect(request["rect"])
+                    recovered, refinement = recover_strict_reward_granted_close(
+                        fresh_image, result["decision"]
+                    )
+                    if refinement is None:
+                        recovered, refinement = recover_strict_top_edge_skip(
+                            fresh_image, result["decision"]
+                        )
+                    if refinement is not None:
+                        result["decision"] = recovered
+                        if recovered.get("recommendedAction") == "click_close":
+                            result["closeRefinement"] = refinement
+                        else:
+                            result["skipRefinement"] = refinement
                 if (
                     "ai_only" in expected_state
                     and result.get("accepted")
                     and (result.get("decision") or {}).get("recommendedAction")
                     == "click_close"
                 ):
-                    # The model decides that this is the close control. Capture
-                    # once more after the API response and use pixels only to
-                    # center that same nearby X. A failed local verification
-                    # requests a new AI cycle; it never falls back to an offset.
                     fresh_image = capture_rect(request["rect"])
                     refined, refinement = refine_ai_close_on_fresh_frame(
                         fresh_image, result["decision"]
@@ -2059,11 +2567,28 @@ def serve(config: dict[str, Any]) -> int:
                     if refinement.get("ok") and refinement.get("applied"):
                         result["decision"] = refined
                     else:
-                        # The local detector recognizes only some X glyph styles.
-                        # It may improve centering, but it must not veto two fresh
-                        # AI-grounded close decisions. Keep the exact AI coordinate
-                        # unchanged when the optional pixel refinement cannot match.
                         result["closeRefinement"]["fallbackToAiCoordinate"] = True
+                if (
+                    "ai_only" in expected_state
+                    and result.get("accepted")
+                    and (result.get("decision") or {}).get("recommendedAction")
+                    == "click_google_play"
+                ):
+                    fresh_image = capture_rect(request["rect"])
+                    refined, refinement = refine_decision_control_center(
+                        fresh_image, result["decision"]
+                    )
+                    result["googlePlayRefinement"] = refinement
+                    if refinement is not None:
+                        result["decision"] = refined
+                    else:
+                        result["accepted"] = False
+                        result.setdefault("errors", []).append(
+                            "Google Play badge was not locally verified"
+                        )
+                        result["googlePlayTextCheck"] = store_control_text_crop(
+                            fresh_image, result["decision"].get("control") or {}
+                        )
                 if (
                     expected_state.startswith("campus_incomplete_building")
                     and result.get("accepted")

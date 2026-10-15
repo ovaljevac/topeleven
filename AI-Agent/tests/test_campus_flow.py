@@ -1,7 +1,10 @@
 import importlib.util
+import json
 import sys
 import unittest
 from pathlib import Path
+
+from test_external_navigation_recovery import function_source, run_powershell
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("campus_x_detector", ROOT / "XDetector.py")
@@ -29,6 +32,78 @@ class CampusFlowTests(unittest.TestCase):
         image = self.strip_image()
         image[:, 570:] = 0
         self.assertFalse(x_detector._campus_object_strip(image)['verified'])
+
+    def test_real_stadium_details_accept_yellow_sixty_percent_cards(self):
+        image = x_detector.load_image(ROOT / 'tests/campus-stadium-strip-20261008.png')
+        result = x_detector.detect_campus_flow(image)
+        self.assertEqual('campus_detail', result['state'])
+        self.assertIsNotNone(result['hundredButton'])
+        strip = result['objectStrip']
+        self.assertTrue(strip['verified'])
+        self.assertEqual(3, len(strip['cards']))
+        self.assertTrue(all(card['incomplete'] for card in strip['cards']))
+        # The fourth card is clipped by the detail panel and cannot be clicked.
+        self.assertTrue(all(card['x'] < .39 for card in strip['cards']))
+
+    def test_strip_accepts_yellow_and_low_red_with_black_glyphs_in_pale_tail(self):
+        image = self.strip_image()
+        image[480:507, 180:270] = (40, 220, 230)
+        image[480:507, 320:420] = 210
+        image[480:507, 320:340] = (45, 45, 210)
+        # A tall black glyph leaves pale pixels above and below it.
+        image[483:503, 370:377] = 20
+        strip = x_detector._campus_object_strip(image)
+        self.assertTrue(strip['verified'])
+        self.assertEqual([False, True, True], [card['incomplete'] for card in strip['cards']])
+
+    def test_real_strip_with_all_full_green_bars_has_no_incomplete_cards(self):
+        image = x_detector.load_image(ROOT / 'tests/campus-stadium-strip-20261008.png')
+        for left, right in ((37,140), (171,275), (305,409)):
+            patch = image[471:499,left:right]
+            bright = x_detector.np.max(patch, axis=2) > 120
+            patch[bright] = (45,210,45)
+        strip = x_detector._campus_object_strip(image)
+        self.assertTrue(strip['verified'])
+        self.assertEqual(3, len(strip['cards']))
+        self.assertTrue(all(not card['incomplete'] for card in strip['cards']))
+
+    def test_initial_facility_gets_reward_before_strip_navigation(self):
+        code = function_source('Invoke-CampusStripMaintenance') + r'''
+$ErrorActionPreference='Stop'
+$script:events=@()
+function Invoke-CampusDetailReward {$script:events+='reward'}
+function Move-CampusObjectStripChecked {param($Handle,$TowardsRight);$script:events+='move';return $false}
+function Confirm-CampusStripBoundary {return $true}
+function Get-CampusFlowSnapshot {return @{objectStrip=@{verified=$true;cards=@(@{incomplete=$false})}}}
+function Test-Cancelled {}
+function Set-Status {}
+Invoke-CampusStripMaintenance ([IntPtr]1)
+ConvertTo-Json -Compress $script:events
+'''
+        result = run_powershell(code)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(['reward','move','move','move'],json.loads(result.stdout))
+
+    def test_reward_requires_current_blue_hundred_button_and_waits_for_ad_return(self):
+        for available in (True,False):
+            code = function_source('Invoke-CampusDetailReward') + r'''
+$ErrorActionPreference='Stop'
+$script:events=@()
+function Wait-CampusHundredButton {return @{x=.89;y=.81}}
+function Get-CampusFlowSnapshot {return @{state='campus_detail';hundredButton=BUTTON}}
+function Click-Relative {$script:events+='click'}
+function Watch-TVAdvertisement {$script:events+='ad';return 'top_eleven'}
+function Wait-CampusFlowState {$script:events+='return'}
+function Set-AgentCheckpointStep {$script:events+='checkpoint'}
+function Wait-Agent {}
+function Set-Status {}
+try {Invoke-CampusDetailReward ([IntPtr]1)} catch {$script:events+='rejected'}
+ConvertTo-Json -Compress -InputObject @($script:events)
+'''.replace('BUTTON','@{x=.89;y=.81}' if available else '$null')
+            result = run_powershell(code)
+            self.assertEqual(0,result.returncode,result.stderr)
+            expected = ['click','ad','return','checkpoint'] if available else ['rejected']
+            self.assertEqual(expected,json.loads(result.stdout))
 
     def test_strip_swipe_stays_left_and_releases_mouse_on_cancellation(self):
         script = (ROOT / 'TopElevenAgent.ps1').read_text(encoding='utf-8-sig')

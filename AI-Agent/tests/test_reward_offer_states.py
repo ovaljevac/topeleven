@@ -39,12 +39,17 @@ class OfferValidationTests(unittest.TestCase):
         self.assertTrue(self.validate(raw))
 
     def test_ad_low_confidence_and_click_are_rejected(self):
-        for mutation in ({"screenType": "ad"}, {"topElevenReturned": False},
+        for mutation in ({"screenType": "ad"},
                          {"control": {"type": "none", "x": None, "y": None, "confidence": .89}},
                          {"recommendedAction": "click_close", "control": {"type": "close", "x": .95, "y": .1, "confidence": .99}}):
             raw = decision("limit")
             raw.update(copy.deepcopy(mutation))
             self.assertTrue(self.validate(raw))
+
+    def test_known_offer_does_not_require_ad_return_flag(self):
+        raw = decision("ready", "training_condition")
+        raw["topElevenReturned"] = False
+        self.assertEqual([], self.validate(raw, "training_condition"))
 
     def test_prompt_uses_original_image_and_exact_resource(self):
         picture = Image.new("RGB", (1024, 600))
@@ -56,6 +61,7 @@ class OfferValidationTests(unittest.TestCase):
             self.assertIn("OGRAN. DOSTIGNUTO", prompt)
             self.assertIn("Missing/covered", prompt)
         self.assertIn("Ignore blue MORAL", vision.build_user_prompt(picture, "reward_offer_green_store")[0])
+        self.assertIn("itself sufficient Top Eleven evidence", vision.build_user_prompt(picture, "reward_offer_training_condition")[0])
 
 
 @unittest.skipUnless(shutil.which("powershell.exe"), "Windows PowerShell required")
@@ -70,7 +76,7 @@ class OfferRuntimeTests(unittest.TestCase):
 
     def test_grey_restarts_repeatedly_and_uses_new_handle(self):
         self.run_ps(["Wait-GreenRewardOffer"], """
-function Wait-RewardOfferState { $script:calls++; if ($script:calls -le 3) { return 'grey' }; return 'ready' }
+function Wait-GreenRewardOfferState { $script:calls++; if ($script:calls -le 3) { return 'grey' }; return 'ready' }
 function Restart-TopElevenForStageRetry { $script:restarts++; return [IntPtr](10 + $script:restarts) }
 function Open-Store { param($Handle); $script:opened=$Handle }
 function Wait-Agent {}
@@ -84,7 +90,7 @@ if ($script:restarts -ne 3 -or $result.State -ne 'ready' -or $result.Handle -ne 
 
     def test_limit_returns_without_restart_or_click(self):
         self.run_ps(["Wait-GreenRewardOffer"], """
-function Wait-RewardOfferState { return 'limit' }
+function Wait-GreenRewardOfferState { return 'limit' }
 function Restart-TopElevenForStageRetry { throw 'must not restart' }
 function Wait-ForCondition { throw 'must not look for a click' }
 """, "$result=Wait-GreenRewardOffer ([IntPtr]1); if ($result.State -ne 'limit') { throw 'limit lost' }")
@@ -127,15 +133,37 @@ try { Wait-RewardOfferState ([IntPtr]1) green_store } catch [System.OperationCan
 if (-not $caught) { throw 'stop ignored' }
 """)
 
-    def test_training_limit_and_grey_exit_before_local_click_wait(self):
+    def test_training_ready_uses_two_local_frames_without_ai(self):
         self.run_ps(["Wait-TrainingFreeButton"], """
-function Wait-RewardOfferState { return $script:testState }
-function Get-TrainingPlayerFlowSnapshot { throw 'must not click/check old profile' }
+function Get-TrainingPlayerFlowSnapshot {
+    $script:localReads++
+    return [PSCustomObject]@{state='condition_modal'; freeButton=[PSCustomObject]@{ready=$true;x=.671;y=.569}}
+}
+function Get-RewardOfferState { throw 'ready training offer must not spend an AI request' }
+function Test-Cancelled {}
+function Add-Log {}
+function Wait-Agent {}
+$script:localReads=0; $script:VisionAiProbeIntervalSeconds=12
+""", """
+$result=Wait-TrainingFreeButton ([IntPtr]1)
+if (-not $result.ready -or [Math]::Abs($result.x-.671) -gt .001 -or $script:localReads -ne 2) { throw 'local ready offer was not returned' }
+""")
+
+    def test_training_limit_and_grey_require_two_ai_reads_when_not_locally_ready(self):
+        self.run_ps(["Wait-TrainingFreeButton"], """
+function Get-TrainingPlayerFlowSnapshot {
+    return [PSCustomObject]@{state='condition_modal'; freeButton=[PSCustomObject]@{ready=$false;x=$null;y=$null}}
+}
+function Get-RewardOfferState { $script:aiReads++; return $script:testState }
+function Test-Cancelled {}
+function Add-Log {}
+function Wait-Agent {}
+$script:VisionAiProbeIntervalSeconds=12
 """, """
 foreach ($state in @('limit','grey')) {
-    $script:testState=$state
+    $script:testState=$state; $script:aiReads=0
     $result=Wait-TrainingFreeButton ([IntPtr]1)
-    if ($result.OfferState -ne $state -or $result.ready) { throw 'training state lost' }
+    if ($result.OfferState -ne $state -or $result.ready -or $script:aiReads -ne 2) { throw 'training state lost' }
 }
 """)
 

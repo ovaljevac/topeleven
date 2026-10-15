@@ -9,7 +9,7 @@ SOURCE = (Path(__file__).resolve().parents[1] / 'TopElevenAgent.ps1').read_text(
 
 class CampusExternalReturnTests(unittest.TestCase):
     def test_pause_precedes_post_ad_snapshot(self):
-        body = function_body(SOURCE, 'Invoke-CampusStripMaintenance')
+        body = function_body(SOURCE, 'Invoke-CampusDetailReward')
         start = body.index("Watch-TVAdvertisement $Handle $false 'campus'")
         pause = body.index('Wait-Agent 5000', start)
         snapshot = body.index("Wait-CampusFlowState $Handle @('campus_detail')", start)

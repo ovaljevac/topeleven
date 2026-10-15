@@ -57,6 +57,47 @@ def run_powershell(command: str):
 
 
 class AdCloseStabilityRegressionTests(unittest.TestCase):
+    def run_wake_gate(self, width, height, *, control_ready=False, ad_visible=True):
+        command = f"""
+$ErrorActionPreference = 'Stop'
+$script:AiTopElevenReturned = $false
+$script:AiAdVisible = $false
+$script:AiProbes = 0
+function Add-Log {{ param([string]$Text) }}
+function Get-GameViewportRectangle {{
+    return [PSCustomObject]@{{ Left = 0; Top = 0; Right = {width}; Bottom = {height} }}
+}}
+function Test-AiOnlyAdControlReady {{
+    $script:AiProbes++
+    $script:AiAdVisible = ${str(ad_visible).lower()}
+    $script:AiAdWakeTapAllowed = $true
+    return ${str(control_ready).lower()}
+}}
+{function_source('Test-AdWakeTapAllowed')}
+$allowed = Test-AdWakeTapAllowed ([IntPtr]::Zero) (Get-Date) 'test reklama'
+[PSCustomObject]@{{ allowed = [bool]$allowed; probes = $script:AiProbes; analysisPerformed = [bool]$script:AdWakeAnalysisPerformed }} | ConvertTo-Json -Compress
+"""
+        completed = run_powershell(command)
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        return json.loads(completed.stdout.strip())
+
+    def test_portrait_wake_requires_fresh_ai_ad_without_control(self):
+        allowed = self.run_wake_gate(360, 640)
+        self.assertTrue(allowed["allowed"])
+        self.assertEqual(1, allowed["probes"])
+        self.assertTrue(allowed["analysisPerformed"])
+
+        control = self.run_wake_gate(360, 640, control_ready=True)
+        self.assertFalse(control["allowed"])
+        self.assertEqual(1, control["probes"])
+        self.assertTrue(control["analysisPerformed"])
+
+    def test_landscape_wake_is_rejected_before_ai(self):
+        result = self.run_wake_gate(1000, 600)
+        self.assertFalse(result["allowed"])
+        self.assertEqual(0, result["probes"])
+        self.assertFalse(result["analysisPerformed"])
+
     def run_confirmation(self, initial):
         command = f"""
 $ErrorActionPreference = 'Stop'
@@ -178,6 +219,40 @@ $ready = Test-AiOnlyAdControlReady ([IntPtr]::Zero) 'ad_control_ai_only_test' -F
         self.assertTrue(result["kindIsNull"])
         self.assertFalse(result["verified"])
 
+    def test_ai_skip_without_fresh_local_verifier_is_rejected(self):
+        command = f"""
+$ErrorActionPreference = 'Stop'
+function Add-Log {{ param([string]$Text) }}
+function Invoke-VisionAnalysis {{ return $script:VisionResult }}
+{function_source('Test-AiOnlyAdControlReady')}
+$script:VisionCacheByState = @{{}}
+$script:VisionResult = [PSCustomObject]@{{
+    accepted = $true
+    decision = [PSCustomObject]@{{
+        screenType = 'ad'
+        topElevenReturned = $false
+        recommendedAction = 'click_skip'
+        control = [PSCustomObject]@{{ x = 0.031; y = 0.121; confidence = 0.95 }}
+    }}
+}}
+$ready = Test-AiOnlyAdControlReady ([IntPtr]::Zero) 'ad_control_ai_only_test' -ForceRefresh
+[PSCustomObject]@{{
+    ready = [bool]$ready
+    x = $script:DetectedAdCloseX
+    y = $script:DetectedAdCloseY
+    kind = $script:DetectedAdCloseKind
+    verified = [bool]$script:DetectedAdCloseLocallyVerified
+}} | ConvertTo-Json -Compress
+"""
+        completed = run_powershell(command)
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        result = json.loads(completed.stdout.strip())
+        self.assertFalse(result["ready"])
+        self.assertIsNone(result["x"])
+        self.assertIsNone(result["y"])
+        self.assertIsNone(result["kind"])
+        self.assertFalse(result["verified"])
+
     def test_wake_probe_hands_verified_close_to_click_flow(self):
         start = SCRIPT.index("if (-not (Test-AdWakeTapAllowed $handle $adStartedAt 'Reklama za 25 zelenih'))")
         end = SCRIPT.index("$adWakeTapCount++", start)
@@ -185,8 +260,9 @@ $ready = Test-AiOnlyAdControlReady ([IntPtr]::Zero) 'ad_control_ai_only_test' -F
         self.assertIn("$script:DetectedAdCloseKind -eq 'close'", body)
         self.assertIn("$script:DetectedAdCloseLocallyVerified", body)
         close_ready = body.index("$adCloseReady = $true")
-        self.assertLess(body.index("break", close_ready), body.index("$reuseWakeAnalysis = $true"))
-        returned = body.index("if ($script:AiTopElevenReturned)")
+        reuse_assignment = "$reuseWakeAnalysis = [bool]$script:AdWakeAnalysisPerformed"
+        self.assertLess(body.index("break", close_ready), body.index(reuse_assignment))
+        returned = body.index("if (Test-GreenGameReturned $handle)")
         self.assertLess(body.index("$adAlreadyExited = $true", returned), close_ready)
         self.assertLess(body.index("break", returned), close_ready)
 

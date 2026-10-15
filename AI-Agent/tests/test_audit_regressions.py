@@ -113,6 +113,7 @@ function Get-BlueStacksForegroundState {
     return [PSCustomObject]@{Package=$script:TopElevenPackage; Activity='AdActivity'; EventTime=(Get-Date)}
 }
 function Test-AdWakeTapAllowed {
+    $script:AdWakeAnalysisPerformed=$true
     $script:AiTopElevenReturned=$true
     $script:AiAdVisible=$false
     $script:DetectedAdCloseX=$null; $script:DetectedAdCloseY=$null

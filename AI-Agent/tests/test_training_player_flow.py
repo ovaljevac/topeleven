@@ -459,10 +459,7 @@ class TrainingPlayerFlowTests(unittest.TestCase):
             "cekam novu svjezu AI potvrdu X-a ili povratka",
             script,
         )
-        self.assertIn(
-            "lokalni verifier nije nasao X blizu te tacke",
-            script,
-        )
+        self.assertIn("lokalni verifier nije nasao X blizu te tacke", script)
 
     def test_connection_interrupted_popup_is_recovered_in_all_state_waiters(self):
         script = (ROOT / "TopElevenAgent.ps1").read_text(encoding="utf-8-sig")

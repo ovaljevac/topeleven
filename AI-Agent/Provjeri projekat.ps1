@@ -45,6 +45,7 @@ $requiredFiles = @(
     'TopElevenManager.ps1',
     'VisionAgent.py',
     'XDetector.py',
+    'google-play-disclosure-wordmark.png',
     'config.json',
     'ai_config.json',
     'requirements.txt'

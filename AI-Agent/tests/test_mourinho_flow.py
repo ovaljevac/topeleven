@@ -54,11 +54,42 @@ class MourinhoFlowTests(unittest.TestCase):
         self.assertIsNotNone(result["button"])
         self.assertGreaterEqual(result["button"]["textScore"], 0.55)
 
+    def test_lower_popup_still_finds_watch_button(self):
+        source = self.load(4)
+        shift = 70
+        image = x_detector.np.zeros_like(source)
+        image[shift:] = source[:-shift]
+
+        result = x_detector.detect_mourinho_flow(image)
+
+        self.assertEqual("mourinho_popup", result["state"])
+        self.assertIsNotNone(result["button"])
+        self.assertGreater(result["button"]["y"], 0.68)
+        self.assertGreaterEqual(result["button"]["textScore"], 0.55)
+
     def test_plain_blue_popup_button_is_rejected(self):
         image = self.load(2)
         image[341:370, 725:842] = (240, 170, 70)
         result = x_detector.detect_mourinho_flow(image)
         self.assertEqual("mourinho_popup", result["state"])
+        self.assertIsNone(result["button"])
+
+    def test_reported_lower_popup_with_event_banner_finds_watch(self):
+        source = x_detector.load_image(ROOT / "tests/mourinho-lower-popup-20261010.png")
+        for scale in (1, 1.5, 2):
+            with self.subTest(scale=scale):
+                image = x_detector.cv2.resize(source, None, fx=scale, fy=scale)
+                result = x_detector.detect_mourinho_flow(image)
+                self.assertEqual("mourinho_popup", result["state"])
+                self.assertIsNotNone(result["button"])
+                self.assertAlmostEqual(830/image.shape[1]*scale, result["button"]["x"], delta=.005)
+                self.assertAlmostEqual(.772, result["button"]["y"], delta=.005)
+                self.assertGreaterEqual(result["button"]["textScore"], .55)
+
+    def test_reported_lower_popup_without_watch_label_cannot_authorize_click(self):
+        image = x_detector.load_image(ROOT / "tests/mourinho-lower-popup-20261010.png")
+        image[462:489, 752:908] = (234, 166, 83)
+        result = x_detector.detect_mourinho_flow(image)
         self.assertIsNone(result["button"])
 
     def test_top_resource_bar_confirms_app_return(self):
